@@ -47,9 +47,6 @@ func APIGropuVersionsTest() {
 		ctx             = context.Background()
 	)
 
-	client, err := NewTestClient()
-	Expect(err).To(Succeed(), "Failed to instantiate cluster client for group version tests")
-
 	BeforeEach(func() {
 		resource = "rockbands"
 		group = "music.example.io"
@@ -59,7 +56,8 @@ func APIGropuVersionsTest() {
 		// TODO: install Velero once for the test suite once feature flag is
 		// removed and velero installation becomes the same as other e2e tests.
 		if VeleroCfg.InstallVelero {
-			err = VeleroInstall(context.Background(), &VeleroCfg, "EnableAPIGroupVersions", false)
+			VeleroCfg.Features = "EnableAPIGroupVersions"
+			err = VeleroInstall(context.Background(), &VeleroCfg, false)
 			Expect(err).NotTo(HaveOccurred())
 		}
 	})
@@ -75,8 +73,10 @@ func APIGropuVersionsTest() {
 		Expect(err).NotTo(HaveOccurred())
 
 		if VeleroCfg.InstallVelero {
-			err = VeleroUninstall(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)
-			Expect(err).NotTo(HaveOccurred())
+			if !VeleroCfg.Debug {
+				err = VeleroUninstall(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)
+				Expect(err).NotTo(HaveOccurred())
+			}
 		}
 
 	})
@@ -85,7 +85,7 @@ func APIGropuVersionsTest() {
 		It("Should back up API group version and restore by version priority", func() {
 			Expect(runEnableAPIGroupVersionsTests(
 				ctx,
-				client,
+				*VeleroCfg.ClientToInstallVelero,
 				resource,
 				group,
 			)).To(Succeed(), "Failed to successfully backup and restore multiple API Groups")
@@ -236,7 +236,13 @@ func runEnableAPIGroupVersionsTests(ctx context.Context, client TestClient, reso
 		backup := "backup-rockbands-" + UUIDgen.String() + "-" + strconv.Itoa(i)
 		namespacesStr := strings.Join(tc.namespaces, ",")
 
-		err = VeleroBackupNamespace(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, backup, namespacesStr, "", false)
+		var BackupCfg BackupConfig
+		BackupCfg.BackupName = backup
+		BackupCfg.Namespace = namespacesStr
+		BackupCfg.BackupLocation = ""
+		BackupCfg.UseVolumeSnapshots = false
+		BackupCfg.Selector = ""
+		err = VeleroBackupNamespace(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, BackupCfg)
 		if err != nil {
 			RunDebug(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, backup, "")
 			return errors.Wrapf(err, "back up %s namespaces on source cluster", namespacesStr)
@@ -276,7 +282,7 @@ func runEnableAPIGroupVersionsTests(ctx context.Context, client TestClient, reso
 		restore := "restore-rockbands-" + UUIDgen.String() + "-" + strconv.Itoa(i)
 
 		if tc.want != nil {
-			if err := VeleroRestore(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, restore, backup); err != nil {
+			if err := VeleroRestore(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, restore, backup, ""); err != nil {
 				RunDebug(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, "", restore)
 				return errors.Wrapf(err, "restore %s namespaces on target cluster", namespacesStr)
 			}
@@ -315,7 +321,7 @@ func runEnableAPIGroupVersionsTests(ctx context.Context, client TestClient, reso
 		} else {
 			// No custom resource should have been restored. Expect "no resource found"
 			// error during restore.
-			err := VeleroRestore(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, restore, backup)
+			err := VeleroRestore(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, restore, backup, "")
 
 			if err.Error() != "Unexpected restore phase got PartiallyFailed, expecting Completed" {
 				return errors.New("expected error but not none")

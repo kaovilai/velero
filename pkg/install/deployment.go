@@ -40,9 +40,11 @@ type podTemplateConfig struct {
 	resources                         corev1.ResourceRequirements
 	withSecret                        bool
 	defaultResticMaintenanceFrequency time.Duration
+	garbageCollectionFrequency        time.Duration
 	plugins                           []string
 	features                          []string
 	defaultVolumesToRestic            bool
+	uploaderType                      string
 }
 
 func WithImage(image string) podTemplateOption {
@@ -82,7 +84,6 @@ func WithEnvFromSecretKey(varName, secret, key string) podTemplateOption {
 func WithSecret(secretPresent bool) podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.withSecret = secretPresent
-
 	}
 }
 
@@ -104,6 +105,12 @@ func WithDefaultResticMaintenanceFrequency(val time.Duration) podTemplateOption 
 	}
 }
 
+func WithGarbageCollectionFrequency(val time.Duration) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.garbageCollectionFrequency = val
+	}
+}
+
 func WithPlugins(plugins []string) podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.plugins = plugins
@@ -113,6 +120,12 @@ func WithPlugins(plugins []string) podTemplateOption {
 func WithFeatures(features []string) podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.features = features
+	}
+}
+
+func WithUploaderType(t string) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.uploaderType = t
 	}
 }
 
@@ -146,6 +159,10 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1.Deployment 
 
 	if c.defaultVolumesToRestic {
 		args = append(args, "--default-volumes-to-restic=true")
+	}
+
+	if len(c.uploaderType) > 0 {
+		args = append(args, fmt.Sprintf("--uploader-type=%s", c.uploaderType))
 	}
 
 	deployment := &appsv1.Deployment{
@@ -273,6 +290,10 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1.Deployment 
 
 	if c.defaultResticMaintenanceFrequency > 0 {
 		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("--default-restic-prune-frequency=%v", c.defaultResticMaintenanceFrequency))
+	}
+
+	if c.garbageCollectionFrequency > 0 {
+		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("--garbage-collection-frequency=%v", c.garbageCollectionFrequency))
 	}
 
 	if len(c.plugins) > 0 {

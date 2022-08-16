@@ -172,6 +172,13 @@ func TestProcessBackupValidationFailures(t *testing.T) {
 			backupLocation: builder.ForBackupStorageLocation("velero", "read-only").AccessMode(velerov1api.BackupStorageLocationAccessModeReadOnly).Result(),
 			expectedErrs:   []string{"backup can't be created because backup storage location read-only is currently in read-only mode"},
 		},
+		{
+			name: "labelSelector as well as orLabelSelectors both are specified in backup request fails validation",
+			backup: defaultBackup().LabelSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"a": "b"}}).OrLabelSelector([]*metav1.LabelSelector{{MatchLabels: map[string]string{"a1": "b1"}}, {MatchLabels: map[string]string{"a2": "b2"}},
+				{MatchLabels: map[string]string{"a3": "b3"}}, {MatchLabels: map[string]string{"a4": "b4"}}}).Result(),
+			backupLocation: defaultBackupLocation,
+			expectedErrs:   []string{"encountered labelSelector as well as orLabelSelectors in backup spec, only one can be specified"},
+		},
 	}
 
 	for _, test := range tests {
@@ -729,6 +736,7 @@ func TestProcessBackupCompletions(t *testing.T) {
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:               velerov1api.BackupPhaseFailed,
+					FailureReason:       "backup already exists in object storage",
 					Version:             1,
 					FormatVersion:       "1.1.0",
 					StartTimestamp:      &timestamp,
@@ -766,6 +774,7 @@ func TestProcessBackupCompletions(t *testing.T) {
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:               velerov1api.BackupPhaseFailed,
+					FailureReason:       "error checking if backup already exists in object storage: Backup already exists in object storage",
 					Version:             1,
 					FormatVersion:       "1.1.0",
 					StartTimestamp:      &timestamp,

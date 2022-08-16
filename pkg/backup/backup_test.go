@@ -47,7 +47,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/discovery"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
-	"github.com/vmware-tanzu/velero/pkg/restic"
+	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/test"
 	testutil "github.com/vmware-tanzu/velero/pkg/test"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
@@ -320,6 +320,35 @@ func TestBackupResourceFiltering(t *testing.T) {
 				test.PVs(
 					builder.ForPersistentVolume("bar").ObjectMeta(builder.WithLabels("a", "b")).Result(),
 					builder.ForPersistentVolume("baz").ObjectMeta(builder.WithLabels("a", "c")).Result(),
+				),
+			},
+			want: []string{
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/persistentvolumes/cluster/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/bar.json",
+			},
+		},
+		{
+			name: "OrLabelSelector only backs up matching resources",
+			backup: defaultBackup().
+				OrLabelSelector([]*metav1.LabelSelector{{MatchLabels: map[string]string{"a1": "b1"}}, {MatchLabels: map[string]string{"a2": "b2"}},
+					{MatchLabels: map[string]string{"a3": "b3"}}, {MatchLabels: map[string]string{"a4": "b4"}}}).
+				Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").ObjectMeta(builder.WithLabels("a1", "b1")).Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").ObjectMeta(builder.WithLabels("a2", "b2")).Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("bar").ObjectMeta(builder.WithLabels("a4", "b4")).Result(),
+					builder.ForPersistentVolume("baz").ObjectMeta(builder.WithLabels("a5", "b5")).Result(),
 				),
 			},
 			want: []string{
@@ -2566,7 +2595,7 @@ func TestBackupWithHooks(t *testing.T) {
 
 type fakeResticBackupperFactory struct{}
 
-func (f *fakeResticBackupperFactory) NewBackupper(context.Context, *velerov1.Backup) (restic.Backupper, error) {
+func (f *fakeResticBackupperFactory) NewBackupper(context.Context, *velerov1.Backup) (podvolume.Backupper, error) {
 	return &fakeResticBackupper{}, nil
 }
 

@@ -226,11 +226,13 @@ type VeleroOptions struct {
 	BSLConfig                         map[string]string
 	VSLConfig                         map[string]string
 	DefaultResticMaintenanceFrequency time.Duration
+	GarbageCollectionFrequency        time.Duration
 	Plugins                           []string
 	NoDefaultBackupLocation           bool
 	CACertData                        []byte
 	Features                          []string
 	DefaultVolumesToRestic            bool
+	UploaderType                      string
 }
 
 func AllCRDs() *unstructured.UnstructuredList {
@@ -285,6 +287,8 @@ func AllResources(o *VeleroOptions) *unstructured.UnstructuredList {
 		WithResources(o.VeleroPodResources),
 		WithSecret(secretPresent),
 		WithDefaultResticMaintenanceFrequency(o.DefaultResticMaintenanceFrequency),
+		WithGarbageCollectionFrequency(o.GarbageCollectionFrequency),
+		WithUploaderType(o.UploaderType),
 	}
 
 	if len(o.Features) > 0 {

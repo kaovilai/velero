@@ -24,6 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vmware-tanzu/velero/pkg/uploader"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -67,12 +69,14 @@ type InstallOptions struct {
 	Wait                              bool
 	UseVolumeSnapshots                bool
 	DefaultResticMaintenanceFrequency time.Duration
+	GarbageCollectionFrequency        time.Duration
 	Plugins                           flag.StringArray
 	NoDefaultBackupLocation           bool
 	CRDsOnly                          bool
 	CACertFile                        string
 	Features                          string
 	DefaultVolumesToRestic            bool
+	UploaderType                      string
 }
 
 // BindFlags adds command line values to the options struct.
@@ -103,11 +107,13 @@ func (o *InstallOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&o.UseRestic, "use-restic", o.UseRestic, "Create restic daemonset. Optional.")
 	flags.BoolVar(&o.Wait, "wait", o.Wait, "Wait for Velero deployment to be ready. Optional.")
 	flags.DurationVar(&o.DefaultResticMaintenanceFrequency, "default-restic-prune-frequency", o.DefaultResticMaintenanceFrequency, "How often 'restic prune' is run for restic repositories by default. Optional.")
+	flags.DurationVar(&o.GarbageCollectionFrequency, "garbage-collection-frequency", o.GarbageCollectionFrequency, "How often the garbage collection runs for expired backups.(default 1h)")
 	flags.Var(&o.Plugins, "plugins", "Plugin container images to install into the Velero Deployment")
 	flags.BoolVar(&o.CRDsOnly, "crds-only", o.CRDsOnly, "Only generate CustomResourceDefinition resources. Useful for updating CRDs for an existing Velero install.")
 	flags.StringVar(&o.CACertFile, "cacert", o.CACertFile, "File containing a certificate bundle to use when verifying TLS connections to the object store. Optional.")
 	flags.StringVar(&o.Features, "features", o.Features, "Comma separated list of Velero feature flags to be set on the Velero deployment and the restic daemonset, if restic is enabled")
 	flags.BoolVar(&o.DefaultVolumesToRestic, "default-volumes-to-restic", o.DefaultVolumesToRestic, "Bool flag to configure Velero server to use restic by default to backup all pod volumes on all backups. Optional.")
+	flags.StringVar(&o.UploaderType, "uploader-type", o.UploaderType, fmt.Sprintf("The type of uploader to transfer the data of pod volumes, the supported values are '%s', '%s'", uploader.ResticType, uploader.KopiaType))
 }
 
 // NewInstallOptions instantiates a new, default InstallOptions struct.
@@ -133,6 +139,7 @@ func NewInstallOptions() *InstallOptions {
 		NoDefaultBackupLocation: false,
 		CRDsOnly:                false,
 		DefaultVolumesToRestic:  false,
+		UploaderType:            uploader.ResticType,
 	}
 }
 
@@ -187,11 +194,13 @@ func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
 		BSLConfig:                         o.BackupStorageConfig.Data(),
 		VSLConfig:                         o.VolumeSnapshotConfig.Data(),
 		DefaultResticMaintenanceFrequency: o.DefaultResticMaintenanceFrequency,
+		GarbageCollectionFrequency:        o.GarbageCollectionFrequency,
 		Plugins:                           o.Plugins,
 		NoDefaultBackupLocation:           o.NoDefaultBackupLocation,
 		CACertData:                        caCertData,
 		Features:                          strings.Split(o.Features, ","),
 		DefaultVolumesToRestic:            o.DefaultVolumesToRestic,
+		UploaderType:                      o.UploaderType,
 	}, nil
 }
 
@@ -324,6 +333,10 @@ func (o *InstallOptions) Validate(c *cobra.Command, args []string, f client.Fact
 		return err
 	}
 
+	if err := uploader.ValidateUploaderType(o.UploaderType); err != nil {
+		return err
+	}
+
 	// If we're only installing CRDs, we can skip the rest of the validation.
 	if o.CRDsOnly {
 		return nil
@@ -393,6 +406,10 @@ func (o *InstallOptions) Validate(c *cobra.Command, args []string, f client.Fact
 
 	if o.DefaultResticMaintenanceFrequency < 0 {
 		return errors.New("--default-restic-prune-frequency must be non-negative")
+	}
+
+	if o.GarbageCollectionFrequency < 0 {
+		return errors.New("--garbage-collection-frequency must be non-negative")
 	}
 
 	return nil
