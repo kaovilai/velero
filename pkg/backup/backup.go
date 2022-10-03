@@ -44,7 +44,8 @@ import (
 	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/plugin/framework"
-	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	biav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/backupitemaction/v1"
+	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podexec"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
@@ -62,7 +63,7 @@ const BackupFormatVersion = "1.1.0"
 type Backupper interface {
 	// Backup takes a backup using the specification in the velerov1api.Backup and writes backup and log data
 	// to the given writers.
-	Backup(logger logrus.FieldLogger, backup *Request, backupFile io.Writer, actions []velero.BackupItemAction, volumeSnapshotterGetter VolumeSnapshotterGetter) error
+	Backup(logger logrus.FieldLogger, backup *Request, backupFile io.Writer, actions []biav1.BackupItemAction, volumeSnapshotterGetter VolumeSnapshotterGetter) error
 	BackupWithResolvers(log logrus.FieldLogger, backupRequest *Request, backupFile io.Writer,
 		backupItemActionResolver framework.BackupItemActionResolver, itemSnapshotterResolver framework.ItemSnapshotterResolver,
 		volumeSnapshotterGetter VolumeSnapshotterGetter) error
@@ -70,14 +71,15 @@ type Backupper interface {
 
 // kubernetesBackupper implements Backupper.
 type kubernetesBackupper struct {
-	backupClient           velerov1client.BackupsGetter
-	dynamicFactory         client.DynamicFactory
-	discoveryHelper        discovery.Helper
-	podCommandExecutor     podexec.PodCommandExecutor
-	resticBackupperFactory podvolume.BackupperFactory
-	resticTimeout          time.Duration
-	defaultVolumesToRestic bool
-	clientPageSize         int
+	backupClient             velerov1client.BackupsGetter
+	dynamicFactory           client.DynamicFactory
+	discoveryHelper          discovery.Helper
+	podCommandExecutor       podexec.PodCommandExecutor
+	resticBackupperFactory   podvolume.BackupperFactory
+	resticTimeout            time.Duration
+	defaultVolumesToFsBackup bool
+	clientPageSize           int
+	uploaderType             string
 }
 
 func (i *itemKey) String() string {
@@ -102,18 +104,20 @@ func NewKubernetesBackupper(
 	podCommandExecutor podexec.PodCommandExecutor,
 	resticBackupperFactory podvolume.BackupperFactory,
 	resticTimeout time.Duration,
-	defaultVolumesToRestic bool,
+	defaultVolumesToFsBackup bool,
 	clientPageSize int,
+	uploaderType string,
 ) (Backupper, error) {
 	return &kubernetesBackupper{
-		backupClient:           backupClient,
-		discoveryHelper:        discoveryHelper,
-		dynamicFactory:         dynamicFactory,
-		podCommandExecutor:     podCommandExecutor,
-		resticBackupperFactory: resticBackupperFactory,
-		resticTimeout:          resticTimeout,
-		defaultVolumesToRestic: defaultVolumesToRestic,
-		clientPageSize:         clientPageSize,
+		backupClient:             backupClient,
+		discoveryHelper:          discoveryHelper,
+		dynamicFactory:           dynamicFactory,
+		podCommandExecutor:       podCommandExecutor,
+		resticBackupperFactory:   resticBackupperFactory,
+		resticTimeout:            resticTimeout,
+		defaultVolumesToFsBackup: defaultVolumesToFsBackup,
+		clientPageSize:           clientPageSize,
+		uploaderType:             uploaderType,
 	}, nil
 }
 
@@ -161,7 +165,7 @@ func getResourceHook(hookSpec velerov1api.BackupResourceHookSpec, discoveryHelpe
 }
 
 type VolumeSnapshotterGetter interface {
-	GetVolumeSnapshotter(name string) (velero.VolumeSnapshotter, error)
+	GetVolumeSnapshotter(name string) (vsv1.VolumeSnapshotter, error)
 }
 
 // Backup backs up the items specified in the Backup, placing them in a gzip-compressed tar file
@@ -170,7 +174,7 @@ type VolumeSnapshotterGetter interface {
 // back up individual resources that don't prevent the backup from continuing to be processed) are logged
 // to the backup log.
 func (kb *kubernetesBackupper) Backup(log logrus.FieldLogger, backupRequest *Request, backupFile io.Writer,
-	actions []velero.BackupItemAction, volumeSnapshotterGetter VolumeSnapshotterGetter) error {
+	actions []biav1.BackupItemAction, volumeSnapshotterGetter VolumeSnapshotterGetter) error {
 	backupItemActions := framework.NewBackupItemActionResolver(actions)
 	itemSnapshotters := framework.NewItemSnapshotterResolver(nil)
 	return kb.BackupWithResolvers(log, backupRequest, backupFile, backupItemActions, itemSnapshotters,
@@ -201,21 +205,24 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 	backupRequest.ResourceIncludesExcludes = collections.GetResourceIncludesExcludes(kb.discoveryHelper, backupRequest.Spec.IncludedResources, backupRequest.Spec.ExcludedResources)
 	log.Infof("Including resources: %s", backupRequest.ResourceIncludesExcludes.IncludesString())
 	log.Infof("Excluding resources: %s", backupRequest.ResourceIncludesExcludes.ExcludesString())
-	log.Infof("Backing up all pod volumes using Restic: %t", boolptr.IsSetToTrue(backupRequest.Backup.Spec.DefaultVolumesToRestic))
+	log.Infof("Backing up all volumes using pod volume backup: %t", boolptr.IsSetToTrue(backupRequest.Backup.Spec.DefaultVolumesToFsBackup))
 
 	var err error
 	backupRequest.ResourceHooks, err = getResourceHooks(backupRequest.Spec.Hooks.Resources, kb.discoveryHelper)
 	if err != nil {
+		log.WithError(errors.WithStack(err)).Debugf("Error from getResourceHooks")
 		return err
 	}
 
-	backupRequest.ResolvedActions, err = backupItemActionResolver.ResolveActions(kb.discoveryHelper)
+	backupRequest.ResolvedActions, err = backupItemActionResolver.ResolveActions(kb.discoveryHelper, log)
 	if err != nil {
+		log.WithError(errors.WithStack(err)).Debugf("Error from backupItemActionResolver.ResolveActions")
 		return err
 	}
 
-	backupRequest.ResolvedItemSnapshotters, err = itemSnapshotterResolver.ResolveActions(kb.discoveryHelper)
+	backupRequest.ResolvedItemSnapshotters, err = itemSnapshotterResolver.ResolveActions(kb.discoveryHelper, log)
 	if err != nil {
+		log.WithError(errors.WithStack(err)).Debugf("Error from itemSnapshotterResolver.ResolveActions")
 		return err
 	}
 
@@ -236,8 +243,9 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 
 	var resticBackupper podvolume.Backupper
 	if kb.resticBackupperFactory != nil {
-		resticBackupper, err = kb.resticBackupperFactory.NewBackupper(ctx, backupRequest.Backup)
+		resticBackupper, err = kb.resticBackupperFactory.NewBackupper(ctx, backupRequest.Backup, kb.uploaderType)
 		if err != nil {
+			log.WithError(errors.WithStack(err)).Debugf("Error from NewBackupper")
 			return errors.WithStack(err)
 		}
 	}

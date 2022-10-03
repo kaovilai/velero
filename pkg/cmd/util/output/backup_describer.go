@@ -110,7 +110,6 @@ func DescribeBackup(
 			d.Println()
 			DescribePodVolumeBackups(d, podVolumeBackups, details)
 		}
-
 	})
 }
 
@@ -164,6 +163,9 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 
 	d.Println()
 	d.Printf("TTL:\t%s\n", spec.TTL.Duration)
+
+	d.Println()
+	d.Printf("CSISnapshotTimeout:\t%s\n", &spec.CSISnapshotTimeout.Duration)
 
 	d.Println()
 	if len(spec.Hooks.Resources) == 0 {
@@ -241,7 +243,6 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 			d.Printf("\t%s: %s\n", key, value)
 		}
 	}
-
 }
 
 // DescribeBackupStatus describes a backup status in human-readable format.
@@ -402,10 +403,19 @@ func failedDeletionCount(requests []velerov1api.DeleteBackupRequest) int {
 
 // DescribePodVolumeBackups describes pod volume backups in human-readable format.
 func DescribePodVolumeBackups(d *Describer, backups []velerov1api.PodVolumeBackup, details bool) {
-	if details {
-		d.Printf("Restic Backups:\n")
+	// Get the type of pod volume uploader. Since the uploader only comes from a single source, we can
+	// take the uploader type from the first element of the array.
+	var uploaderType string
+	if len(backups) > 0 {
+		uploaderType = backups[0].Spec.UploaderType
 	} else {
-		d.Printf("Restic Backups (specify --details for more information):\n")
+		return
+	}
+
+	if details {
+		d.Printf("%s Backups:\n", uploaderType)
+	} else {
+		d.Printf("%s Backups (specify --details for more information):\n", uploaderType)
 	}
 
 	// separate backups by phase (combining <none> and New into a single group)
@@ -486,7 +496,7 @@ func (v *volumesByPod) Add(namespace, name, volume, phase string, progress veler
 	key := fmt.Sprintf("%s/%s", namespace, name)
 
 	// append backup progress percentage if backup is in progress
-	if phase == "In Progress" && progress != (velerov1api.PodVolumeOperationProgress{}) {
+	if phase == "In Progress" && progress.TotalBytes != 0 {
 		volume = fmt.Sprintf("%s (%.2f%%)", volume, float64(progress.BytesDone)/float64(progress.TotalBytes)*100)
 	}
 

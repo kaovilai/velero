@@ -37,6 +37,8 @@ import (
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 
+	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
+
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	cliinstall "github.com/vmware-tanzu/velero/pkg/cmd/cli/install"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/flag"
@@ -321,10 +323,15 @@ func VeleroBackupNamespace(ctx context.Context, veleroCLI, veleroNamespace strin
 	if backupCfg.UseVolumeSnapshots {
 		args = append(args, "--snapshot-volumes")
 	} else {
-		args = append(args, "--default-volumes-to-restic")
+		if backupCfg.UseRestic {
+			args = append(args, "--default-volumes-to-restic")
+		} else {
+			args = append(args, "--default-volumes-to-fs-backup")
+		}
+
 		// To workaround https://github.com/vmware-tanzu/velero-plugin-for-vsphere/issues/347 for vsphere plugin v1.1.1
 		// if the "--snapshot-volumes=false" isn't specified explicitly, the vSphere plugin will always take snapshots
-		// for the volumes even though the "--default-volumes-to-restic" is specified
+		// for the volumes even though the "--default-volumes-to-fs-backup" is specified
 		// TODO This can be removed if the logic of vSphere plugin bump up to 1.3
 		args = append(args, "--snapshot-volumes=false")
 	}
@@ -360,7 +367,7 @@ func VeleroBackupExcludeNamespaces(ctx context.Context, veleroCLI string, velero
 	args := []string{
 		"--namespace", veleroNamespace, "create", "backup", backupName,
 		"--exclude-namespaces", namespaces,
-		"--default-volumes-to-restic", "--wait",
+		"--default-volumes-to-fs-backup", "--wait",
 	}
 	return VeleroBackupExec(ctx, veleroCLI, veleroNamespace, backupName, args)
 }
@@ -371,7 +378,7 @@ func VeleroBackupIncludeNamespaces(ctx context.Context, veleroCLI string, velero
 	args := []string{
 		"--namespace", veleroNamespace, "create", "backup", backupName,
 		"--include-namespaces", namespaces,
-		"--default-volumes-to-restic", "--wait",
+		"--default-volumes-to-fs-backup", "--wait",
 	}
 	return VeleroBackupExec(ctx, veleroCLI, veleroNamespace, backupName, args)
 }
@@ -429,14 +436,19 @@ func VeleroScheduleCreate(ctx context.Context, veleroCLI string, veleroNamespace
 
 func VeleroCmdExec(ctx context.Context, veleroCLI string, args []string) error {
 	cmd := exec.CommandContext(ctx, veleroCLI, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	var errBuf, outBuf bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
+	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
 	fmt.Printf("velero cmd =%v\n", cmd)
 	err := cmd.Run()
+	retAll := outBuf.String() + " " + errBuf.String()
+	if strings.Contains(strings.ToLower(retAll), "failed") {
+		return errors.Wrap(err, fmt.Sprintf("velero cmd =%v return with failure\n", cmd))
+	}
 	if err != nil {
 		return err
 	}
-	return err
+	return nil
 }
 
 func VeleroBackupLogs(ctx context.Context, veleroCLI string, veleroNamespace string, backupName string) error {
@@ -866,6 +878,43 @@ func GetBackupsFromBsl(ctx context.Context, veleroCLI, bslName string) ([]string
 	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
 }
 
+func GetScheduledBackupsCreationTime(ctx context.Context, veleroCLI, bslName, scheduleName string) ([]string, error) {
+	var creationTimes []string
+	backups, err := GetBackupsCreationTime(ctx, veleroCLI, bslName)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range backups {
+		if strings.Contains(b, scheduleName) {
+			creationTimes = append(creationTimes, b)
+		}
+	}
+	return creationTimes, nil
+}
+func GetBackupsCreationTime(ctx context.Context, veleroCLI, bslName string) ([]string, error) {
+	args1 := []string{"get", "backups"}
+	createdTime := "$1,\",\" $5,$6,$7,$8"
+	if strings.TrimSpace(bslName) != "" {
+		args1 = append(args1, "-l", "velero.io/storage-location="+bslName)
+	}
+	CmdLine1 := &common.OsCommandLine{
+		Cmd:  veleroCLI,
+		Args: args1,
+	}
+
+	CmdLine2 := &common.OsCommandLine{
+		Cmd:  "awk",
+		Args: []string{"{print " + createdTime + "}"},
+	}
+
+	CmdLine3 := &common.OsCommandLine{
+		Cmd:  "tail",
+		Args: []string{"-n", "+2"},
+	}
+
+	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
+}
+
 func GetAllBackups(ctx context.Context, veleroCLI string) ([]string, error) {
 	return GetBackupsFromBsl(ctx, veleroCLI, "")
 }
@@ -971,7 +1020,6 @@ func GetSnapshotCheckPoint(client TestClient, VeleroCfg VerleroConfig, expectCou
 }
 
 func GetBackupTTL(ctx context.Context, veleroNamespace, backupName string) (string, error) {
-
 	checkSnapshotCmd := exec.CommandContext(ctx, "kubectl",
 		"get", "backup", "-n", veleroNamespace, backupName, "-o=jsonpath='{.spec.ttl}'")
 	fmt.Printf("checkSnapshotCmd cmd =%v\n", checkSnapshotCmd)
@@ -979,15 +1027,8 @@ func GetBackupTTL(ctx context.Context, veleroNamespace, backupName string) (stri
 	if err != nil {
 		fmt.Print(stdout)
 		fmt.Print(stderr)
-		return "", errors.Wrap(err, "failed to verify")
+		return "", errors.Wrap(err, fmt.Sprintf("failed to run command %s", checkSnapshotCmd))
 	}
-	// lines := strings.Split(stdout, "\n")
-	// complete := true
-	// for _, curLine := range lines {
-	// 	fmt.Println(curLine)
-
-	// }
-	// return complete, nil
 	return stdout, err
 }
 
@@ -1007,4 +1048,30 @@ func GetVersionList(veleroCli, veleroVersion string) []VeleroCLI2Version {
 		veleroCLI2VersionList[i].VeleroCLI = veleroCli
 	}
 	return veleroCLI2VersionList
+}
+func DeleteBackups(ctx context.Context, client TestClient) error {
+	backupList := new(velerov1api.BackupList)
+	if err := client.Kubebuilder.List(ctx, backupList, &kbclient.ListOptions{Namespace: VeleroCfg.VeleroNamespace}); err != nil {
+		return fmt.Errorf("failed to list backup object in %s namespace with err %v", VeleroCfg.VeleroNamespace, err)
+	}
+	for _, backup := range backupList.Items {
+		fmt.Printf("Backup %s is going to be deleted...\n", backup.Name)
+		if err := VeleroBackupDelete(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, backup.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func GetSchedule(ctx context.Context, veleroNamespace, scheduleName string) (string, error) {
+	checkSnapshotCmd := exec.CommandContext(ctx, "kubectl",
+		"get", "schedule", "-n", veleroNamespace, scheduleName, "-o=jsonpath='{.metadata.creationTimestamp}'")
+	fmt.Printf("Cmd =%v\n", checkSnapshotCmd)
+	stdout, stderr, err := veleroexec.RunCommand(checkSnapshotCmd)
+	if err != nil {
+		fmt.Print(stdout)
+		fmt.Print(stderr)
+		return "", errors.Wrap(err, fmt.Sprintf("failed to run command %s", checkSnapshotCmd))
+	}
+	return stdout, err
 }

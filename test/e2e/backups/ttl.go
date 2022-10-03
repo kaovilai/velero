@@ -58,12 +58,11 @@ func (b *TTL) Init() {
 }
 
 func TTLTest() {
+	var err error
 	useVolumeSnapshots := true
 	test := new(TTL)
-	client, err := NewTestClient(VeleroCfg.DefaultCluster)
-	if err != nil {
-		println(err.Error())
-	}
+	client := *VeleroCfg.ClientToInstallVelero
+
 	//Expect(err).To(Succeed(), "Failed to instantiate cluster client for backup tests")
 
 	BeforeEach(func() {
@@ -76,12 +75,15 @@ func TTLTest() {
 	})
 
 	AfterEach(func() {
-		if VeleroCfg.InstallVelero {
-			VeleroCfg.GCFrequency = ""
-			if !VeleroCfg.Debug {
+		VeleroCfg.GCFrequency = ""
+		if !VeleroCfg.Debug {
+			By("Clean backups after test", func() {
+				DeleteBackups(context.Background(), *VeleroCfg.ClientToInstallVelero)
+			})
+			if VeleroCfg.InstallVelero {
 				Expect(VeleroUninstall(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To(Succeed())
-				Expect(DeleteNamespace(test.ctx, client, test.testNS, false)).To(Succeed(), fmt.Sprintf("Failed to delete the namespace %s", test.testNS))
 			}
+			Expect(DeleteNamespace(test.ctx, client, test.testNS, false)).To(Succeed(), fmt.Sprintf("Failed to delete the namespace %s", test.testNS))
 		}
 	})
 

@@ -35,6 +35,7 @@ import (
 	. "github.com/vmware-tanzu/velero/test/e2e/bsl-mgmt"
 	. "github.com/vmware-tanzu/velero/test/e2e/orderedresources"
 	. "github.com/vmware-tanzu/velero/test/e2e/privilegesmgmt"
+	. "github.com/vmware-tanzu/velero/test/e2e/pv-backup"
 	. "github.com/vmware-tanzu/velero/test/e2e/resource-filtering"
 	. "github.com/vmware-tanzu/velero/test/e2e/scale"
 	. "github.com/vmware-tanzu/velero/test/e2e/upgrade"
@@ -77,9 +78,11 @@ func init() {
 	flag.StringVar(&VeleroCfg.GCFrequency, "garbage-collection-frequency", "", "Frequency of garbage collection.")
 	flag.StringVar(&VeleroCfg.DefaultCluster, "default-cluster", "", "Default cluster context for migration test.")
 	flag.StringVar(&VeleroCfg.StandbyCluster, "standby-cluster", "", "Standby cluster context for migration test.")
+	flag.StringVar(&VeleroCfg.UploaderType, "uploader-type", "", "Identify persistent volume backup uploader.")
 }
 
-var _ = Describe("[APIGroup] Velero tests with various CRD API group versions", APIGropuVersionsTest)
+var _ = Describe("[APIGroup][Common] Velero tests with various CRD API group versions", APIGropuVersionsTest)
+var _ = Describe("[APIGroup][APIExtensions] CRD of apiextentions v1beta1 should be B/R successfully from cluster(k8s version < 1.22) to cluster(k8s version >= 1.22)", APIExtensionsVersionsTest)
 
 // Test backup and restore of Kibishi using restic
 var _ = Describe("[Basic][Restic] Velero tests on cluster using the plugin provider for object storage and Restic for volume backups", BackupRestoreWithRestic)
@@ -110,6 +113,7 @@ var _ = Describe("[Backups][Deletion][Restic] Velero tests of Restic backup dele
 var _ = Describe("[Backups][Deletion][Snapshot] Velero tests of snapshot backup deletion", BackupDeletionWithSnapshots)
 var _ = Describe("[Backups][TTL] Local backups and restic repos will be deleted once the corresponding backup storage location is deleted", TTLTest)
 var _ = Describe("[Backups][BackupsSync] Backups in object storage are synced to a new Velero and deleted backups in object storage are synced to be deleted in Velero", BackupsSyncTest)
+var _ = Describe("[Backups][Schedule] Backup will be created periodly by schedule defined by a Cron expression", ScheduleBackupTest)
 
 var _ = Describe("[PrivilegesMgmt][SSR] Velero test on ssr object when controller namespace mix-ups", SSRTest)
 
@@ -124,6 +128,9 @@ var _ = Describe("[Schedule][OrederedResources] Backup resources should follow t
 
 var _ = Describe("[NamespaceMapping][Single] Backup resources should follow the specific order in schedule", OneNamespaceMappingTest)
 var _ = Describe("[NamespaceMapping][Multiple] Backup resources should follow the specific order in schedule", MultiNamespacesMappingTest)
+
+var _ = Describe("[pv-backup][Opt-In] Backup resources should follow the specific order in schedule", OptInPVBackupTest)
+var _ = Describe("[pv-backup][Opt-Out] Backup resources should follow the specific order in schedule", OptOutPVBackupTest)
 
 func GetKubeconfigContext() error {
 	var err error

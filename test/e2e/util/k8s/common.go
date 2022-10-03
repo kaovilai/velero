@@ -24,6 +24,7 @@ import (
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	corev1 "k8s.io/api/core/v1"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -49,7 +50,6 @@ func CreateSecretFromFiles(ctx context.Context, client TestClient, namespace str
 
 		data[key] = contents
 	}
-
 	secret := builder.ForSecret(namespace, name).Data(data).Result()
 	_, err := client.ClientGo.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
 	return err
@@ -64,7 +64,7 @@ func WaitForPods(ctx context.Context, client TestClient, namespace string, pods 
 			checkPod, err := client.ClientGo.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
 			if err != nil {
 				//Should ignore "etcdserver: request timed out" kind of errors, try to get pod status again before timeout.
-				fmt.Println(errors.Wrap(err, fmt.Sprintf("Failed to verify pod %s/%s is %s, try again...", namespace, podName, corev1api.PodRunning)))
+				fmt.Println(errors.Wrap(err, fmt.Sprintf("Failed to verify pod %s/%s is %s, try again...\n", namespace, podName, corev1api.PodRunning)))
 				return false, nil
 			}
 			// If any pod is still waiting we don't need to check any more so return and wait for next poll interval
@@ -124,6 +124,45 @@ func GetPvByPvc(ctx context.Context, namespace, pvc string) ([]string, error) {
 	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
 }
 
+func CRDShouldExist(ctx context.Context, name string) error {
+	return CRDCountShouldBe(ctx, name, 1)
+}
+
+func CRDShouldNotExist(ctx context.Context, name string) error {
+	return CRDCountShouldBe(ctx, name, 0)
+}
+
+func CRDCountShouldBe(ctx context.Context, name string, count int) error {
+	crdList, err := GetCRD(ctx, name)
+	if err != nil {
+		return errors.Wrap(err, "Fail to get CRDs")
+	}
+	len := len(crdList)
+	if len != count {
+		return errors.New(fmt.Sprintf("CRD count is expected as %d instead of %d", count, len))
+	}
+	return nil
+}
+
+func GetCRD(ctx context.Context, name string) ([]string, error) {
+	CmdLine1 := &common.OsCommandLine{
+		Cmd:  "kubectl",
+		Args: []string{"get", "crd"},
+	}
+
+	CmdLine2 := &common.OsCommandLine{
+		Cmd:  "grep",
+		Args: []string{name},
+	}
+
+	CmdLine3 := &common.OsCommandLine{
+		Cmd:  "awk",
+		Args: []string{"{print $1}"},
+	}
+
+	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
+}
+
 func AddLabelToPv(ctx context.Context, pv, label string) error {
 	return exec.CommandContext(ctx, "kubectl", "label", "pv", pv, label).Run()
 }
@@ -136,6 +175,12 @@ func AddLabelToPvc(ctx context.Context, pvc, namespace, label string) error {
 
 func AddLabelToPod(ctx context.Context, podName, namespace, label string) error {
 	args := []string{"label", "pod", podName, "-n", namespace, label}
+	fmt.Println(args)
+	return exec.CommandContext(ctx, "kubectl", args...).Run()
+}
+
+func AddLabelToCRD(ctx context.Context, crd, label string) error {
+	args := []string{"label", "crd", crd, label}
 	fmt.Println(args)
 	return exec.CommandContext(ctx, "kubectl", args...).Run()
 }
@@ -153,4 +198,87 @@ func KubectlConfigUseContext(ctx context.Context, kubectlContext string) error {
 	fmt.Print(stdout)
 	fmt.Print(stderr)
 	return err
+}
+
+func GetAPIVersions(client *TestClient, name string) ([]string, error) {
+	var version []string
+	APIGroup, err := client.ClientGo.Discovery().ServerGroups()
+	if err != nil {
+		return nil, errors.Wrap(err, "Fail to get server API groups")
+	}
+	for _, group := range APIGroup.Groups {
+		fmt.Println(group.Name)
+		if group.Name == name {
+			for _, v := range group.Versions {
+				fmt.Println(v.Version)
+				version = append(version, v.Version)
+			}
+			return version, nil
+		}
+	}
+	return nil, errors.New("Server API groups is empty")
+}
+
+func GetPVByPodName(client TestClient, namespace, podName string) (string, error) {
+	pvcList, err := GetPvcByPodName(context.Background(), namespace, podName)
+	if err != nil {
+		return "", err
+	}
+	if len(pvcList) != 1 {
+		return "", errors.New(fmt.Sprintf("Only 1 PVC of pod %s should be found under namespace %s", podName, namespace))
+	}
+	pvList, err := GetPvByPvc(context.Background(), namespace, pvcList[0])
+	if err != nil {
+		return "", err
+	}
+	if len(pvList) != 1 {
+		return "", errors.New(fmt.Sprintf("Only 1 PV of PVC %s pod %s should be found under namespace %s", pvcList[0], podName, namespace))
+	}
+	pv_value, err := GetPersistentVolume(context.Background(), client, "", pvList[0])
+	fmt.Println(pv_value.Annotations["pv.kubernetes.io/provisioned-by"])
+	if err != nil {
+		return "", err
+	}
+	return pv_value.Name, nil
+}
+func CreatePodWithPVC(client TestClient, ns, podName, sc string, volumeNameList []string) (*corev1.Pod, error) {
+	volumes := []corev1.Volume{}
+	for _, volume := range volumeNameList {
+		pvc, err := CreatePVC(client, ns, fmt.Sprintf("pvc-%s", volume), sc)
+		if err != nil {
+			return nil, err
+		}
+		volumes = append(volumes, corev1.Volume{
+			Name: volume,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvc.Name,
+					ReadOnly:  false,
+				},
+			},
+		})
+	}
+	pod, err := CreatePod(client, ns, podName, volumes)
+	if err != nil {
+		return nil, err
+	}
+	return pod, nil
+}
+
+func CreateFileToPod(ctx context.Context, namespace, podName, volume, filename, content string) error {
+	arg := []string{"exec", "-n", namespace, "-c", podName, podName,
+		"--", "/bin/sh", "-c", fmt.Sprintf("echo ns-%s pod-%s volume-%s  > /%s/%s", namespace, podName, volume, volume, filename)}
+	cmd := exec.CommandContext(ctx, "kubectl", arg...)
+	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
+	return cmd.Run()
+}
+func ReadFileFromPodVolume(ctx context.Context, namespace, podName, volume, filename string) (string, error) {
+	arg := []string{"exec", "-n", namespace, "-c", podName, podName,
+		"--", "cat", fmt.Sprintf("/%s/%s", volume, filename)}
+	cmd := exec.CommandContext(ctx, "kubectl", arg...)
+	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
+	stdout, stderr, err := veleroexec.RunCommand(cmd)
+	fmt.Print(stdout)
+	fmt.Print(stderr)
+	return stdout, err
 }

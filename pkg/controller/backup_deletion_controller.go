@@ -39,13 +39,14 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
-	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/repository"
-	"github.com/vmware-tanzu/velero/pkg/restic"
 	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/vmware-tanzu/velero/pkg/podvolume"
 )
 
 const (
@@ -91,7 +92,7 @@ func NewBackupDeletionReconciler(
 
 func (r *backupDeletionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Make sure the expired requests can be deleted eventually
-	s := kube.NewPeriodicalEnqueueSource(r.logger, mgr.GetClient(), &velerov1api.DeleteBackupRequestList{}, time.Hour)
+	s := kube.NewPeriodicalEnqueueSource(r.logger, mgr.GetClient(), &velerov1api.DeleteBackupRequestList{}, time.Hour, kube.PeriodicalEnqueueSourceOption{})
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov1api.DeleteBackupRequest{}).
 		Watches(s, nil).
@@ -281,7 +282,7 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if snapshots, err := backupStore.GetBackupVolumeSnapshots(backup.Name); err != nil {
 			errs = append(errs, errors.Wrap(err, "error getting backup's volume snapshots").Error())
 		} else {
-			volumeSnapshotters := make(map[string]velero.VolumeSnapshotter)
+			volumeSnapshotters := make(map[string]vsv1.VolumeSnapshotter)
 
 			for _, snapshot := range snapshots {
 				log.WithField("providerSnapshotID", snapshot.Status.ProviderSnapshotID).Info("Removing snapshot associated with backup")
@@ -391,7 +392,7 @@ func volumeSnapshottersForVSL(
 	namespace, vslName string,
 	client client.Client,
 	pluginManager clientmgmt.Manager,
-) (velero.VolumeSnapshotter, error) {
+) (vsv1.VolumeSnapshotter, error) {
 	vsl := &velerov1api.VolumeSnapshotLocation{}
 	if err := client.Get(ctx, types.NamespacedName{
 		Namespace: namespace,
@@ -440,7 +441,7 @@ func (r *backupDeletionReconciler) deleteResticSnapshots(ctx context.Context, ba
 		return nil
 	}
 
-	snapshots, err := restic.GetSnapshotsInBackup(ctx, backup, r.Client)
+	snapshots, err := getSnapshotsInBackup(ctx, backup, r.Client)
 	if err != nil {
 		return []error{err}
 	}
@@ -490,4 +491,22 @@ func (r *backupDeletionReconciler) patchBackup(ctx context.Context, backup *vele
 		return nil, errors.Wrap(err, "error patching Backup")
 	}
 	return backup, nil
+}
+
+// getSnapshotsInBackup returns a list of all restic snapshot ids associated with
+// a given Velero backup.
+func getSnapshotsInBackup(ctx context.Context, backup *velerov1api.Backup, kbClient client.Client) ([]repository.SnapshotIdentifier, error) {
+	podVolumeBackups := &velerov1api.PodVolumeBackupList{}
+	options := &client.ListOptions{
+		LabelSelector: labels.Set(map[string]string{
+			velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
+		}).AsSelector(),
+	}
+
+	err := kbClient.List(ctx, podVolumeBackups, options)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return podvolume.GetSnapshotIdentifier(podVolumeBackups), nil
 }

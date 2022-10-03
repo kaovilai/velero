@@ -233,6 +233,7 @@ func TestGetStorageVariables(t *testing.T) {
 		name                  string
 		backupLocation        velerov1api.BackupStorageLocation
 		repoName              string
+		repoBackend           string
 		getS3BucketRegion     func(string) (string, error)
 		getAzureStorageDomain func(map[string]string) string
 		expected              map[string]string
@@ -249,7 +250,7 @@ func TestGetStorageVariables(t *testing.T) {
 			expectedErr: "invalid storage provider",
 		},
 		{
-			name: "aws, ObjectStorage section not exists in BSL, s3Url exist",
+			name: "aws, ObjectStorage section not exists in BSL, s3Url exist, https",
 			backupLocation: velerov1api.BackupStorageLocation{
 				Spec: velerov1api.BackupStorageLocationSpec{
 					Provider: "velero.io/aws",
@@ -257,19 +258,39 @@ func TestGetStorageVariables(t *testing.T) {
 						"bucket":                "fake-bucket",
 						"prefix":                "fake-prefix",
 						"region":                "fake-region/",
-						"s3Url":                 "fake-url",
+						"s3Url":                 "https://fake-url/",
 						"insecureSkipTLSVerify": "true",
 					},
 				},
 			},
+			repoBackend: "fake-repo-type",
 			expected: map[string]string{
 				"bucket":        "fake-bucket",
-				"prefix":        "fake-prefix/unified-repo/",
+				"prefix":        "fake-prefix/fake-repo-type/",
 				"region":        "fake-region",
 				"fspath":        "",
 				"endpoint":      "fake-url",
+				"doNotUseTLS":   "false",
 				"skipTLSVerify": "true",
 			},
+		},
+		{
+			name: "aws, ObjectStorage section not exists in BSL, s3Url exist, invalid",
+			backupLocation: velerov1api.BackupStorageLocation{
+				Spec: velerov1api.BackupStorageLocationSpec{
+					Provider: "velero.io/aws",
+					Config: map[string]string{
+						"bucket":                "fake-bucket",
+						"prefix":                "fake-prefix",
+						"region":                "fake-region/",
+						"s3Url":                 "https://fake-url/fake-path",
+						"insecureSkipTLSVerify": "true",
+					},
+				},
+			},
+			repoBackend: "fake-repo-type",
+			expected:    map[string]string{},
+			expectedErr: "path is not expected in s3Url https://fake-url/fake-path",
 		},
 		{
 			name: "aws, ObjectStorage section not exists in BSL, s3Url not exist",
@@ -286,12 +307,14 @@ func TestGetStorageVariables(t *testing.T) {
 			getS3BucketRegion: func(bucket string) (string, error) {
 				return "region from bucket: " + bucket, nil
 			},
+			repoBackend: "fake-repo-type",
 			expected: map[string]string{
 				"bucket":        "fake-bucket",
-				"prefix":        "fake-prefix/unified-repo/",
+				"prefix":        "fake-prefix/fake-repo-type/",
 				"region":        "region from bucket: fake-bucket",
 				"fspath":        "",
 				"endpoint":      "s3-region from bucket: fake-bucket.amazonaws.com",
+				"doNotUseTLS":   "false",
 				"skipTLSVerify": "false",
 			},
 		},
@@ -310,7 +333,7 @@ func TestGetStorageVariables(t *testing.T) {
 			expectedErr: "error get s3 bucket region: fake error",
 		},
 		{
-			name: "aws, ObjectStorage section exists in BSL, s3Url exist",
+			name: "aws, ObjectStorage section exists in BSL, s3Url exist, http",
 			backupLocation: velerov1api.BackupStorageLocation{
 				Spec: velerov1api.BackupStorageLocationSpec{
 					Provider: "velero.io/aws",
@@ -318,7 +341,7 @@ func TestGetStorageVariables(t *testing.T) {
 						"bucket":                "fake-bucket-config",
 						"prefix":                "fake-prefix-config",
 						"region":                "fake-region",
-						"s3Url":                 "fake-url",
+						"s3Url":                 "http://fake-url/",
 						"insecureSkipTLSVerify": "false",
 					},
 					StorageType: velerov1api.StorageType{
@@ -332,12 +355,14 @@ func TestGetStorageVariables(t *testing.T) {
 			getS3BucketRegion: func(bucket string) (string, error) {
 				return "region from bucket: " + bucket, nil
 			},
+			repoBackend: "fake-repo-type",
 			expected: map[string]string{
 				"bucket":        "fake-bucket-object-store",
-				"prefix":        "fake-prefix-object-store/unified-repo/",
+				"prefix":        "fake-prefix-object-store/fake-repo-type/",
 				"region":        "fake-region",
 				"fspath":        "",
 				"endpoint":      "fake-url",
+				"doNotUseTLS":   "true",
 				"skipTLSVerify": "false",
 			},
 		},
@@ -364,9 +389,10 @@ func TestGetStorageVariables(t *testing.T) {
 			getAzureStorageDomain: func(config map[string]string) string {
 				return config["storageDomain"]
 			},
+			repoBackend: "fake-repo-type",
 			expected: map[string]string{
 				"bucket":        "fake-bucket-object-store",
-				"prefix":        "fake-prefix-object-store/unified-repo/",
+				"prefix":        "fake-prefix-object-store/fake-repo-type/",
 				"region":        "fake-region",
 				"fspath":        "",
 				"storageDomain": "fake-domain",
@@ -386,13 +412,14 @@ func TestGetStorageVariables(t *testing.T) {
 					},
 				},
 			},
-			repoName: "//fake-name//",
+			repoName:    "//fake-name//",
+			repoBackend: "fake-repo-type",
 			getAzureStorageDomain: func(config map[string]string) string {
 				return config["storageDomain"]
 			},
 			expected: map[string]string{
 				"bucket":        "fake-bucket",
-				"prefix":        "fake-prefix/unified-repo/fake-name/",
+				"prefix":        "fake-prefix/fake-repo-type/fake-name/",
 				"region":        "fake-region",
 				"fspath":        "",
 				"storageDomain": "fake-domain",
@@ -409,10 +436,11 @@ func TestGetStorageVariables(t *testing.T) {
 					},
 				},
 			},
+			repoBackend: "fake-repo-type",
 			expected: map[string]string{
 				"fspath": "fake-path",
 				"bucket": "",
-				"prefix": "fake-prefix/unified-repo/",
+				"prefix": "fake-prefix/fake-repo-type/",
 				"region": "",
 			},
 		},
@@ -423,7 +451,7 @@ func TestGetStorageVariables(t *testing.T) {
 			getS3BucketRegion = tc.getS3BucketRegion
 			getAzureStorageDomain = tc.getAzureStorageDomain
 
-			actual, err := getStorageVariables(&tc.backupLocation, tc.repoName)
+			actual, err := getStorageVariables(&tc.backupLocation, tc.repoBackend, tc.repoName)
 
 			require.Equal(t, tc.expected, actual)
 
@@ -503,7 +531,7 @@ func TestGetStoreOptions(t *testing.T) {
 			name:        "wrong param type",
 			repoParam:   struct{}{},
 			expected:    map[string]string{},
-			expectedErr: "invalid parameter",
+			expectedErr: "invalid parameter, expect provider.RepoParam, actual struct {}",
 		},
 		{
 			name: "get storage variable fail",
@@ -512,7 +540,7 @@ func TestGetStoreOptions(t *testing.T) {
 				BackupRepo:     &velerov1api.BackupRepository{},
 			},
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, errors.New("fake-error-2")
 				},
 			},
@@ -526,7 +554,7 @@ func TestGetStoreOptions(t *testing.T) {
 				BackupRepo:     &velerov1api.BackupRepository{},
 			},
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, nil
 				},
 				getStorageCredentials: func(*velerov1api.BackupStorageLocation, velerocredentials.FileStore) (map[string]string, error) {
@@ -586,7 +614,7 @@ func TestPrepareRepo(t *testing.T) {
 			repoService:     new(reposervicenmocks.BackupRepoService),
 			credStoreReturn: "fake-password",
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, errors.New("fake-store-option-error")
 				},
 			},
@@ -597,7 +625,7 @@ func TestPrepareRepo(t *testing.T) {
 			getter:          new(credmock.SecretStore),
 			credStoreReturn: "fake-password",
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, nil
 				},
 				getStorageCredentials: func(*velerov1api.BackupStorageLocation, velerocredentials.FileStore) (map[string]string, error) {
@@ -618,7 +646,7 @@ func TestPrepareRepo(t *testing.T) {
 			getter:          new(credmock.SecretStore),
 			credStoreReturn: "fake-password",
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, nil
 				},
 				getStorageCredentials: func(*velerov1api.BackupStorageLocation, velerocredentials.FileStore) (map[string]string, error) {
@@ -695,7 +723,7 @@ func TestForget(t *testing.T) {
 			getter:          new(credmock.SecretStore),
 			credStoreReturn: "fake-password",
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, nil
 				},
 				getStorageCredentials: func(*velerov1api.BackupStorageLocation, velerocredentials.FileStore) (map[string]string, error) {
@@ -719,7 +747,7 @@ func TestForget(t *testing.T) {
 			getter:          new(credmock.SecretStore),
 			credStoreReturn: "fake-password",
 			funcTable: localFuncTable{
-				getStorageVariables: func(*velerov1api.BackupStorageLocation, string) (map[string]string, error) {
+				getStorageVariables: func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error) {
 					return map[string]string{}, nil
 				},
 				getStorageCredentials: func(*velerov1api.BackupStorageLocation, velerocredentials.FileStore) (map[string]string, error) {
@@ -775,6 +803,7 @@ func TestForget(t *testing.T) {
 
 			err := urp.Forget(context.Background(), "", RepoParam{
 				BackupLocation: &velerov1api.BackupStorageLocation{},
+				BackupRepo:     &velerov1api.BackupRepository{},
 			})
 
 			if tc.expectedErr == "" {

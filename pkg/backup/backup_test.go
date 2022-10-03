@@ -47,6 +47,8 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/discovery"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	biav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/backupitemaction/v1"
+	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/test"
 	testutil "github.com/vmware-tanzu/velero/pkg/test"
@@ -1360,7 +1362,7 @@ func TestBackupActionsRunForCorrectItems(t *testing.T) {
 				h.addItems(t, resource)
 			}
 
-			actions := []velero.BackupItemAction{}
+			actions := []biav1.BackupItemAction{}
 			for action := range tc.actions {
 				actions = append(actions, action)
 			}
@@ -1386,7 +1388,7 @@ func TestBackupWithInvalidActions(t *testing.T) {
 		name         string
 		backup       *velerov1.Backup
 		apiResources []*test.APIResource
-		actions      []velero.BackupItemAction
+		actions      []biav1.BackupItemAction
 	}{
 		{
 			name: "action with invalid label selector results in an error",
@@ -1402,7 +1404,7 @@ func TestBackupWithInvalidActions(t *testing.T) {
 					builder.ForPersistentVolume("baz").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				new(recordResourcesAction).ForLabelSelector("=invalid-selector"),
 			},
 		},
@@ -1420,7 +1422,7 @@ func TestBackupWithInvalidActions(t *testing.T) {
 					builder.ForPersistentVolume("baz").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&appliesToErrorAction{},
 			},
 		},
@@ -1482,7 +1484,7 @@ func TestBackupActionModifications(t *testing.T) {
 		name         string
 		backup       *velerov1.Backup
 		apiResources []*test.APIResource
-		actions      []velero.BackupItemAction
+		actions      []biav1.BackupItemAction
 		want         map[string]unstructuredObject
 	}{
 		{
@@ -1493,7 +1495,7 @@ func TestBackupActionModifications(t *testing.T) {
 					builder.ForPod("ns-1", "pod-1").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.SetLabels(map[string]string{"updated": "true"})
 				}),
@@ -1510,7 +1512,7 @@ func TestBackupActionModifications(t *testing.T) {
 					builder.ForPod("ns-1", "pod-1").ObjectMeta(builder.WithLabels("should-be-removed", "true")).Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.SetLabels(nil)
 				}),
@@ -1527,7 +1529,7 @@ func TestBackupActionModifications(t *testing.T) {
 					builder.ForPod("ns-1", "pod-1").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.Object["spec"].(map[string]interface{})["nodeName"] = "foo"
 				}),
@@ -1545,7 +1547,7 @@ func TestBackupActionModifications(t *testing.T) {
 					builder.ForPod("ns-1", "pod-1").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.SetName(item.GetName() + "-updated")
 					item.SetNamespace(item.GetNamespace() + "-updated")
@@ -1586,7 +1588,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 		name         string
 		backup       *velerov1.Backup
 		apiResources []*test.APIResource
-		actions      []velero.BackupItemAction
+		actions      []biav1.BackupItemAction
 		want         []string
 	}{
 		{
@@ -1599,7 +1601,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPod("ns-3", "pod-3").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					selector: velero.ResourceSelector{IncludedNamespaces: []string{"ns-1"}},
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
@@ -1631,7 +1633,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPod("ns-3", "pod-3").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
@@ -1661,7 +1663,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPersistentVolume("pv-2").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
@@ -1694,7 +1696,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPersistentVolume("pv-2").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
@@ -1724,7 +1726,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPersistentVolume("pv-2").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
@@ -1755,7 +1757,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPersistentVolume("pv-2").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
@@ -1785,7 +1787,7 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 					builder.ForPod("ns-3", "pod-3").Result(),
 				),
 			},
-			actions: []velero.BackupItemAction{
+			actions: []biav1.BackupItemAction{
 				&pluggableAction{
 					selector: velero.ResourceSelector{IncludedNamespaces: []string{"ns-1"}},
 					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
@@ -1830,10 +1832,10 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 }
 
 // volumeSnapshotterGetter is a simple implementation of the VolumeSnapshotterGetter
-// interface that returns velero.VolumeSnapshotters from a map if they exist.
-type volumeSnapshotterGetter map[string]velero.VolumeSnapshotter
+// interface that returns vsv1.VolumeSnapshotters from a map if they exist.
+type volumeSnapshotterGetter map[string]vsv1.VolumeSnapshotter
 
-func (vsg volumeSnapshotterGetter) GetVolumeSnapshotter(name string) (velero.VolumeSnapshotter, error) {
+func (vsg volumeSnapshotterGetter) GetVolumeSnapshotter(name string) (vsv1.VolumeSnapshotter, error) {
 	snapshotter, ok := vsg[name]
 	if !ok {
 		return nil, errors.New("volume snapshotter not found")
@@ -1858,7 +1860,7 @@ type volumeInfo struct {
 	snapshotErr bool
 }
 
-// fakeVolumeSnapshotter is a test fake for the velero.VolumeSnapshotter interface.
+// fakeVolumeSnapshotter is a test fake for the vsv1.VolumeSnapshotter interface.
 type fakeVolumeSnapshotter struct {
 	// PVVolumeNames is a map from PV name to volume ID, used as the basis
 	// for the GetVolumeID method.
@@ -1981,7 +1983,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, false),
 			},
 			want: []*volume.Snapshot{
@@ -2014,7 +2016,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabels("failure-domain.beta.kubernetes.io/zone", "zone-1")).Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "zone-1", "type-1", 100, false),
 			},
 			want: []*volume.Snapshot{
@@ -2048,7 +2050,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabels("topology.kubernetes.io/zone", "zone-1")).Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "zone-1", "type-1", 100, false),
 			},
 			want: []*volume.Snapshot{
@@ -2082,7 +2084,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabelsMap(map[string]string{"failure-domain.beta.kubernetes.io/zone": "zone-1-deprecated", "topology.kubernetes.io/zone": "zone-1-ga"})).Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "zone-1-ga", "type-1", 100, false),
 			},
 			want: []*volume.Snapshot{
@@ -2116,7 +2118,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, true),
 			},
 			want: []*volume.Snapshot{
@@ -2148,7 +2150,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, false),
 			},
 			want: nil,
@@ -2163,7 +2165,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, false),
 			},
 			want: nil,
@@ -2181,7 +2183,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{},
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{},
 			want:              nil,
 		},
 		{
@@ -2197,7 +2199,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-1").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter),
 			},
 			want: nil,
@@ -2217,7 +2219,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					builder.ForPersistentVolume("pv-2").Result(),
 				),
 			},
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, false),
 				"another": new(fakeVolumeSnapshotter).WithVolume("pv-2", "vol-2", "", "type-2", 100, false),
 			},
@@ -2595,7 +2597,7 @@ func TestBackupWithHooks(t *testing.T) {
 
 type fakeResticBackupperFactory struct{}
 
-func (f *fakeResticBackupperFactory) NewBackupper(context.Context, *velerov1.Backup) (podvolume.Backupper, error) {
+func (f *fakeResticBackupperFactory) NewBackupper(context.Context, *velerov1.Backup, string) (podvolume.Backupper, error) {
 	return &fakeResticBackupper{}, nil
 }
 
@@ -2685,7 +2687,7 @@ func TestBackupWithRestic(t *testing.T) {
 				),
 			},
 			vsl: newSnapshotLocation("velero", "default", "default"),
-			snapshotterGetter: map[string]velero.VolumeSnapshotter{
+			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"default": new(fakeVolumeSnapshotter).
 					WithVolume("pv-1", "vol-1", "", "type-1", 100, false).
 					WithVolume("pv-2", "vol-2", "", "type-1", 100, false),
@@ -2805,7 +2807,7 @@ func newSnapshotLocation(ns, name, provider string) *velerov1.VolumeSnapshotLoca
 }
 
 func defaultBackup() *builder.BackupBuilder {
-	return builder.ForBackup(velerov1.DefaultNamespace, "backup-1").DefaultVolumesToRestic(false)
+	return builder.ForBackup(velerov1.DefaultNamespace, "backup-1").DefaultVolumesToFsBackup(false)
 }
 
 func toUnstructuredOrFail(t *testing.T, obj interface{}) map[string]interface{} {

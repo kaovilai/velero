@@ -18,27 +18,73 @@ package provider
 
 import (
 	"context"
+	"time"
 
+	"github.com/pkg/errors"
+
+	"github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/vmware-tanzu/velero/internal/credentials"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/repository/provider"
+	"github.com/vmware-tanzu/velero/pkg/uploader"
+	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
 )
+
+const restoreProgressCheckInterval = 10 * time.Second
+const backupProgressCheckInterval = 10 * time.Second
 
 // Provider which is designed for one pod volumn to do the backup or restore
 type Provider interface {
-	// RunBackup which will do backup for one specific volumn and return snapshotID error
-	// updateFunc which is used for update backup progress into related pvb status
+	// RunBackup which will do backup for one specific volumn and return snapshotID, isSnapshotEmpty, error
+	// updater is used for updating backup progress which implement by third-party
 	RunBackup(
 		ctx context.Context,
 		path string,
 		tags map[string]string,
 		parentSnapshot string,
-		updateFunc func(velerov1api.PodVolumeOperationProgress)) (string, error)
+		updater uploader.ProgressUpdater) (string, bool, error)
 	// RunRestore which will do restore for one specific volumn with given snapshot id and return error
-	// updateFunc which is used for update restore progress into related pvr status
+	// updater is used for updating backup progress which implement by third-party
 	RunRestore(
 		ctx context.Context,
 		snapshotID string,
 		volumePath string,
-		updateFunc func(velerov1api.PodVolumeOperationProgress)) error
+		updater uploader.ProgressUpdater) error
 	// Close which will close related repository
-	Close(ctx context.Context)
+	Close(ctx context.Context) error
+}
+
+// NewUploaderProvider initialize provider with specific uploaderType
+func NewUploaderProvider(
+	ctx context.Context,
+	client client.Client,
+	uploaderType string,
+	repoIdentifier string,
+	bsl *velerov1api.BackupStorageLocation,
+	backupRepo *velerov1api.BackupRepository,
+	credGetter *credentials.CredentialGetter,
+	repoKeySelector *v1.SecretKeySelector,
+	log logrus.FieldLogger,
+) (Provider, error) {
+	if credGetter.FromFile == nil {
+		return nil, errors.New("uninitialized FileStore credentail is not supported")
+	}
+	if uploaderType == uploader.KopiaType {
+		// We use the hardcode repositoryType velerov1api.BackupRepositoryTypeKopia for now, because we have only one implementation of unified repo.
+		// TODO: post v1.10, replace the hardcode. In future, when we have multiple implementations of Unified Repo (besides Kopia), we will add the
+		// repositoryType to BSL, because by then, we are not able to hardcode the repositoryType to BackupRepositoryTypeKopia for Unified Repo.
+		if err := provider.NewUnifiedRepoProvider(*credGetter, velerov1api.BackupRepositoryTypeKopia, log).ConnectToRepo(ctx, provider.RepoParam{BackupLocation: bsl, BackupRepo: backupRepo}); err != nil {
+			return nil, errors.Wrap(err, "failed to connect repository")
+		}
+		return NewKopiaUploaderProvider(ctx, credGetter, backupRepo, log)
+	} else {
+		if err := provider.NewResticRepositoryProvider(credGetter.FromFile, filesystem.NewFileSystem(), log).ConnectToRepo(ctx, provider.RepoParam{BackupLocation: bsl, BackupRepo: backupRepo}); err != nil {
+			return nil, errors.Wrap(err, "failed to connect repository")
+		}
+		return NewResticUploaderProvider(repoIdentifier, bsl, credGetter, repoKeySelector, log)
+	}
 }

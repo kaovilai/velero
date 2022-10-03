@@ -20,18 +20,10 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/vmware-tanzu/velero/pkg/repository/udmrepo"
+	"github.com/vmware-tanzu/velero/pkg/repository/udmrepo/kopialib"
 )
 
-const (
-	defaultUsername = "default"
-	defaultDomain   = "default"
-)
-
+// Create creates an instance of BackupRepoService
 func Create(logger logrus.FieldLogger) udmrepo.BackupRepoService {
-	///TODO: create from kopiaLib
-	return nil
-}
-
-func GetRepoUser() (username, domain string) {
-	return defaultUsername, defaultDomain
+	return kopialib.NewKopiaRepoService(logger)
 }

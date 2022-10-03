@@ -19,8 +19,11 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"path"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -37,6 +40,7 @@ type unifiedRepoProvider struct {
 	credentialGetter credentials.CredentialGetter
 	workPath         string
 	repoService      udmrepo.BackupRepoService
+	repoBackend      string
 	log              logrus.FieldLogger
 }
 
@@ -49,7 +53,7 @@ var getS3BucketRegion = repoconfig.GetAWSBucketRegion
 var getAzureStorageDomain = repoconfig.GetAzureStorageDomain
 
 type localFuncTable struct {
-	getStorageVariables   func(*velerov1api.BackupStorageLocation, string) (map[string]string, error)
+	getStorageVariables   func(*velerov1api.BackupStorageLocation, string, string) (map[string]string, error)
 	getStorageCredentials func(*velerov1api.BackupStorageLocation, credentials.FileStore) (map[string]string, error)
 }
 
@@ -59,41 +63,49 @@ var funcTable = localFuncTable{
 }
 
 const (
-	repoOpDescFullMaintain  = "full maintenance"
-	repoOpDescQuickMaintain = "quick maintenance"
-	repoOpDescForget        = "forget"
+	repoOpDescMaintain = "repo maintenance"
+	repoOpDescForget   = "forget"
+
+	repoConnectDesc = "unfied repo"
 )
 
 // NewUnifiedRepoProvider creates the service provider for Unified Repo
 func NewUnifiedRepoProvider(
 	credentialGetter credentials.CredentialGetter,
+	repoBackend string,
 	log logrus.FieldLogger,
-) (Provider, error) {
+) Provider {
 	repo := unifiedRepoProvider{
 		credentialGetter: credentialGetter,
+		repoBackend:      repoBackend,
 		log:              log,
 	}
 
 	repo.repoService = createRepoService(log)
 
-	log.Debug("Finished create unified repo service")
-
-	return &repo, nil
+	return &repo
 }
 
 func (urp *unifiedRepoProvider) InitRepo(ctx context.Context, param RepoParam) error {
 	log := urp.log.WithFields(logrus.Fields{
-		"BSL name": param.BackupLocation.Name,
-		"BSL UID":  param.BackupLocation.UID,
+		"BSL name":  param.BackupLocation.Name,
+		"repo name": param.BackupRepo.Name,
+		"repo UID":  param.BackupRepo.UID,
 	})
 
 	log.Debug("Start to init repo")
 
 	repoOption, err := udmrepo.NewRepoOptions(
 		udmrepo.WithPassword(urp, param),
-		udmrepo.WithConfigFile(urp.workPath, string(param.BackupLocation.UID)),
+		udmrepo.WithConfigFile(urp.workPath, string(param.BackupRepo.UID)),
+		udmrepo.WithGenOptions(
+			map[string]string{
+				udmrepo.GenOptionOwnerName:   udmrepo.GetRepoUser(),
+				udmrepo.GenOptionOwnerDomain: udmrepo.GetRepoDomain(),
+			},
+		),
 		udmrepo.WithStoreOptions(urp, param),
-		udmrepo.WithDescription(repoOpDescFullMaintain),
+		udmrepo.WithDescription(repoConnectDesc),
 	)
 
 	if err != nil {
@@ -112,17 +124,24 @@ func (urp *unifiedRepoProvider) InitRepo(ctx context.Context, param RepoParam) e
 
 func (urp *unifiedRepoProvider) ConnectToRepo(ctx context.Context, param RepoParam) error {
 	log := urp.log.WithFields(logrus.Fields{
-		"BSL name": param.BackupLocation.Name,
-		"BSL UID":  param.BackupLocation.UID,
+		"BSL name":  param.BackupLocation.Name,
+		"repo name": param.BackupRepo.Name,
+		"repo UID":  param.BackupRepo.UID,
 	})
 
 	log.Debug("Start to connect repo")
 
 	repoOption, err := udmrepo.NewRepoOptions(
 		udmrepo.WithPassword(urp, param),
-		udmrepo.WithConfigFile(urp.workPath, string(param.BackupLocation.UID)),
+		udmrepo.WithConfigFile(urp.workPath, string(param.BackupRepo.UID)),
+		udmrepo.WithGenOptions(
+			map[string]string{
+				udmrepo.GenOptionOwnerName:   udmrepo.GetRepoUser(),
+				udmrepo.GenOptionOwnerDomain: udmrepo.GetRepoDomain(),
+			},
+		),
 		udmrepo.WithStoreOptions(urp, param),
-		udmrepo.WithDescription(repoOpDescFullMaintain),
+		udmrepo.WithDescription(repoConnectDesc),
 	)
 
 	if err != nil {
@@ -141,17 +160,24 @@ func (urp *unifiedRepoProvider) ConnectToRepo(ctx context.Context, param RepoPar
 
 func (urp *unifiedRepoProvider) PrepareRepo(ctx context.Context, param RepoParam) error {
 	log := urp.log.WithFields(logrus.Fields{
-		"BSL name": param.BackupLocation.Name,
-		"BSL UID":  param.BackupLocation.UID,
+		"BSL name":  param.BackupLocation.Name,
+		"repo name": param.BackupRepo.Name,
+		"repo UID":  param.BackupRepo.UID,
 	})
 
 	log.Debug("Start to prepare repo")
 
 	repoOption, err := udmrepo.NewRepoOptions(
 		udmrepo.WithPassword(urp, param),
-		udmrepo.WithConfigFile(urp.workPath, string(param.BackupLocation.UID)),
+		udmrepo.WithConfigFile(urp.workPath, string(param.BackupRepo.UID)),
+		udmrepo.WithGenOptions(
+			map[string]string{
+				udmrepo.GenOptionOwnerName:   udmrepo.GetRepoUser(),
+				udmrepo.GenOptionOwnerDomain: udmrepo.GetRepoDomain(),
+			},
+		),
 		udmrepo.WithStoreOptions(urp, param),
-		udmrepo.WithDescription(repoOpDescFullMaintain),
+		udmrepo.WithDescription(repoConnectDesc),
 	)
 
 	if err != nil {
@@ -176,17 +202,17 @@ func (urp *unifiedRepoProvider) PrepareRepo(ctx context.Context, param RepoParam
 
 func (urp *unifiedRepoProvider) PruneRepo(ctx context.Context, param RepoParam) error {
 	log := urp.log.WithFields(logrus.Fields{
-		"BSL name": param.BackupLocation.Name,
-		"BSL UID":  param.BackupLocation.UID,
+		"BSL name":  param.BackupLocation.Name,
+		"repo name": param.BackupRepo.Name,
+		"repo UID":  param.BackupRepo.UID,
 	})
 
 	log.Debug("Start to prune repo")
 
 	repoOption, err := udmrepo.NewRepoOptions(
 		udmrepo.WithPassword(urp, param),
-		udmrepo.WithConfigFile(urp.workPath, string(param.BackupLocation.UID)),
-		udmrepo.WithGenOptions(map[string]string{udmrepo.GenOptionMaintainMode: udmrepo.GenOptionMaintainFull}),
-		udmrepo.WithDescription(repoOpDescFullMaintain),
+		udmrepo.WithConfigFile(urp.workPath, string(param.BackupRepo.UID)),
+		udmrepo.WithDescription(repoOpDescMaintain),
 	)
 
 	if err != nil {
@@ -203,35 +229,6 @@ func (urp *unifiedRepoProvider) PruneRepo(ctx context.Context, param RepoParam) 
 	return nil
 }
 
-func (urp *unifiedRepoProvider) PruneRepoQuick(ctx context.Context, param RepoParam) error {
-	log := urp.log.WithFields(logrus.Fields{
-		"BSL name": param.BackupLocation.Name,
-		"BSL UID":  param.BackupLocation.UID,
-	})
-
-	log.Debug("Start to prune repo quick")
-
-	repoOption, err := udmrepo.NewRepoOptions(
-		udmrepo.WithPassword(urp, param),
-		udmrepo.WithConfigFile(urp.workPath, string(param.BackupLocation.UID)),
-		udmrepo.WithGenOptions(map[string]string{udmrepo.GenOptionMaintainMode: udmrepo.GenOptionMaintainQuick}),
-		udmrepo.WithDescription(repoOpDescQuickMaintain),
-	)
-
-	if err != nil {
-		return errors.Wrap(err, "error to get repo options")
-	}
-
-	err = urp.repoService.Maintain(ctx, *repoOption)
-	if err != nil {
-		return errors.Wrap(err, "error to prune backup repo quick")
-	}
-
-	log.Debug("Prune repo quick complete")
-
-	return nil
-}
-
 func (urp *unifiedRepoProvider) EnsureUnlockRepo(ctx context.Context, param RepoParam) error {
 	return nil
 }
@@ -239,7 +236,8 @@ func (urp *unifiedRepoProvider) EnsureUnlockRepo(ctx context.Context, param Repo
 func (urp *unifiedRepoProvider) Forget(ctx context.Context, snapshotID string, param RepoParam) error {
 	log := urp.log.WithFields(logrus.Fields{
 		"BSL name":   param.BackupLocation.Name,
-		"BSL UID":    param.BackupLocation.UID,
+		"repo name":  param.BackupRepo.Name,
+		"repo UID":   param.BackupRepo.UID,
 		"snapshotID": snapshotID,
 	})
 
@@ -247,7 +245,7 @@ func (urp *unifiedRepoProvider) Forget(ctx context.Context, snapshotID string, p
 
 	repoOption, err := udmrepo.NewRepoOptions(
 		udmrepo.WithPassword(urp, param),
-		udmrepo.WithConfigFile(urp.workPath, string(param.BackupLocation.UID)),
+		udmrepo.WithConfigFile(urp.workPath, string(param.BackupRepo.UID)),
 		udmrepo.WithDescription(repoOpDescForget),
 	)
 
@@ -277,10 +275,14 @@ func (urp *unifiedRepoProvider) Forget(ctx context.Context, snapshotID string, p
 	return nil
 }
 
+func (urp *unifiedRepoProvider) DefaultMaintenanceFrequency(ctx context.Context, param RepoParam) time.Duration {
+	return urp.repoService.DefaultMaintenanceFrequency()
+}
+
 func (urp *unifiedRepoProvider) GetPassword(param interface{}) (string, error) {
 	repoParam, ok := param.(RepoParam)
 	if !ok {
-		return "", errors.New("invalid parameter")
+		return "", errors.Errorf("invalid parameter, expect %T, actual %T", RepoParam{}, param)
 	}
 
 	repoPassword, err := getRepoPassword(urp.credentialGetter.FromSecret, repoParam)
@@ -294,7 +296,7 @@ func (urp *unifiedRepoProvider) GetPassword(param interface{}) (string, error) {
 func (urp *unifiedRepoProvider) GetStoreType(param interface{}) (string, error) {
 	repoParam, ok := param.(RepoParam)
 	if !ok {
-		return "", errors.New("invalid parameter")
+		return "", errors.Errorf("invalid parameter, expect %T, actual %T", RepoParam{}, param)
 	}
 
 	return getStorageType(repoParam.BackupLocation), nil
@@ -303,10 +305,10 @@ func (urp *unifiedRepoProvider) GetStoreType(param interface{}) (string, error) 
 func (urp *unifiedRepoProvider) GetStoreOptions(param interface{}) (map[string]string, error) {
 	repoParam, ok := param.(RepoParam)
 	if !ok {
-		return map[string]string{}, errors.New("invalid parameter")
+		return map[string]string{}, errors.Errorf("invalid parameter, expect %T, actual %T", RepoParam{}, param)
 	}
 
-	storeVar, err := funcTable.getStorageVariables(repoParam.BackupLocation, repoParam.BackupRepo.Spec.VolumeNamespace)
+	storeVar, err := funcTable.getStorageVariables(repoParam.BackupLocation, urp.repoBackend, repoParam.BackupRepo.Spec.VolumeNamespace)
 	if err != nil {
 		return map[string]string{}, errors.Wrap(err, "error to get storage variables")
 	}
@@ -409,7 +411,7 @@ func getStorageCredentials(backupLocation *velerov1api.BackupStorageLocation, cr
 	return result, nil
 }
 
-func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repoName string) (map[string]string, error) {
+func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repoBackend string, repoName string) (map[string]string, error) {
 	result := make(map[string]string)
 
 	backendType := repoconfig.GetBackendType(backupLocation.Spec.Provider)
@@ -429,12 +431,13 @@ func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repo
 		prefix = strings.Trim(backupLocation.Spec.ObjectStorage.Prefix, "/")
 	}
 
-	prefix = path.Join(prefix, udmrepo.StoreOptionPrefixName, repoName) + "/"
+	prefix = path.Join(prefix, repoBackend, repoName) + "/"
 
 	region := config["region"]
 
 	if backendType == repoconfig.AWSBackend {
 		s3Url := config["s3Url"]
+		disableTls := false
 
 		var err error
 		if s3Url == "" {
@@ -444,10 +447,24 @@ func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repo
 			}
 
 			s3Url = fmt.Sprintf("s3-%s.amazonaws.com", region)
+			disableTls = false
+		} else {
+			url, err := url.Parse(s3Url)
+			if err != nil {
+				return map[string]string{}, errors.Wrapf(err, "error to parse s3Url %s", s3Url)
+			}
+
+			if url.Path != "" && url.Path != "/" {
+				return map[string]string{}, errors.Errorf("path is not expected in s3Url %s", s3Url)
+			}
+
+			s3Url = url.Host
+			disableTls = (url.Scheme == "http")
 		}
 
 		result[udmrepo.StoreOptionS3Endpoint] = strings.Trim(s3Url, "/")
 		result[udmrepo.StoreOptionS3DisableTlsVerify] = config["insecureSkipTLSVerify"]
+		result[udmrepo.StoreOptionS3DisableTls] = strconv.FormatBool(disableTls)
 	} else if backendType == repoconfig.AzureBackend {
 		result[udmrepo.StoreOptionAzureDomain] = getAzureStorageDomain(config)
 	}

@@ -34,10 +34,10 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/label"
-	"github.com/vmware-tanzu/velero/pkg/plugin/framework"
+	"github.com/vmware-tanzu/velero/pkg/plugin/framework/common"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	riav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/restoreitemaction/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
-	"github.com/vmware-tanzu/velero/pkg/restic"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
@@ -67,7 +67,7 @@ func (a *ResticRestoreAction) AppliesTo() (velero.ResourceSelector, error) {
 	}, nil
 }
 
-func (a *ResticRestoreAction) Execute(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+func (a *ResticRestoreAction) Execute(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
 	a.logger.Info("Executing ResticRestoreAction")
 	defer a.logger.Info("Done executing ResticRestoreAction")
 
@@ -100,7 +100,7 @@ func (a *ResticRestoreAction) Execute(input *velero.RestoreItemActionExecuteInpu
 	volumeSnapshots := podvolume.GetVolumeBackupsForPod(podVolumeBackups, &pod, podFromBackup.Namespace)
 	if len(volumeSnapshots) == 0 {
 		log.Debug("No restic backups found for pod")
-		return velero.NewRestoreItemActionExecuteOutput(input.Item), nil
+		return riav1.NewRestoreItemActionExecuteOutput(input.Item), nil
 	}
 
 	log.Info("Restic backups for pod found")
@@ -108,7 +108,7 @@ func (a *ResticRestoreAction) Execute(input *velero.RestoreItemActionExecuteInpu
 	// TODO we might want/need to get plugin config at the top of this method at some point; for now, wait
 	// until we know we're doing a restore before getting config.
 	log.Debugf("Getting plugin config")
-	config, err := getPluginConfig(framework.PluginKindRestoreItemAction, "velero.io/restic", a.client)
+	config, err := getPluginConfig(common.PluginKindRestoreItemAction, "velero.io/restic", a.client)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +161,7 @@ func (a *ResticRestoreAction) Execute(input *velero.RestoreItemActionExecuteInpu
 	initContainerBuilder.Command(getCommand(log, config))
 
 	initContainer := *initContainerBuilder.Result()
-	if len(pod.Spec.InitContainers) == 0 || pod.Spec.InitContainers[0].Name != restic.InitContainer {
+	if len(pod.Spec.InitContainers) == 0 || pod.Spec.InitContainers[0].Name != podvolume.InitContainer {
 		pod.Spec.InitContainers = append([]corev1.Container{initContainer}, pod.Spec.InitContainers...)
 	} else {
 		pod.Spec.InitContainers[0] = initContainer
@@ -172,7 +172,7 @@ func (a *ResticRestoreAction) Execute(input *velero.RestoreItemActionExecuteInpu
 		return nil, errors.Wrap(err, "unable to convert pod to runtime.Unstructured")
 	}
 
-	return velero.NewRestoreItemActionExecuteOutput(&unstructured.Unstructured{Object: res}), nil
+	return riav1.NewRestoreItemActionExecuteOutput(&unstructured.Unstructured{Object: res}), nil
 }
 
 func getCommand(log logrus.FieldLogger, config *corev1.ConfigMap) []string {
@@ -262,7 +262,7 @@ func getSecurityContext(log logrus.FieldLogger, config *corev1.ConfigMap) (strin
 
 // TODO eventually this can move to pkg/plugin/framework since it'll be used across multiple
 // plugins.
-func getPluginConfig(kind framework.PluginKind, name string, client corev1client.ConfigMapInterface) (*corev1.ConfigMap, error) {
+func getPluginConfig(kind common.PluginKind, name string, client corev1client.ConfigMapInterface) (*corev1.ConfigMap, error) {
 	opts := metav1.ListOptions{
 		// velero.io/plugin-config: true
 		// velero.io/restic: RestoreItemAction
@@ -290,7 +290,7 @@ func getPluginConfig(kind framework.PluginKind, name string, client corev1client
 }
 
 func newResticInitContainerBuilder(image, restoreUID string) *builder.ContainerBuilder {
-	return builder.ForContainer(restic.InitContainer, image).
+	return builder.ForContainer(podvolume.InitContainer, image).
 		Args(restoreUID).
 		Env([]*corev1.EnvVar{
 			{

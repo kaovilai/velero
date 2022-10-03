@@ -83,8 +83,8 @@ func TestFunc(test VeleroBackupRestoreTest) func() {
 			}
 		})
 		AfterEach(func() {
-			if VeleroCfg.InstallVelero {
-				if !VeleroCfg.Debug {
+			if !VeleroCfg.Debug {
+				if VeleroCfg.InstallVelero {
 					Expect(VeleroUninstall(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To((Succeed()))
 				}
 			}
@@ -117,9 +117,11 @@ func TestFuncWithMultiIt(tests []VeleroBackupRestoreTest) func() {
 		})
 
 		AfterEach(func() {
-			if VeleroCfg.InstallVelero {
-				if countIt == len(tests) && !VeleroCfg.Debug {
-					Expect(VeleroUninstall(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To((Succeed()))
+			if !VeleroCfg.Debug {
+				if VeleroCfg.InstallVelero {
+					if countIt == len(tests) && !VeleroCfg.Debug {
+						Expect(VeleroUninstall(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To((Succeed()))
+					}
 				}
 			}
 		})
@@ -162,10 +164,12 @@ func (t *TestCase) Destroy() error {
 }
 
 func (t *TestCase) Restore() error {
-	if err := VeleroCmdExec(t.Ctx, VeleroCfg.VeleroCLI, t.RestoreArgs); err != nil {
-		RunDebug(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, t.BackupName, "")
-		return errors.Wrapf(err, "Failed to restore resources")
-	}
+	By("Start to restore ......", func() {
+		Expect(VeleroCmdExec(t.Ctx, VeleroCfg.VeleroCLI, t.RestoreArgs)).To(Succeed(), func() string {
+			RunDebug(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, t.BackupName, "")
+			return "Fail to restore workload"
+		})
+	})
 	return nil
 }
 
@@ -174,7 +178,15 @@ func (t *TestCase) Verify() error {
 }
 
 func (t *TestCase) Clean() error {
-	return CleanupNamespacesWithPoll(t.Ctx, t.Client, t.NSBaseName)
+	if !VeleroCfg.Debug {
+		By(fmt.Sprintf("Clean namespace with prefix %s after test", t.NSBaseName), func() {
+			CleanupNamespaces(t.Ctx, t.Client, t.NSBaseName)
+		})
+		By("Clean backups after test", func() {
+			DeleteBackups(t.Ctx, t.Client)
+		})
+	}
+	return nil
 }
 
 func (t *TestCase) GetTestMsg() *TestMSG {

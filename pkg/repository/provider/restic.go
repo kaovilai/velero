@@ -18,6 +18,8 @@ package provider
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -45,19 +47,23 @@ func (r *resticRepositoryProvider) ConnectToRepo(ctx context.Context, param Repo
 }
 
 func (r *resticRepositoryProvider) PrepareRepo(ctx context.Context, param RepoParam) error {
-	if err := r.InitRepo(ctx, param); err != nil {
+	if err := r.ConnectToRepo(ctx, param); err != nil {
+		// If the repository has not yet been initialized, the error message will always include
+		// the following string. This is the only scenario where we should try to initialize it.
+		// Other errors (e.g. "already locked") should be returned as-is since the repository
+		// does already exist, but it can't be connected to.
+		if strings.Contains(err.Error(), "Is there a repository at the following location?") {
+			return r.InitRepo(ctx, param)
+		}
+
 		return err
 	}
-	return r.ConnectToRepo(ctx, param)
+
+	return nil
 }
 
 func (r *resticRepositoryProvider) PruneRepo(ctx context.Context, param RepoParam) error {
 	return r.svc.PruneRepo(param.BackupLocation, param.BackupRepo)
-}
-
-func (r *resticRepositoryProvider) PruneRepoQuick(ctx context.Context, param RepoParam) error {
-	// restic doesn't support this operation
-	return nil
 }
 
 func (r *resticRepositoryProvider) EnsureUnlockRepo(ctx context.Context, param RepoParam) error {
@@ -66,4 +72,8 @@ func (r *resticRepositoryProvider) EnsureUnlockRepo(ctx context.Context, param R
 
 func (r *resticRepositoryProvider) Forget(ctx context.Context, snapshotID string, param RepoParam) error {
 	return r.svc.Forget(param.BackupLocation, param.BackupRepo, snapshotID)
+}
+
+func (r *resticRepositoryProvider) DefaultMaintenanceFrequency(ctx context.Context, param RepoParam) time.Duration {
+	return r.svc.DefaultMaintenanceFrequency()
 }

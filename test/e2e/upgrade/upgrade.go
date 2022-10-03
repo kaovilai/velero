@@ -70,11 +70,14 @@ func BackupUpgradeRestoreTest(useVolumeSnapshots bool, veleroCLI2Version VeleroC
 		}
 	})
 	AfterEach(func() {
-		if VeleroCfg.InstallVelero {
-			if !VeleroCfg.Debug {
-				By(fmt.Sprintf("Delete sample workload namespace %s", upgradeNamespace), func() {
-					DeleteNamespace(context.Background(), *VeleroCfg.ClientToInstallVelero, upgradeNamespace, true)
-				})
+		if !VeleroCfg.Debug {
+			By("Clean backups after test", func() {
+				DeleteBackups(context.Background(), *VeleroCfg.ClientToInstallVelero)
+			})
+			By(fmt.Sprintf("Delete sample workload namespace %s", upgradeNamespace), func() {
+				DeleteNamespace(context.Background(), *VeleroCfg.ClientToInstallVelero, upgradeNamespace, true)
+			})
+			if VeleroCfg.InstallVelero {
 				By("Uninstall Velero", func() {
 					Expect(VeleroUninstall(context.Background(), VeleroCfg.VeleroCLI,
 						VeleroCfg.VeleroNamespace)).To(Succeed())
@@ -109,6 +112,7 @@ func BackupUpgradeRestoreTest(useVolumeSnapshots bool, veleroCLI2Version VeleroC
 				tmpCfgForOldVeleroInstall.VeleroImage = ""
 				tmpCfgForOldVeleroInstall.ResticHelperImage = ""
 				tmpCfgForOldVeleroInstall.Plugins = ""
+				tmpCfgForOldVeleroInstall.UploaderType = ""
 
 				Expect(VeleroInstall(context.Background(), &tmpCfgForOldVeleroInstall,
 					useVolumeSnapshots)).To(Succeed())
@@ -140,11 +144,13 @@ func BackupUpgradeRestoreTest(useVolumeSnapshots bool, veleroCLI2Version VeleroC
 				BackupCfg.BackupLocation = ""
 				BackupCfg.UseVolumeSnapshots = useVolumeSnapshots
 				BackupCfg.Selector = ""
+				//TODO: pay attention to this param
+				BackupCfg.UseRestic = true
 				Expect(VeleroBackupNamespace(oneHourTimeout, tmpCfg.UpgradeFromVeleroCLI,
-					tmpCfg.VeleroNamespace, BackupCfg)).ShouldNot(HaveOccurred(), func() string {
-					err = VeleroBackupLogs(context.Background(), tmpCfg.UpgradeFromVeleroCLI,
-						tmpCfg.VeleroNamespace, backupName)
-					return "Get backup logs"
+					tmpCfg.VeleroNamespace, BackupCfg)).To(Succeed(), func() string {
+					RunDebug(context.Background(), tmpCfg.UpgradeFromVeleroCLI, tmpCfg.VeleroNamespace,
+						BackupCfg.BackupName, "")
+					return "Fail to backup workload"
 				})
 			})
 
