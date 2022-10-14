@@ -26,7 +26,7 @@ jobs:
           head: openshift:oadp-1.0
       fail-fast: false
     steps:
-      - uses: kaovilai/fork-sync@v0.0.02
+      - uses: kaovilai/fork-sync@v0.0.03
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: ${{ matrix.base }}
