@@ -12,29 +12,22 @@ jobs:
     strategy:
       matrix:
         include:
-        - owner: vmware-tanzu
-          base: main
-          head: main
-        - owner: vmware-tanzu
-          base: release-1.9
-          head: release-1.9
-        - owner: openshift
-          base: konveyor-dev
-          head: konveyor-dev
-        - owner: openshift
-          base: konveyor-1.9
-          head: konveyor-1.9
-        - owner: openshift
-          base: oadp-1.1
-          head: oadp-1.1
-        - owner: openshift
-          base: oadp-1.0
-          head: oadp-1.0
+        - base: main
+          head: vmware-tanzu:main
+        - base: release-1.9
+          head: vmware-tanzu:release-1.9
+        - base: konveyor-dev
+          head: openshift:konveyor-dev
+        - base: konveyor-1.9
+          head: openshift:konveyor-1.9
+        - base: oadp-1.1
+          head: openshift:oadp-1.1
+        - base: oadp-1.0
+          head: openshift:oadp-1.0
       fail-fast: false
     steps:
       - uses: tgymnich/fork-sync@v1.6.3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          owner: ${{ matrix.owner }}
           base: ${{ matrix.base }}
           head: ${{ matrix.head }}
