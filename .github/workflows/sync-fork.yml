@@ -1,0 +1,40 @@
+
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # every 30 minutes
+  workflow_dispatch: # on button click
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+        - owner: vmware-tanzu
+          base: main
+          head: main
+        - owner: vmware-tanzu
+          base: release-1.9
+          head: release-1.9
+        - owner: openshift
+          base: konveyor-dev
+          head: konveyor-dev
+        - owner: openshift
+          base: konveyor-1.9
+          head: konveyor-1.9
+        - owner: openshift
+          base: oadp-1.1
+          head: oadp-1.1
+        - owner: openshift
+          base: oadp-1.0
+          head: oadp-1.0
+      fail-fast: false
+    steps:
+      - uses: tgymnich/fork-sync@v1.6.3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          owner: ${{ matrix.owner }}
+          base: ${{ matrix.base }}
+          head: ${{ matrix.head }}
