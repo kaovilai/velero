@@ -9,20 +9,10 @@ reviewers:
 
   groups:
     maintainers:
-      - sseago
-      - reasonerjt
-      - ywk253100
-      - blackpiglet
-      - qiuming-best
-      - shubham-pampattiwar
-      - Lyndon-Li
-      - anshulahuja98
+      - kaovilai
 
     tech-writer:
-      - sseago
-      - reasonerjt
-      - ywk253100
-      - Lyndon-Li
+      - kaovilai
 
 files:
   'site/**':
