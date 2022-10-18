@@ -9,17 +9,10 @@ reviewers:
 
   groups:
     maintainers:
-      - dsu-igeek
-      - sseago
-      - reasonerjt
-      - ywk253100
-      - blackpiglet
-      - qiuming-best
-      - shubham-pampattiwar
-      - Lyndon-Li
+      - kaovilai
 
     tech-writer:
-      - a-mccarthy
+      - kaovilai
 
 files:
   'site/**':
