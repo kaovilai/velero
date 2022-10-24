@@ -7,10 +7,10 @@ go: stable
 env:
   global:
   - IMAGE1: quay.io/konveyor/velero
-  - IMAGE2: quay.io/konveyor/velero-restic-restore-helper
+  - IMAGE2: quay.io/konveyor/velero-restore-helper
   - DEFAULT_BRANCH: konveyor-dev
   - DOCKERFILE1: Dockerfile.ubi
-  - DOCKERFILE2: Dockerfile-velero-restic-restore-helper.ubi
+  - DOCKERFILE2: Dockerfile-velero-restore-helper.ubi
   - DOCKER_CLI_EXPERIMENTAL: enabled
   - GOPROXY: https://goproxy.io,direct
 

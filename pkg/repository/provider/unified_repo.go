@@ -19,7 +19,9 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -278,12 +280,12 @@ func (urp *unifiedRepoProvider) DefaultMaintenanceFrequency(ctx context.Context,
 }
 
 func (urp *unifiedRepoProvider) GetPassword(param interface{}) (string, error) {
-	repoParam, ok := param.(RepoParam)
+	_, ok := param.(RepoParam)
 	if !ok {
 		return "", errors.Errorf("invalid parameter, expect %T, actual %T", RepoParam{}, param)
 	}
 
-	repoPassword, err := getRepoPassword(urp.credentialGetter.FromSecret, repoParam)
+	repoPassword, err := getRepoPassword(urp.credentialGetter.FromSecret)
 	if err != nil {
 		return "", errors.Wrap(err, "error to get repo password")
 	}
@@ -328,7 +330,7 @@ func (urp *unifiedRepoProvider) GetStoreOptions(param interface{}) (map[string]s
 	return storeOptions, nil
 }
 
-func getRepoPassword(secretStore credentials.SecretStore, param RepoParam) (string, error) {
+func getRepoPassword(secretStore credentials.SecretStore) (string, error) {
 	if secretStore == nil {
 		return "", errors.New("invalid credentials interface")
 	}
@@ -435,6 +437,7 @@ func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repo
 
 	if backendType == repoconfig.AWSBackend {
 		s3Url := config["s3Url"]
+		disableTls := false
 
 		var err error
 		if s3Url == "" {
@@ -444,10 +447,24 @@ func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repo
 			}
 
 			s3Url = fmt.Sprintf("s3-%s.amazonaws.com", region)
+			disableTls = false
+		} else {
+			url, err := url.Parse(s3Url)
+			if err != nil {
+				return map[string]string{}, errors.Wrapf(err, "error to parse s3Url %s", s3Url)
+			}
+
+			if url.Path != "" && url.Path != "/" {
+				return map[string]string{}, errors.Errorf("path is not expected in s3Url %s", s3Url)
+			}
+
+			s3Url = url.Host
+			disableTls = (url.Scheme == "http")
 		}
 
 		result[udmrepo.StoreOptionS3Endpoint] = strings.Trim(s3Url, "/")
 		result[udmrepo.StoreOptionS3DisableTlsVerify] = config["insecureSkipTLSVerify"]
+		result[udmrepo.StoreOptionS3DisableTls] = strconv.FormatBool(disableTls)
 	} else if backendType == repoconfig.AzureBackend {
 		result[udmrepo.StoreOptionAzureDomain] = getAzureStorageDomain(config)
 	}

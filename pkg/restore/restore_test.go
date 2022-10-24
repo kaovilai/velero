@@ -49,6 +49,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	riav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/restoreitemaction/v1"
+	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	uploadermocks "github.com/vmware-tanzu/velero/pkg/podvolume/mocks"
 	"github.com/vmware-tanzu/velero/pkg/test"
@@ -1148,17 +1149,17 @@ func (a *recordResourcesAction) AppliesTo() (velero.ResourceSelector, error) {
 	return a.selector, nil
 }
 
-func (a *recordResourcesAction) Execute(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
+func (a *recordResourcesAction) Execute(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 	metadata, err := meta.Accessor(input.Item)
 	if err != nil {
-		return &riav1.RestoreItemActionExecuteOutput{
+		return &velero.RestoreItemActionExecuteOutput{
 			UpdatedItem:     input.Item,
 			AdditionalItems: a.additionalItems,
 		}, err
 	}
 	a.ids = append(a.ids, kubeutil.NamespaceAndName(metadata))
 
-	return &riav1.RestoreItemActionExecuteOutput{
+	return &velero.RestoreItemActionExecuteOutput{
 		UpdatedItem:     input.Item,
 		AdditionalItems: a.additionalItems,
 	}, nil
@@ -1354,12 +1355,12 @@ func TestRestoreActionsRunForCorrectItems(t *testing.T) {
 // function body at runtime.
 type pluggableAction struct {
 	selector    velero.ResourceSelector
-	executeFunc func(*riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error)
+	executeFunc func(*velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error)
 }
 
-func (a *pluggableAction) Execute(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
+func (a *pluggableAction) Execute(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 	if a.executeFunc == nil {
-		return &riav1.RestoreItemActionExecuteOutput{
+		return &velero.RestoreItemActionExecuteOutput{
 			UpdatedItem: input.Item,
 		}, nil
 	}
@@ -1384,7 +1385,7 @@ func TestRestoreActionModifications(t *testing.T) {
 	// method modifies the item being passed in by calling the 'modify' function on it.
 	modifyingActionGetter := func(modify func(*unstructured.Unstructured)) *pluggableAction {
 		return &pluggableAction{
-			executeFunc: func(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
+			executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 				obj, ok := input.Item.(*unstructured.Unstructured)
 				if !ok {
 					return nil, errors.Errorf("unexpected type %T", input.Item)
@@ -1393,7 +1394,7 @@ func TestRestoreActionModifications(t *testing.T) {
 				res := obj.DeepCopy()
 				modify(res)
 
-				return &riav1.RestoreItemActionExecuteOutput{
+				return &velero.RestoreItemActionExecuteOutput{
 					UpdatedItem: res,
 				}, nil
 			},
@@ -1531,8 +1532,8 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			actions: []riav1.RestoreItemAction{
 				&pluggableAction{
 					selector: velero.ResourceSelector{IncludedNamespaces: []string{"ns-1"}},
-					executeFunc: func(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
-						return &riav1.RestoreItemActionExecuteOutput{
+					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+						return &velero.RestoreItemActionExecuteOutput{
 							UpdatedItem: input.Item,
 							AdditionalItems: []velero.ResourceIdentifier{
 								{GroupResource: kuberesource.Pods, Namespace: "ns-2", Name: "pod-2"},
@@ -1553,8 +1554,8 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			apiResources: []*test.APIResource{test.Pods()},
 			actions: []riav1.RestoreItemAction{
 				&pluggableAction{
-					executeFunc: func(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
-						return &riav1.RestoreItemActionExecuteOutput{
+					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+						return &velero.RestoreItemActionExecuteOutput{
 							UpdatedItem: input.Item,
 							AdditionalItems: []velero.ResourceIdentifier{
 								{GroupResource: kuberesource.Pods, Namespace: "ns-2", Name: "pod-2"},
@@ -1578,8 +1579,8 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			apiResources: []*test.APIResource{test.Pods(), test.PVs()},
 			actions: []riav1.RestoreItemAction{
 				&pluggableAction{
-					executeFunc: func(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
-						return &riav1.RestoreItemActionExecuteOutput{
+					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+						return &velero.RestoreItemActionExecuteOutput{
 							UpdatedItem: input.Item,
 							AdditionalItems: []velero.ResourceIdentifier{
 								{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
@@ -1604,8 +1605,8 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			apiResources: []*test.APIResource{test.Pods(), test.PVs()},
 			actions: []riav1.RestoreItemAction{
 				&pluggableAction{
-					executeFunc: func(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
-						return &riav1.RestoreItemActionExecuteOutput{
+					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+						return &velero.RestoreItemActionExecuteOutput{
 							UpdatedItem: input.Item,
 							AdditionalItems: []velero.ResourceIdentifier{
 								{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
@@ -1630,8 +1631,8 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			apiResources: []*test.APIResource{test.Pods(), test.PVs()},
 			actions: []riav1.RestoreItemAction{
 				&pluggableAction{
-					executeFunc: func(input *riav1.RestoreItemActionExecuteInput) (*riav1.RestoreItemActionExecuteOutput, error) {
-						return &riav1.RestoreItemActionExecuteOutput{
+					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+						return &velero.RestoreItemActionExecuteOutput{
 							UpdatedItem: input.Item,
 							AdditionalItems: []velero.ResourceIdentifier{
 								{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
@@ -1876,10 +1877,10 @@ func assertRestoredItems(t *testing.T, h *harness, want []*test.APIResource) {
 }
 
 // volumeSnapshotterGetter is a simple implementation of the VolumeSnapshotterGetter
-// interface that returns velero.VolumeSnapshotters from a map if they exist.
-type volumeSnapshotterGetter map[string]velero.VolumeSnapshotter
+// interface that returns vsv1.VolumeSnapshotters from a map if they exist.
+type volumeSnapshotterGetter map[string]vsv1.VolumeSnapshotter
 
-func (vsg volumeSnapshotterGetter) GetVolumeSnapshotter(name string) (velero.VolumeSnapshotter, error) {
+func (vsg volumeSnapshotterGetter) GetVolumeSnapshotter(name string) (vsv1.VolumeSnapshotter, error) {
 	snapshotter, ok := vsg[name]
 	if !ok {
 		return nil, errors.New("volume snapshotter not found")
@@ -1888,7 +1889,7 @@ func (vsg volumeSnapshotterGetter) GetVolumeSnapshotter(name string) (velero.Vol
 	return snapshotter, nil
 }
 
-// volumeSnapshotter is a test fake for the velero.VolumeSnapshotter interface
+// volumeSnapshotter is a test fake for the vsv1.VolumeSnapshotter interface
 type volumeSnapshotter struct {
 	// a map from snapshotID to volumeID
 	snapshotVolumes map[string]string
@@ -2052,7 +2053,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"provider-1": &volumeSnapshotter{
 					snapshotVolumes: map[string]string{"snapshot-1": "new-volume"},
 				},
@@ -2101,7 +2102,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"provider-1": &volumeSnapshotter{
 					snapshotVolumes: map[string]string{"snapshot-1": "new-volume"},
 				},
@@ -2155,7 +2156,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				// the volume snapshotter fake is not configured with any snapshotID -> volumeID
 				// mappings as a way to verify that the snapshot is not restored, since if it were
 				// restored, we'd get an error of "snapshot not found".
@@ -2207,7 +2208,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				// the volume snapshotter fake is not configured with any snapshotID -> volumeID
 				// mappings as a way to verify that the snapshot is not restored, since if it were
 				// restored, we'd get an error of "snapshot not found".
@@ -2258,7 +2259,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"provider-1": &volumeSnapshotter{
 					snapshotVolumes: map[string]string{"snapshot-1": "new-volume"},
 				},
@@ -2319,7 +2320,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"provider-1": &volumeSnapshotter{
 					snapshotVolumes: map[string]string{"snapshot-1": "new-volume"},
 				},
@@ -2467,7 +2468,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"provider-1": &volumeSnapshotter{
 					snapshotVolumes: map[string]string{"snapshot-1": "new-pvname"},
 					pvName:          map[string]string{"new-pvname": "new-pvname"},
@@ -2539,7 +2540,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 					},
 				},
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				// the volume snapshotter fake is not configured with any snapshotID -> volumeID
 				// mappings as a way to verify that the snapshot is not restored, since if it were
 				// restored, we'd get an error of "snapshot not found".
@@ -2591,7 +2592,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			volumeSnapshotLocations: []*velerov1api.VolumeSnapshotLocation{
 				builder.ForVolumeSnapshotLocation(velerov1api.DefaultNamespace, "default").Provider("provider-1").Result(),
 			},
-			volumeSnapshotterGetter: map[string]velero.VolumeSnapshotter{
+			volumeSnapshotterGetter: map[string]vsv1.VolumeSnapshotter{
 				"provider-1": &volumeSnapshotter{
 					snapshotVolumes: map[string]string{"snapshot-1": "new-volume"},
 					pvName:          map[string]string{"new-volume": "volumesnapshotter-renamed-source-pv"},
@@ -2681,17 +2682,17 @@ func TestRestorePersistentVolumes(t *testing.T) {
 	}
 }
 
-type fakeResticRestorerFactory struct {
+type fakePodVolumeRestorerFactory struct {
 	restorer *uploadermocks.Restorer
 }
 
-func (f *fakeResticRestorerFactory) NewRestorer(context.Context, *velerov1api.Restore) (podvolume.Restorer, error) {
+func (f *fakePodVolumeRestorerFactory) NewRestorer(context.Context, *velerov1api.Restore) (podvolume.Restorer, error) {
 	return f.restorer, nil
 }
 
-// TestRestoreWithRestic verifies that a call to RestorePodVolumes was made as and when
-// expected for the given pods by using a mock for the restic restorer.
-func TestRestoreWithRestic(t *testing.T) {
+// TestRestoreWithPodVolume verifies that a call to RestorePodVolumes was made as and when
+// expected for the given pods by using a mock for the pod volume restorer.
+func TestRestoreWithPodVolume(t *testing.T) {
 	tests := []struct {
 		name                        string
 		restore                     *velerov1api.Restore
@@ -2752,7 +2753,7 @@ func TestRestoreWithRestic(t *testing.T) {
 			h := newHarness(t)
 			restorer := new(uploadermocks.Restorer)
 			defer restorer.AssertExpectations(t)
-			h.restorer.resticRestorerFactory = &fakeResticRestorerFactory{
+			h.restorer.podVolumeRestorerFactory = &fakePodVolumeRestorerFactory{
 				restorer: restorer,
 			}
 
@@ -3120,8 +3121,8 @@ func newHarness(t *testing.T) *harness {
 			fileSystem:                 testutil.NewFakeFileSystem(),
 
 			// unsupported
-			resticRestorerFactory: nil,
-			resticTimeout:         0,
+			podVolumeRestorerFactory: nil,
+			podVolumeTimeout:         0,
 		},
 		log: log,
 	}

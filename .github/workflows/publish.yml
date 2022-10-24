@@ -13,7 +13,7 @@ on:
 env:
   REGISTRY: quay.io
   IMAGE_NAME: konveyor/velero
-  HELPER_IMAGE_NAME: konveyor/velero-restic-restore-helper
+  HELPER_IMAGE_NAME: konveyor/velero-restore-helper
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,7 +33,7 @@ jobs:
         run: docker build . --file Dockerfile.ubi --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.extract_branch.outputs.branch }}
 
       - name: Build helper image
-        run: docker build . --file Dockerfile-velero-restic-restore-helper.ubi --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.extract_branch.outputs.branch }}
+        run: docker build . --file Dockerfile-velero-restore-helper.ubi --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.extract_branch.outputs.branch }}
 
       - name: Log into registry
         run: echo "${{ secrets.QUAY_PUBLISH_TOKEN }}" | docker login quay.io -u ${{ secrets.QUAY_PUBLISH_ROBOT }} --password-stdin

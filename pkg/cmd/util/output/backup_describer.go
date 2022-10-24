@@ -125,7 +125,7 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	}
 	d.Printf("\tIncluded:\t%s\n", s)
 	if len(spec.ExcludedNamespaces) == 0 {
-		s = "<none>"
+		s = emptyDisplay
 	} else {
 		s = strings.Join(spec.ExcludedNamespaces, ", ")
 	}
@@ -140,7 +140,7 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	}
 	d.Printf("\tIncluded:\t%s\n", s)
 	if len(spec.ExcludedResources) == 0 {
-		s = "<none>"
+		s = emptyDisplay
 	} else {
 		s = strings.Join(spec.ExcludedResources, ", ")
 	}
@@ -149,7 +149,7 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	d.Printf("\tCluster-scoped:\t%s\n", BoolPointerString(spec.IncludeClusterResources, "excluded", "included", "auto"))
 
 	d.Println()
-	s = "<none>"
+	s = emptyDisplay
 	if spec.LabelSelector != nil {
 		s = metav1.FormatLabelSelector(spec.LabelSelector)
 	}
@@ -165,11 +165,11 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	d.Printf("TTL:\t%s\n", spec.TTL.Duration)
 
 	d.Println()
-	d.Printf("CSISnapshotTimeout:\t%s\n", &spec.CSISnapshotTimeout.Duration)
+	d.Printf("CSISnapshotTimeout:\t%s\n", spec.CSISnapshotTimeout.Duration)
 
 	d.Println()
 	if len(spec.Hooks.Resources) == 0 {
-		d.Printf("Hooks:\t<none>\n")
+		d.Printf("Hooks:\t" + emptyDisplay + "\n")
 	} else {
 		d.Printf("Hooks:\n")
 		d.Printf("\tResources:\n")
@@ -184,7 +184,7 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 			}
 			d.Printf("\t\t\t\tIncluded:\t%s\n", s)
 			if len(spec.ExcludedNamespaces) == 0 {
-				s = "<none>"
+				s = emptyDisplay
 			} else {
 				s = strings.Join(spec.ExcludedNamespaces, ", ")
 			}
@@ -199,14 +199,14 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 			}
 			d.Printf("\t\t\t\tIncluded:\t%s\n", s)
 			if len(spec.ExcludedResources) == 0 {
-				s = "<none>"
+				s = emptyDisplay
 			} else {
 				s = strings.Join(spec.ExcludedResources, ", ")
 			}
 			d.Printf("\t\t\t\tExcluded:\t%s\n", s)
 
 			d.Println()
-			s = "<none>"
+			s = emptyDisplay
 			if backupResourceHookSpec.LabelSelector != nil {
 				s = metav1.FormatLabelSelector(backupResourceHookSpec.LabelSelector)
 			}
@@ -403,10 +403,19 @@ func failedDeletionCount(requests []velerov1api.DeleteBackupRequest) int {
 
 // DescribePodVolumeBackups describes pod volume backups in human-readable format.
 func DescribePodVolumeBackups(d *Describer, backups []velerov1api.PodVolumeBackup, details bool) {
-	if details {
-		d.Printf("Restic Backups:\n")
+	// Get the type of pod volume uploader. Since the uploader only comes from a single source, we can
+	// take the uploader type from the first element of the array.
+	var uploaderType string
+	if len(backups) > 0 {
+		uploaderType = backups[0].Spec.UploaderType
 	} else {
-		d.Printf("Restic Backups (specify --details for more information):\n")
+		return
+	}
+
+	if details {
+		d.Printf("%s Backups:\n", uploaderType)
+	} else {
+		d.Printf("%s Backups (specify --details for more information):\n", uploaderType)
 	}
 
 	// separate backups by phase (combining <none> and New into a single group)
