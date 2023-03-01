@@ -706,11 +706,11 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 				backupLog.Error(err)
 			}
 		}
-
-		// Delete the VolumeSnapshots created in the backup, when CSI feature is enabled.
-		if len(volumeSnapshots) > 0 && len(volumeSnapshotContents) > 0 {
-			c.deleteVolumeSnapshot(volumeSnapshots, volumeSnapshotContents, backupLog)
-		}
+		// OADP-DEMO: Comment out the following lines to avoid deleting the VolumeSnapshots
+		// // Delete the VolumeSnapshots created in the backup, when CSI feature is enabled.
+		// if len(volumeSnapshots) > 0 && len(volumeSnapshotContents) > 0 {
+		// 	c.deleteVolumeSnapshot(volumeSnapshots, volumeSnapshotContents, backupLog)
+		// }
 	}
 
 	backup.Status.VolumeSnapshotsAttempted = len(backup.VolumeSnapshots)
