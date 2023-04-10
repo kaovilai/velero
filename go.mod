@@ -19,7 +19,7 @@ require (
 	github.com/golang/protobuf v1.5.2
 	github.com/google/go-cmp v0.5.8
 	github.com/google/uuid v1.3.0
-	github.com/hashicorp/go-hclog v0.14.1
+	github.com/hashicorp/go-hclog v1.5.0
 	github.com/hashicorp/go-plugin v1.4.3
 	github.com/joho/godotenv v1.3.0
 	github.com/kopia/kopia v0.10.7
@@ -33,7 +33,7 @@ require (
 	github.com/spf13/afero v1.6.0
 	github.com/spf13/cobra v1.4.0
 	github.com/spf13/pflag v1.0.5
-	github.com/stretchr/testify v1.7.1
+	github.com/stretchr/testify v1.7.2
 	github.com/vmware-tanzu/crash-diagnostics v0.3.7
 	golang.org/x/mod v0.6.0-dev.0.20220106191415-9b9b3d81d5e3
 	golang.org/x/net v0.0.0-20220615171555-694bf12d69de
