@@ -406,7 +406,7 @@ func (r *backupDeletionReconciler) volumeSnapshottersForVSL(
 	}
 
 	// add credential to config
-	err := volume.UpdateVolumeSnapshotLocationWithCredentialConfig(vsl, r.credentialStore, r.logger)
+	err := volume.UpdateVolumeSnapshotLocationWithCredentialConfig(vsl, r.credentialStore)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -484,14 +484,14 @@ func (r *backupDeletionReconciler) patchBackup(ctx context.Context, backup *vele
 	// Record original json
 	oldData, err := json.Marshal(backup)
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling original Backup")
+		return nil, errors.Wrap(err, "error marshaling original Backup")
 	}
 
 	newBackup := backup.DeepCopy()
 	mutate(newBackup)
 	newData, err := json.Marshal(newBackup)
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling updated Backup")
+		return nil, errors.Wrap(err, "error marshaling updated Backup")
 	}
 	patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
 	if err != nil {

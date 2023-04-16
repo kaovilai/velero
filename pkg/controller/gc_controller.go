@@ -23,7 +23,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/clock"
+	clocks "k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,7 +48,7 @@ const (
 type gcReconciler struct {
 	client.Client
 	logger    logrus.FieldLogger
-	clock     clock.Clock
+	clock     clocks.WithTickerAndDelayedExecution
 	frequency time.Duration
 }
 
@@ -61,7 +61,7 @@ func NewGCReconciler(
 	gcr := &gcReconciler{
 		Client:    client,
 		logger:    logger,
-		clock:     clock.RealClock{},
+		clock:     clocks.RealClock{},
 		frequency: frequency,
 	}
 	if gcr.frequency <= 0 {
@@ -96,6 +96,7 @@ func (c *gcReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests,verbs=get;list;watch;create;
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests/status,verbs=get
 // +kubebuilder:rbac:groups=velero.io,resources=backupstoragelocations,verbs=get
+
 func (c *gcReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := c.logger.WithField("gc backup", req.String())
 	log.Debug("gcController getting backup")

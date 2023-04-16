@@ -18,20 +18,19 @@ package k8s
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	corev1 "k8s.io/api/core/v1"
-	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	veleroexec "github.com/vmware-tanzu/velero/pkg/util/exec"
-	common "github.com/vmware-tanzu/velero/test/e2e/util/common"
+	"github.com/vmware-tanzu/velero/test/e2e/util/common"
 )
 
 // ensureClusterExists returns whether or not a kubernetes cluster exists for tests to be run on.
@@ -43,7 +42,7 @@ func CreateSecretFromFiles(ctx context.Context, client TestClient, namespace str
 	data := make(map[string][]byte)
 
 	for key, filePath := range files {
-		contents, err := ioutil.ReadFile(filePath)
+		contents, err := os.ReadFile(filePath)
 		if err != nil {
 			return errors.WithMessagef(err, "Failed to read secret file %q", filePath)
 		}
@@ -64,12 +63,12 @@ func WaitForPods(ctx context.Context, client TestClient, namespace string, pods 
 			checkPod, err := client.ClientGo.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
 			if err != nil {
 				//Should ignore "etcdserver: request timed out" kind of errors, try to get pod status again before timeout.
-				fmt.Println(errors.Wrap(err, fmt.Sprintf("Failed to verify pod %s/%s is %s, try again...\n", namespace, podName, corev1api.PodRunning)))
+				fmt.Println(errors.Wrap(err, fmt.Sprintf("Failed to verify pod %s/%s is %s, try again...\n", namespace, podName, corev1.PodRunning)))
 				return false, nil
 			}
 			// If any pod is still waiting we don't need to check any more so return and wait for next poll interval
-			if checkPod.Status.Phase != corev1api.PodRunning {
-				fmt.Printf("Pod %s is in state %s waiting for it to be %s\n", podName, checkPod.Status.Phase, corev1api.PodRunning)
+			if checkPod.Status.Phase != corev1.PodRunning {
+				fmt.Printf("Pod %s is in state %s waiting for it to be %s\n", podName, checkPod.Status.Phase, corev1.PodRunning)
 				return false, nil
 			}
 		}
@@ -86,42 +85,52 @@ func GetPvcByPodName(ctx context.Context, namespace, podName string) ([]string, 
 	// Example:
 	//    NAME                                  STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS             AGE
 	//    kibishii-data-kibishii-deployment-0   Bound    pvc-94b9fdf2-c30f-4a7b-87bf-06eadca0d5b6   1Gi        RWO            kibishii-storage-class   115s
-	CmdLine1 := &common.OsCommandLine{
+	cmds := []*common.OsCommandLine{}
+	cmd := &common.OsCommandLine{
 		Cmd:  "kubectl",
 		Args: []string{"get", "pvc", "-n", namespace},
 	}
-	CmdLine2 := &common.OsCommandLine{
+	cmds = append(cmds, cmd)
+
+	cmd = &common.OsCommandLine{
 		Cmd:  "grep",
 		Args: []string{podName},
 	}
-	CmdLine3 := &common.OsCommandLine{
+	cmds = append(cmds, cmd)
+
+	cmd = &common.OsCommandLine{
 		Cmd:  "awk",
 		Args: []string{"{print $1}"},
 	}
+	cmds = append(cmds, cmd)
 
-	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
+	return common.GetListByCmdPipes(ctx, cmds)
 }
 
 func GetPvByPvc(ctx context.Context, namespace, pvc string) ([]string, error) {
 	// Example:
 	// 	  NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                                              STORAGECLASS             REASON   AGE
 	//    pvc-3f784366-58db-40b2-8fec-77307807e74b   1Gi        RWO            Delete           Bound    bsl-deletion/kibishii-data-kibishii-deployment-0   kibishii-storage-class            6h41m
-	CmdLine1 := &common.OsCommandLine{
+	cmds := []*common.OsCommandLine{}
+	cmd := &common.OsCommandLine{
 		Cmd:  "kubectl",
 		Args: []string{"get", "pv"},
 	}
+	cmds = append(cmds, cmd)
 
-	CmdLine2 := &common.OsCommandLine{
+	cmd = &common.OsCommandLine{
 		Cmd:  "grep",
 		Args: []string{namespace + "/" + pvc},
 	}
+	cmds = append(cmds, cmd)
 
-	CmdLine3 := &common.OsCommandLine{
+	cmd = &common.OsCommandLine{
 		Cmd:  "awk",
 		Args: []string{"{print $1}"},
 	}
+	cmds = append(cmds, cmd)
 
-	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
+	return common.GetListByCmdPipes(ctx, cmds)
 }
 
 func CRDShouldExist(ctx context.Context, name string) error {
@@ -145,22 +154,26 @@ func CRDCountShouldBe(ctx context.Context, name string, count int) error {
 }
 
 func GetCRD(ctx context.Context, name string) ([]string, error) {
-	CmdLine1 := &common.OsCommandLine{
+	cmds := []*common.OsCommandLine{}
+	cmd := &common.OsCommandLine{
 		Cmd:  "kubectl",
 		Args: []string{"get", "crd"},
 	}
+	cmds = append(cmds, cmd)
 
-	CmdLine2 := &common.OsCommandLine{
+	cmd = &common.OsCommandLine{
 		Cmd:  "grep",
 		Args: []string{name},
 	}
+	cmds = append(cmds, cmd)
 
-	CmdLine3 := &common.OsCommandLine{
+	cmd = &common.OsCommandLine{
 		Cmd:  "awk",
 		Args: []string{"{print $1}"},
 	}
+	cmds = append(cmds, cmd)
 
-	return common.GetListBy2Pipes(ctx, *CmdLine1, *CmdLine2, *CmdLine3)
+	return common.GetListByCmdPipes(ctx, cmds)
 }
 
 func AddLabelToPv(ctx context.Context, pv, label string) error {
@@ -241,39 +254,31 @@ func GetPVByPodName(client TestClient, namespace, podName string) (string, error
 	}
 	return pv_value.Name, nil
 }
-func CreatePodWithPVC(client TestClient, ns, podName, sc string, volumeNameList []string) (*corev1.Pod, error) {
-	volumes := []corev1.Volume{}
-	for _, volume := range volumeNameList {
-		pvc, err := CreatePVC(client, ns, fmt.Sprintf("pvc-%s", volume), sc)
-		if err != nil {
-			return nil, err
-		}
-		volumes = append(volumes, corev1.Volume{
+
+func PrepareVolumeList(volumeNameList []string) (vols []*corev1.Volume) {
+	for i, volume := range volumeNameList {
+		vols = append(vols, &corev1.Volume{
 			Name: volume,
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: pvc.Name,
+					ClaimName: fmt.Sprintf("pvc-%d", i),
 					ReadOnly:  false,
 				},
 			},
 		})
 	}
-	pod, err := CreatePod(client, ns, podName, volumes)
-	if err != nil {
-		return nil, err
-	}
-	return pod, nil
+	return
 }
 
-func CreateFileToPod(ctx context.Context, namespace, podName, volume, filename, content string) error {
-	arg := []string{"exec", "-n", namespace, "-c", podName, podName,
+func CreateFileToPod(ctx context.Context, namespace, podName, containerName, volume, filename, content string) error {
+	arg := []string{"exec", "-n", namespace, "-c", containerName, podName,
 		"--", "/bin/sh", "-c", fmt.Sprintf("echo ns-%s pod-%s volume-%s  > /%s/%s", namespace, podName, volume, volume, filename)}
 	cmd := exec.CommandContext(ctx, "kubectl", arg...)
 	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
 	return cmd.Run()
 }
-func ReadFileFromPodVolume(ctx context.Context, namespace, podName, volume, filename string) (string, error) {
-	arg := []string{"exec", "-n", namespace, "-c", podName, podName,
+func ReadFileFromPodVolume(ctx context.Context, namespace, podName, containerName, volume, filename string) (string, error) {
+	arg := []string{"exec", "-n", namespace, "-c", containerName, podName,
 		"--", "cat", fmt.Sprintf("/%s/%s", volume, filename)}
 	cmd := exec.CommandContext(ctx, "kubectl", arg...)
 	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
@@ -281,4 +286,63 @@ func ReadFileFromPodVolume(ctx context.Context, namespace, podName, volume, file
 	fmt.Print(stdout)
 	fmt.Print(stderr)
 	return stdout, err
+}
+
+func KubectlGetInfo(cmdName string, arg []string) {
+	cmd := exec.CommandContext(context.Background(), cmdName, arg...)
+	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
+	stdout, stderr, err := veleroexec.RunCommand(cmd)
+	fmt.Println(stdout)
+	if err != nil {
+		fmt.Println(stderr)
+		fmt.Println(err)
+	}
+}
+
+func KubectlGetDsJson(veleroNamespace string) (string, error) {
+	arg := []string{"get", "ds", "-n", veleroNamespace, "-ojson"}
+	cmd := exec.CommandContext(context.Background(), "kubectl", arg...)
+	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
+	stdout, stderr, err := veleroexec.RunCommand(cmd)
+	fmt.Println(stdout)
+	if err != nil {
+		fmt.Println(stderr)
+		fmt.Println(err)
+		return "", err
+	}
+	return stdout, nil
+}
+
+func DeleteVeleroDs(ctx context.Context) error {
+	args := []string{"delete", "ds", "-n", "velero", "--all", "--force", "--grace-period", "0"}
+	fmt.Println(args)
+	return exec.CommandContext(ctx, "kubectl", args...).Run()
+}
+
+func WaitForCRDEstablished(crdName string) error {
+	arg := []string{"wait", "--for", "condition=established", "--timeout=60s", "crd/" + crdName}
+	cmd := exec.CommandContext(context.Background(), "kubectl", arg...)
+	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
+	stdout, stderr, err := veleroexec.RunCommand(cmd)
+	fmt.Println(stdout)
+	if err != nil {
+		fmt.Println(stderr)
+		fmt.Println(err)
+		return err
+	}
+	return nil
+}
+
+func GetAllService(ctx context.Context) (string, error) {
+	args := []string{"get", "service", "-A"}
+	cmd := exec.CommandContext(context.Background(), "kubectl", args...)
+	fmt.Printf("Kubectl exec cmd =%v\n", cmd)
+	stdout, stderr, err := veleroexec.RunCommand(cmd)
+	fmt.Println(stdout)
+	if err != nil {
+		fmt.Println(stderr)
+		fmt.Println(err)
+		return "", err
+	}
+	return stdout, nil
 }

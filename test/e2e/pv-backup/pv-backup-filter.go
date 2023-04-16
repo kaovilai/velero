@@ -32,7 +32,10 @@ var OptOutPVBackupTest func() = TestFunc(&PVBackupFiltering{annotation: OPT_OUT_
 
 func (p *PVBackupFiltering) Init() error {
 	p.Ctx, _ = context.WithTimeout(context.Background(), 60*time.Minute)
-	p.Client = TestClientInstance
+	p.VeleroCfg = VeleroCfg
+	p.Client = *p.VeleroCfg.ClientToInstallVelero
+	p.VeleroCfg.UseVolumeSnapshots = false
+	p.VeleroCfg.UseNodeAgent = true
 	p.NSBaseName = "ns"
 	p.NSIncluded = &[]string{fmt.Sprintf("%s-%s-%d", p.NSBaseName, p.id, 1), fmt.Sprintf("%s-%s-%d", p.NSBaseName, p.id, 2)}
 
@@ -45,7 +48,7 @@ func (p *PVBackupFiltering) Init() error {
 }
 
 func (p *PVBackupFiltering) StartRun() error {
-	err := installStorageClass(context.Background(), fmt.Sprintf("testdata/storage-class/%s.yaml", VeleroCfg.CloudProvider))
+	err := InstallStorageClass(p.Ctx, fmt.Sprintf("testdata/storage-class/%s.yaml", VeleroCfg.CloudProvider))
 	if err != nil {
 		return err
 	}
@@ -69,7 +72,6 @@ func (p *PVBackupFiltering) StartRun() error {
 	return nil
 }
 func (p *PVBackupFiltering) CreateResources() error {
-	p.Ctx, _ = context.WithTimeout(context.Background(), 60*time.Minute)
 	for _, ns := range *p.NSIncluded {
 		By(fmt.Sprintf("Create namespaces %s for workload\n", ns), func() {
 			Expect(CreateNamespace(p.Ctx, p.Client, ns)).To(Succeed(), fmt.Sprintf("Failed to create namespace %s", ns))
@@ -94,7 +96,7 @@ func (p *PVBackupFiltering) CreateResources() error {
 				podName := fmt.Sprintf("pod-%d", i)
 				pods = append(pods, podName)
 				By(fmt.Sprintf("Create pod %s in namespace %s", podName, ns), func() {
-					pod, err := CreatePodWithPVC(p.Client, ns, podName, "e2e-storage-class", volumes)
+					pod, err := CreatePod(p.Client, ns, podName, "e2e-storage-class", "", volumes, nil, nil)
 					Expect(err).To(Succeed())
 					ann := map[string]string{
 						p.annotation: volumesToAnnotation,
@@ -115,13 +117,13 @@ func (p *PVBackupFiltering) CreateResources() error {
 			})
 		}
 	})
-	By(fmt.Sprintf("Polulate all pods %s with file %s", p.podsList, FILE_NAME), func() {
+	By(fmt.Sprintf("Populate all pods %s with file %s", p.podsList, FILE_NAME), func() {
 		for index, ns := range *p.NSIncluded {
 			By(fmt.Sprintf("Creating file in all pods to start %d in namespace %s", index, ns), func() {
 				WaitForPods(p.Ctx, p.Client, ns, p.podsList[index])
 				for i, pod := range p.podsList[index] {
 					for j := range p.volumesList[i] {
-						Expect(CreateFileToPod(p.Ctx, ns, pod, p.volumesList[i][j],
+						Expect(CreateFileToPod(p.Ctx, ns, pod, pod, p.volumesList[i][j],
 							FILE_NAME, fileContent(ns, pod, p.volumesList[i][j]))).To(Succeed())
 					}
 				}
@@ -132,7 +134,6 @@ func (p *PVBackupFiltering) CreateResources() error {
 }
 
 func (p *PVBackupFiltering) Verify() error {
-	p.Ctx, _ = context.WithTimeout(context.Background(), 60*time.Minute)
 	By(fmt.Sprintf("Waiting for all pods to start %s", p.podsList), func() {
 		for index, ns := range *p.NSIncluded {
 			By(fmt.Sprintf("Waiting for all pods to start %d in namespace %s", index, ns), func() {
@@ -179,7 +180,7 @@ func fileContent(namespace, podName, volume string) string {
 }
 
 func fileExist(ctx context.Context, namespace, podName, volume string) error {
-	c, err := ReadFileFromPodVolume(ctx, namespace, podName, volume, FILE_NAME)
+	c, err := ReadFileFromPodVolume(ctx, namespace, podName, podName, volume, FILE_NAME)
 	if err != nil {
 		return errors.Wrap(err, fmt.Sprintf("Fail to read file %s from volume %s of pod %s in %s ",
 			FILE_NAME, volume, podName, namespace))
@@ -194,17 +195,11 @@ func fileExist(ctx context.Context, namespace, podName, volume string) error {
 	}
 }
 func fileNotExist(ctx context.Context, namespace, podName, volume string) error {
-	_, err := ReadFileFromPodVolume(ctx, namespace, podName, volume, FILE_NAME)
+	_, err := ReadFileFromPodVolume(ctx, namespace, podName, podName, volume, FILE_NAME)
 	if err != nil {
 		return nil
 	} else {
 		return errors.New(fmt.Sprintf("UNEXPECTED: File %s exist in volume %s of pod %s in namespace %s.",
 			FILE_NAME, volume, podName, namespace))
 	}
-}
-
-func installStorageClass(ctx context.Context, yaml string) error {
-	fmt.Printf("Install storage class with %s.\n", yaml)
-	err := KubectlApplyByFile(ctx, yaml)
-	return err
 }

@@ -100,7 +100,7 @@ func (e *ExcludeFromBackup) CreateResources() error {
 	}
 	//Create deployment: to be included
 	fmt.Printf("Creating deployment in namespaces ...%s\n", namespace)
-	deployment := NewDeployment(e.NSBaseName, namespace, e.replica, label2)
+	deployment := NewDeployment(e.NSBaseName, namespace, e.replica, label2, nil).Result()
 	deployment, err := CreateDeployment(e.Client.ClientGo, namespace, deployment)
 	if err != nil {
 		return errors.Wrap(err, fmt.Sprintf("failed to delete the namespace %q", namespace))
@@ -127,7 +127,7 @@ func (e *ExcludeFromBackup) CreateResources() error {
 	//Create Configmap: to be included
 	configmaptName := e.NSBaseName
 	fmt.Printf("Creating configmap %s in namespaces ...%s\n", configmaptName, namespace)
-	_, err = CreateConfigMap(e.Client.ClientGo, namespace, configmaptName, label1)
+	_, err = CreateConfigMap(e.Client.ClientGo, namespace, configmaptName, label1, nil)
 	if err != nil {
 		return errors.Wrap(err, fmt.Sprintf("failed to create configmap in the namespace %q", namespace))
 	}

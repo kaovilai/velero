@@ -23,6 +23,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 
@@ -42,25 +43,28 @@ func NewRestorerFactory(repoLocker *repository.RepoLocker,
 	repoEnsurer *repository.RepositoryEnsurer,
 	veleroClient clientset.Interface,
 	pvcClient corev1client.PersistentVolumeClaimsGetter,
-	repoInformerSynced cache.InformerSynced,
+	podClient corev1client.PodsGetter,
+	kubeClient kubernetes.Interface,
 	log logrus.FieldLogger) RestorerFactory {
 	return &restorerFactory{
-		repoLocker:         repoLocker,
-		repoEnsurer:        repoEnsurer,
-		veleroClient:       veleroClient,
-		pvcClient:          pvcClient,
-		repoInformerSynced: repoInformerSynced,
-		log:                log,
+		repoLocker:   repoLocker,
+		repoEnsurer:  repoEnsurer,
+		veleroClient: veleroClient,
+		pvcClient:    pvcClient,
+		podClient:    podClient,
+		kubeClient:   kubeClient,
+		log:          log,
 	}
 }
 
 type restorerFactory struct {
-	repoLocker         *repository.RepoLocker
-	repoEnsurer        *repository.RepositoryEnsurer
-	veleroClient       clientset.Interface
-	pvcClient          corev1client.PersistentVolumeClaimsGetter
-	repoInformerSynced cache.InformerSynced
-	log                logrus.FieldLogger
+	repoLocker   *repository.RepoLocker
+	repoEnsurer  *repository.RepositoryEnsurer
+	veleroClient clientset.Interface
+	pvcClient    corev1client.PersistentVolumeClaimsGetter
+	podClient    corev1client.PodsGetter
+	kubeClient   kubernetes.Interface
+	log          logrus.FieldLogger
 }
 
 func (rf *restorerFactory) NewRestorer(ctx context.Context, restore *velerov1api.Restore) (Restorer, error) {
@@ -74,10 +78,10 @@ func (rf *restorerFactory) NewRestorer(ctx context.Context, restore *velerov1api
 		},
 	)
 
-	r := newRestorer(ctx, rf.repoLocker, rf.repoEnsurer, informer, rf.veleroClient, rf.pvcClient, rf.log)
+	r := newRestorer(ctx, rf.repoLocker, rf.repoEnsurer, informer, rf.veleroClient, rf.pvcClient, rf.podClient, rf.kubeClient, rf.log)
 
 	go informer.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced, rf.repoInformerSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
 		return nil, errors.New("timed out waiting for cache to sync")
 	}
 

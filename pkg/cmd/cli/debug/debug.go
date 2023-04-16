@@ -21,7 +21,6 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -69,11 +68,6 @@ func (o *option) bindFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&o.verbose, "verbose", false, "When it's set to true the debug messages by crashd will be printed during execution.  Default value is false.")
 }
 
-func (o *option) asCrashdArgs() string {
-	return fmt.Sprintf("output=%s,namespace=%s,basedir=%s,backup=%s,restore=%s,kubeconfig=%s,kubecontext=%s",
-		o.outputPath, o.namespace, o.baseDir, o.backup, o.restore, o.kubeconfigPath, o.kubeContext)
-}
-
 func (o *option) asCrashdArgMap() exec.ArgMap {
 	return exec.ArgMap{
 		"cmd":         o.currCmd,
@@ -96,7 +90,7 @@ func (o *option) complete(f client.Factory, fs *pflag.FlagSet) error {
 		return fmt.Errorf("invalid output path: %v", err)
 	}
 	o.outputPath = absOutputPath
-	tmpDir, err := ioutil.TempDir("", "crashd")
+	tmpDir, err := os.MkdirTemp("", "crashd")
 	if err != nil {
 		return err
 	}

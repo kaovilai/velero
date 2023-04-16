@@ -18,7 +18,6 @@ package install
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +50,7 @@ type InstallOptions struct {
 	PodAnnotations            flag.Map
 	PodLabels                 flag.Map
 	ServiceAccountAnnotations flag.Map
+	ServiceAccountName        string
 	VeleroPodCPURequest       string
 	VeleroPodMemRequest       string
 	VeleroPodCPULimit         string
@@ -93,6 +93,8 @@ func (o *InstallOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.Var(&o.PodAnnotations, "pod-annotations", "Annotations to add to the Velero and node agent pods. Optional. Format is key1=value1,key2=value2")
 	flags.Var(&o.PodLabels, "pod-labels", "Labels to add to the Velero and node agent pods. Optional. Format is key1=value1,key2=value2")
 	flags.Var(&o.ServiceAccountAnnotations, "sa-annotations", "Annotations to add to the Velero ServiceAccount. Add iam.gke.io/gcp-service-account=[GSA_NAME]@[PROJECT_NAME].iam.gserviceaccount.com for workload identity. Optional. Format is key1=value1,key2=value2")
+	flags.StringVar(&o.ServiceAccountName, "service-account-name", o.ServiceAccountName, "ServiceAccountName to be set to the Velero and node agent pods, it should be created before the installation, and the user also needs to create the rolebinding for it."+
+		"  Optional, if this attribute is set, the default service account 'velero' will not be created, and the flag --sa-annotations will be disregarded.")
 	flags.StringVar(&o.VeleroPodCPURequest, "velero-pod-cpu-request", o.VeleroPodCPURequest, `CPU request for Velero pod. A value of "0" is treated as unbounded. Optional.`)
 	flags.StringVar(&o.VeleroPodMemRequest, "velero-pod-mem-request", o.VeleroPodMemRequest, `Memory request for Velero pod. A value of "0" is treated as unbounded. Optional.`)
 	flags.StringVar(&o.VeleroPodCPULimit, "velero-pod-cpu-limit", o.VeleroPodCPULimit, `CPU limit for Velero pod. A value of "0" is treated as unbounded. Optional.`)
@@ -153,7 +155,7 @@ func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
 		if err != nil {
 			return nil, err
 		}
-		secretData, err = ioutil.ReadFile(realPath)
+		secretData, err = os.ReadFile(realPath)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +166,7 @@ func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
 		if err != nil {
 			return nil, err
 		}
-		caCertData, err = ioutil.ReadFile(realPath)
+		caCertData, err = os.ReadFile(realPath)
 		if err != nil {
 			return nil, err
 		}
@@ -187,6 +189,7 @@ func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
 		PodAnnotations:                  o.PodAnnotations.Data(),
 		PodLabels:                       o.PodLabels.Data(),
 		ServiceAccountAnnotations:       o.ServiceAccountAnnotations.Data(),
+		ServiceAccountName:              o.ServiceAccountName,
 		VeleroPodResources:              veleroPodResources,
 		NodeAgentPodResources:           nodeAgentPodResources,
 		SecretData:                      secretData,
@@ -323,7 +326,7 @@ func (o *InstallOptions) Run(c *cobra.Command, f client.Factory) error {
 	return nil
 }
 
-//Complete completes options for a command.
+// Complete completes options for a command.
 func (o *InstallOptions) Complete(args []string, f client.Factory) error {
 	o.Namespace = f.Namespace()
 	return nil

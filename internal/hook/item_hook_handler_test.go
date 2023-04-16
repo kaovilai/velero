@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -39,15 +38,6 @@ import (
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 )
-
-type mockItemHookHandler struct {
-	mock.Mock
-}
-
-func (h *mockItemHookHandler) HandleHooks(log logrus.FieldLogger, groupResource schema.GroupResource, obj runtime.Unstructured, resourceHooks []ResourceHook, phase hookPhase) error {
-	args := h.Called(log, groupResource, obj, resourceHooks, phase)
-	return args.Error(0)
-}
 
 func TestHandleHooksSkips(t *testing.T) {
 	tests := []struct {
@@ -1342,8 +1332,8 @@ func TestGetRestoreHooksFromSpec(t *testing.T) {
 				{
 					Name: "h1",
 					Selector: ResourceHookSelector{
-						Namespaces: collections.NewIncludesExcludes().Includes([]string{"ns1", "ns2", "ns3"}...).Excludes([]string{"ns4", "ns5", "ns6"}...),
-						Resources:  collections.NewIncludesExcludes().Includes([]string{kuberesource.Pods.Resource}...),
+						Namespaces: collections.NewIncludesExcludes().Includes("ns1", "ns2", "ns3").Excludes("ns4", "ns5", "ns6"),
+						Resources:  collections.NewIncludesExcludes().Includes(kuberesource.Pods.Resource),
 					},
 					RestoreHooks: []velerov1api.RestoreResourceHook{
 						{

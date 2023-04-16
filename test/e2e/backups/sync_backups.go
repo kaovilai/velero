@@ -16,7 +16,7 @@
  * /
  */
 
-//Refer to https://github.com/vmware-tanzu/velero/issues/4253
+// Refer to https://github.com/vmware-tanzu/velero/issues/4253
 package backups
 
 import (
@@ -47,7 +47,7 @@ func (b *SyncBackups) Init() {
 	UUIDgen, _ = uuid.NewRandom()
 	b.testNS = "sync-bsl-test-" + UUIDgen.String()
 	b.backupName = "sync-bsl-test-" + UUIDgen.String()
-	b.ctx, _ = context.WithTimeout(context.Background(), time.Duration(time.Minute*10))
+	b.ctx, _ = context.WithTimeout(context.Background(), time.Minute*10)
 }
 
 func BackupsSyncTest() {
@@ -59,7 +59,9 @@ func BackupsSyncTest() {
 	BeforeEach(func() {
 		flag.Parse()
 		if VeleroCfg.InstallVelero {
-			Expect(VeleroInstall(context.Background(), &VeleroCfg, false)).To(Succeed())
+			veleroCfg := VeleroCfg
+			veleroCfg.UseVolumeSnapshots = false
+			Expect(VeleroInstall(context.Background(), &VeleroCfg)).To(Succeed())
 		}
 	})
 
@@ -105,8 +107,9 @@ func BackupsSyncTest() {
 		})
 
 		By("Install velero", func() {
-			VeleroCfg.ObjectStoreProvider = ""
-			Expect(VeleroInstall(test.ctx, &VeleroCfg, false)).To(Succeed())
+			veleroCfg := VeleroCfg
+			veleroCfg.UseVolumeSnapshots = false
+			Expect(VeleroInstall(test.ctx, &VeleroCfg)).To(Succeed())
 		})
 
 		By("Check all backups in object storage are synced to Velero", func() {

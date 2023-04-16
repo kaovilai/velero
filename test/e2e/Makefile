@@ -55,7 +55,7 @@ VELERO_VERSION ?= $(VERSION)
 PLUGINS ?=
 RESTORE_HELPER_IMAGE ?=
 #Released version only
-UPGRADE_FROM_VELERO_VERSION ?= v1.7.1,v1.8.1
+UPGRADE_FROM_VELERO_VERSION ?= v1.9.6,v1.10.2
 # UPGRADE_FROM_VELERO_CLI can has the same format(a list divided by comma) with UPGRADE_FROM_VELERO_VERSION
 # Upgrade tests will be executed sequently according to the list by UPGRADE_FROM_VELERO_VERSION
 # So although length of UPGRADE_FROM_VELERO_CLI list is not equal with UPGRADE_FROM_VELERO_VERSION
@@ -63,7 +63,7 @@ UPGRADE_FROM_VELERO_VERSION ?= v1.7.1,v1.8.1
 # to the end, nil string will be set if UPGRADE_FROM_VELERO_CLI is shorter than UPGRADE_FROM_VELERO_VERSION
 UPGRADE_FROM_VELERO_CLI ?=
 
-MIGRATE_FROM_VELERO_VERSION ?= v1.8.1,self
+MIGRATE_FROM_VELERO_VERSION ?= v1.10.2,self
 MIGRATE_FROM_VELERO_CLI ?=
 
 VELERO_NAMESPACE ?= velero
@@ -89,6 +89,7 @@ ADDITIONAL_BSL_CONFIG ?=
 
 FEATURES ?=
 DEBUG_E2E_TEST ?= false
+VELERO_SERVER_DEBUG_MODE ?= false
 
 # Parameters to run migration tests along with all other E2E tests, and both of them should
 #   be provided or left them all empty to skip migration tests with no influence to other
@@ -139,6 +140,7 @@ run: ginkgo
 		-registry-credential-file=$(REGISTRY_CREDENTIAL_FILE) \
 		-kibishii-directory=$(KIBISHII_DIRECTORY) \
 		-debug-e2e-test=$(DEBUG_E2E_TEST) \
+		-velero-server-debug-mode=$(VELERO_SERVER_DEBUG_MODE) \
 		-default-cluster=$(DEFAULT_CLUSTER) \
 		-standby-cluster=$(STANDBY_CLUSTER) \
 		-uploader-type=$(UPLOADER_TYPE)

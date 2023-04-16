@@ -26,7 +26,34 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func CreatePod(client TestClient, ns, name string, volumes []corev1.Volume) (*corev1.Pod, error) {
+func CreatePod(client TestClient, ns, name, sc, pvcName string, volumeNameList []string, pvcAnn, ann map[string]string) (*corev1.Pod, error) {
+	if pvcName != "" && len(volumeNameList) != 1 {
+		return nil, errors.New("Volume name list should contain only 1 since PVC name is not empty")
+	}
+	volumes := []corev1.Volume{}
+	for _, volume := range volumeNameList {
+		var _pvcName string
+		if pvcName == "" {
+			_pvcName = fmt.Sprintf("pvc-%s", volume)
+		} else {
+			_pvcName = pvcName
+		}
+		pvc, err := CreatePVC(client, ns, _pvcName, sc, pvcAnn)
+		if err != nil {
+			return nil, err
+		}
+
+		volumes = append(volumes, corev1.Volume{
+			Name: volume,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvc.Name,
+					ReadOnly:  false,
+				},
+			},
+		})
+	}
+
 	vmList := []corev1.VolumeMount{}
 	for _, v := range volumes {
 		vmList = append(vmList, corev1.VolumeMount{
@@ -34,9 +61,11 @@ func CreatePod(client TestClient, ns, name string, volumes []corev1.Volume) (*co
 			MountPath: "/" + v.Name,
 		})
 	}
+
 	p := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:        name,
+			Annotations: ann,
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -76,4 +105,8 @@ func AddAnnotationToPod(ctx context.Context, client TestClient, namespace, podNa
 	fmt.Println(newPod.Annotations)
 
 	return client.ClientGo.CoreV1().Pods(namespace).Update(ctx, newPod, metav1.UpdateOptions{})
+}
+
+func ListPods(ctx context.Context, client TestClient, namespace string) (*corev1.PodList, error) {
+	return client.ClientGo.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 }

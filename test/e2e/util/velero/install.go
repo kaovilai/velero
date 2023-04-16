@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -42,18 +41,22 @@ import (
 	. "github.com/vmware-tanzu/velero/test/e2e/util/k8s"
 )
 
+const (
+	KubeSystemNamespace           = "kube-system"
+	VSphereCSIControllerNamespace = "vmware-system-csi"
+)
+
 // we provide more install options other than the standard install.InstallOptions in E2E test
 type installOptions struct {
 	*install.InstallOptions
 	RegistryCredentialFile string
 	RestoreHelperImage     string
+	VeleroServerDebugMode  bool
 }
 
-func VeleroInstall(ctx context.Context, veleroCfg *VerleroConfig, useVolumeSnapshots bool) error {
+func VeleroInstall(ctx context.Context, veleroCfg *VeleroConfig) error {
 	if veleroCfg.CloudProvider != "kind" {
-		if veleroCfg.ObjectStoreProvider != "" {
-			return errors.New("For cloud platforms, object store plugin cannot be overridden") // Can't set an object store provider that is different than your cloud
-		}
+		fmt.Printf("For cloud platforms, object store plugin provider will be set as cloud provider")
 		veleroCfg.ObjectStoreProvider = veleroCfg.CloudProvider
 	} else {
 		if veleroCfg.ObjectStoreProvider == "" {
@@ -81,14 +84,13 @@ func VeleroInstall(ctx context.Context, veleroCfg *VerleroConfig, useVolumeSnaps
 		}
 	}
 
-	veleroInstallOptions, err := getProviderVeleroInstallOptions(veleroCfg.ObjectStoreProvider, veleroCfg.CloudCredentialsFile, veleroCfg.BSLBucket,
-		veleroCfg.BSLPrefix, veleroCfg.BSLConfig, veleroCfg.VSLConfig, providerPluginsTmp, veleroCfg.Features)
+	veleroInstallOptions, err := getProviderVeleroInstallOptions(veleroCfg, providerPluginsTmp)
 	if err != nil {
 		return errors.WithMessagef(err, "Failed to get Velero InstallOptions for plugin provider %s", veleroCfg.ObjectStoreProvider)
 	}
-	veleroInstallOptions.UseVolumeSnapshots = useVolumeSnapshots
+	veleroInstallOptions.UseVolumeSnapshots = veleroCfg.UseVolumeSnapshots
 	if !veleroCfg.UseRestic {
-		veleroInstallOptions.UseNodeAgent = !useVolumeSnapshots
+		veleroInstallOptions.UseNodeAgent = veleroCfg.UseNodeAgent
 	}
 	veleroInstallOptions.UseRestic = veleroCfg.UseRestic
 	veleroInstallOptions.Image = veleroCfg.VeleroImage
@@ -101,15 +103,17 @@ func VeleroInstall(ctx context.Context, veleroCfg *VerleroConfig, useVolumeSnaps
 		InstallOptions:         veleroInstallOptions,
 		RegistryCredentialFile: veleroCfg.RegistryCredentialFile,
 		RestoreHelperImage:     veleroCfg.RestoreHelperImage,
+		VeleroServerDebugMode:  veleroCfg.VeleroServerDebugMode,
 	})
 	if err != nil {
+		RunDebug(context.Background(), veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace, "", "")
 		return errors.WithMessagef(err, "Failed to install Velero in the cluster")
 	}
 
 	return nil
 }
 
-//configvSpherePlugin refers to https://github.com/vmware-tanzu/velero-plugin-for-vsphere/blob/v1.3.0/docs/vanilla.md
+// configvSpherePlugin refers to https://github.com/vmware-tanzu/velero-plugin-for-vsphere/blob/v1.3.0/docs/vanilla.md
 func configvSpherePlugin(cli TestClient) error {
 	var err error
 	vsphereSecret := "velero-vsphere-config-secret"
@@ -120,7 +124,7 @@ func configvSpherePlugin(cli TestClient) error {
 	if err := CreateNamespace(context.Background(), cli, VeleroCfg.VeleroNamespace); err != nil {
 		return errors.WithMessagef(err, "Failed to create Velero %s namespace", VeleroCfg.VeleroNamespace)
 	}
-	if err := CreateVCCredentialSecret(cli.ClientGo, VeleroCfg.VeleroNamespace); err != nil {
+	if err := createVCCredentialSecret(cli.ClientGo, VeleroCfg.VeleroNamespace); err != nil {
 		return errors.WithMessagef(err, "Failed to create virtual center credential secret in %s namespace", VeleroCfg.VeleroNamespace)
 	}
 	if err := WaitForSecretsComplete(cli.ClientGo, VeleroCfg.VeleroNamespace, vsphereSecret); err != nil {
@@ -130,7 +134,7 @@ func configvSpherePlugin(cli TestClient) error {
 		"cluster_flavor":           "VANILLA",
 		"vsphere_secret_name":      vsphereSecret,
 		"vsphere_secret_namespace": VeleroCfg.VeleroNamespace,
-	})
+	}, nil)
 	if err != nil {
 		return errors.WithMessagef(err, "Failed to create velero-vsphere-plugin-config configmap in %s namespace", VeleroCfg.VeleroNamespace)
 	}
@@ -178,6 +182,9 @@ func installVeleroServer(ctx context.Context, cli string, options *installOption
 	if options.UseNodeAgent {
 		args = append(args, "--use-node-agent")
 	}
+	if options.DefaultVolumesToFsBackup {
+		args = append(args, "--default-volumes-to-fs-backup")
+	}
 	if options.UseRestic {
 		args = append(args, "--use-restic")
 	}
@@ -224,14 +231,14 @@ func installVeleroServer(ctx context.Context, cli string, options *installOption
 		args = append(args, fmt.Sprintf("--uploader-type=%v", options.UploaderType))
 	}
 
-	if err := createVelereResources(ctx, cli, namespace, args, options.RegistryCredentialFile, options.RestoreHelperImage); err != nil {
+	if err := createVelereResources(ctx, cli, namespace, args, options); err != nil {
 		return err
 	}
 
 	return waitVeleroReady(ctx, namespace, options.UseNodeAgent)
 }
 
-func createVelereResources(ctx context.Context, cli, namespace string, args []string, registryCredentialFile, RestoreHelperImage string) error {
+func createVelereResources(ctx context.Context, cli, namespace string, args []string, options *installOptions) error {
 	args = append(args, "--dry-run", "--output", "json", "--crds-only")
 
 	// get the CRD definitions
@@ -273,10 +280,10 @@ func createVelereResources(ctx context.Context, cli, namespace string, args []st
 
 	resources := &unstructured.UnstructuredList{}
 	if err := json.Unmarshal([]byte(stdout), resources); err != nil {
-		return errors.Wrapf(err, "failed to unmarshal the resources: %s", string(stdout))
+		return errors.Wrapf(err, "failed to unmarshal the resources: %s", stdout)
 	}
 
-	if err = patchResources(ctx, resources, namespace, registryCredentialFile, VeleroCfg.RestoreHelperImage); err != nil {
+	if err = patchResources(ctx, resources, namespace, options); err != nil {
 		return errors.Wrapf(err, "failed to patch resources")
 	}
 
@@ -298,51 +305,86 @@ func createVelereResources(ctx context.Context, cli, namespace string, args []st
 }
 
 // patch the velero resources
-func patchResources(ctx context.Context, resources *unstructured.UnstructuredList, namespace, registryCredentialFile, RestoreHelperImage string) error {
-	// apply the image pull secret to avoid the image pull limit of Docker Hub
-	if len(registryCredentialFile) > 0 {
-		credential, err := ioutil.ReadFile(registryCredentialFile)
-		if err != nil {
-			return errors.Wrapf(err, "failed to read the registry credential file %s", registryCredentialFile)
-		}
+func patchResources(ctx context.Context, resources *unstructured.UnstructuredList, namespace string, options *installOptions) error {
+	i := 0
+	size := 2
+	var deploy apps.Deployment
+	var imagePullSecret corev1.Secret
 
-		imagePullSecret := corev1.Secret{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Secret",
-				APIVersion: corev1.SchemeGroupVersion.String(),
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "image-pull-secret",
-				Namespace: namespace,
-			},
-			Type: corev1.SecretTypeDockerConfigJson,
-			Data: map[string][]byte{
-				".dockerconfigjson": credential,
-			},
-		}
-
-		for resourceIndex, resource := range resources.Items {
-			if resource.GetKind() == "ServiceAccount" && resource.GetName() == "velero" {
-				resource.Object["imagePullSecrets"] = []map[string]interface{}{
-					{
-						"name": "image-pull-secret",
-					},
-				}
-				resources.Items[resourceIndex] = resource
-				fmt.Printf("image pull secret %q set for velero serviceaccount \n", "image-pull-secret")
-				break
+	for resourceIndex, resource := range resources.Items {
+		// apply the image pull secret to avoid the image pull limit of Docker Hub
+		if len(options.RegistryCredentialFile) > 0 && resource.GetKind() == "ServiceAccount" &&
+			resource.GetName() == "velero" {
+			credential, err := os.ReadFile(options.RegistryCredentialFile)
+			if err != nil {
+				return errors.Wrapf(err, "failed to read the registry credential file %s", options.RegistryCredentialFile)
 			}
-		}
+			imagePullSecret = corev1.Secret{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Secret",
+					APIVersion: corev1.SchemeGroupVersion.String(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "image-pull-secret",
+					Namespace: namespace,
+				},
+				Type: corev1.SecretTypeDockerConfigJson,
+				Data: map[string][]byte{
+					".dockerconfigjson": credential,
+				},
+			}
+			resource.Object["imagePullSecrets"] = []map[string]interface{}{
+				{
+					"name": "image-pull-secret",
+				},
+			}
+			resources.Items[resourceIndex] = resource
+			fmt.Printf("image pull secret %q set for velero serviceaccount \n", "image-pull-secret")
 
-		un, err := toUnstructured(imagePullSecret)
-		if err != nil {
-			return errors.Wrapf(err, "failed to convert pull secret to unstructure")
+			un, err := toUnstructured(imagePullSecret)
+			if err != nil {
+				return errors.Wrapf(err, "failed to convert pull secret to unstructure")
+			}
+			resources.Items = append(resources.Items, un)
+			i++
+		} else if options.VeleroServerDebugMode && resource.GetKind() == "Deployment" &&
+			resource.GetName() == "velero" {
+			deployJsonStr, err := json.Marshal(resource.Object)
+			if err != nil {
+				return errors.Wrapf(err, "failed to marshal velero deployment")
+			}
+			if err := json.Unmarshal(deployJsonStr, &deploy); err != nil {
+				return errors.Wrapf(err, "failed to unmarshal velero deployment")
+			}
+			veleroDeployIndex := -1
+			for containerIndex, container := range deploy.Spec.Template.Spec.Containers {
+				if container.Name == "velero" {
+					veleroDeployIndex = containerIndex
+					container.Args = append(container.Args, "--log-level", "debug")
+					break
+				}
+			}
+			if veleroDeployIndex >= 0 {
+				deploy.Spec.Template.Spec.Containers[veleroDeployIndex].Args = append(deploy.Spec.Template.Spec.Containers[veleroDeployIndex].Args, "--log-level")
+				deploy.Spec.Template.Spec.Containers[veleroDeployIndex].Args = append(deploy.Spec.Template.Spec.Containers[veleroDeployIndex].Args, "debug")
+				un, err := toUnstructured(deploy)
+				if err != nil {
+					return errors.Wrapf(err, "failed to unstructured velero deployment")
+				}
+				resources.Items = append(resources.Items, un)
+				resources.Items = append(resources.Items[:resourceIndex], resources.Items[resourceIndex+1:]...)
+			} else {
+				return errors.New("failed to get velero container in velero pod")
+			}
+			i++
 		}
-		resources.Items = append(resources.Items, un)
+		if i == size {
+			break
+		}
 	}
 
 	// customize the restic restore helper image
-	if len(VeleroCfg.RestoreHelperImage) > 0 {
+	if len(options.RestoreHelperImage) > 0 {
 		restoreActionConfig := corev1.ConfigMap{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "ConfigMap",
@@ -357,7 +399,7 @@ func patchResources(ctx context.Context, resources *unstructured.UnstructuredLis
 				},
 			},
 			Data: map[string]string{
-				"image": VeleroCfg.RestoreHelperImage,
+				"image": options.RestoreHelperImage,
 			},
 		}
 
@@ -425,4 +467,38 @@ func VeleroUninstall(ctx context.Context, cli, namespace string) error {
 	}
 	fmt.Println("Velero uninstalled ⛵")
 	return nil
+}
+
+// createVCCredentialSecret refer to https://github.com/vmware-tanzu/velero-plugin-for-vsphere/blob/v1.3.0/docs/vanilla.md
+func createVCCredentialSecret(c clientset.Interface, veleroNamespace string) error {
+	secret, err := getVCCredentialSecret(c)
+	if err != nil {
+		return err
+	}
+	vsphereCfg, exist := secret.Data["csi-vsphere.conf"]
+	if !exist {
+		return errors.New("failed to retrieve csi-vsphere config")
+	}
+	se := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "velero-vsphere-config-secret",
+			Namespace: veleroNamespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"csi-vsphere.conf": vsphereCfg},
+	}
+	_, err = c.CoreV1().Secrets(veleroNamespace).Create(context.TODO(), se, metav1.CreateOptions{})
+	return err
+}
+
+// Reference https://github.com/vmware-tanzu/velero-plugin-for-vsphere/blob/main/docs/vanilla.md#create-vc-credential-secret
+// Read secret from kube-system namespace first, if not found, try with vmware-system-csi.
+func getVCCredentialSecret(c clientset.Interface) (secret *corev1.Secret, err error) {
+	secret, err = GetSecret(c, KubeSystemNamespace, "vsphere-config-secret")
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			secret, err = GetSecret(c, VSphereCSIControllerNamespace, "vsphere-config-secret")
+		}
+	}
+	return
 }

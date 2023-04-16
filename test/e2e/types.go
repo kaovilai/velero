@@ -26,46 +26,50 @@ import (
 
 var UUIDgen uuid.UUID
 
-var VeleroCfg VerleroConfig
+var VeleroCfg VeleroConfig
 
-type VerleroConfig struct {
-	VeleroCLI                string
-	VeleroImage              string
-	VeleroVersion            string
-	CloudCredentialsFile     string
-	BSLConfig                string
-	BSLBucket                string
-	BSLPrefix                string
-	VSLConfig                string
-	CloudProvider            string
-	ObjectStoreProvider      string
-	VeleroNamespace          string
-	AdditionalBSLProvider    string
-	AdditionalBSLBucket      string
-	AdditionalBSLPrefix      string
-	AdditionalBSLConfig      string
-	AdditionalBSLCredentials string
-	RegistryCredentialFile   string
-	RestoreHelperImage       string
-	UpgradeFromVeleroVersion string
-	UpgradeFromVeleroCLI     string
-	MigrateFromVeleroVersion string
-	MigrateFromVeleroCLI     string
-	Plugins                  string
-	AddBSLPlugins            string
-	InstallVelero            bool
-	KibishiiDirectory        string
-	Features                 string
-	Debug                    bool
-	GCFrequency              string
-	DefaultCluster           string
-	StandbyCluster           string
-	ClientToInstallVelero    *TestClient
-	DefaultClient            *TestClient
-	StandbyClient            *TestClient
-	UploaderType             string
-	UseNodeAgent             bool
-	UseRestic                bool
+type VeleroConfig struct {
+	VeleroCLI                   string
+	VeleroImage                 string
+	VeleroVersion               string
+	CloudCredentialsFile        string
+	BSLConfig                   string
+	BSLBucket                   string
+	BSLPrefix                   string
+	VSLConfig                   string
+	CloudProvider               string
+	ObjectStoreProvider         string
+	VeleroNamespace             string
+	AdditionalBSLProvider       string
+	AdditionalBSLBucket         string
+	AdditionalBSLPrefix         string
+	AdditionalBSLConfig         string
+	AdditionalBSLCredentials    string
+	RegistryCredentialFile      string
+	RestoreHelperImage          string
+	UpgradeFromVeleroVersion    string
+	UpgradeFromVeleroCLI        string
+	MigrateFromVeleroVersion    string
+	MigrateFromVeleroCLI        string
+	Plugins                     string
+	AddBSLPlugins               string
+	InstallVelero               bool
+	KibishiiDirectory           string
+	Features                    string
+	Debug                       bool
+	GCFrequency                 string
+	DefaultCluster              string
+	StandbyCluster              string
+	ClientToInstallVelero       *TestClient
+	DefaultClient               *TestClient
+	StandbyClient               *TestClient
+	UploaderType                string
+	UseNodeAgent                bool
+	UseRestic                   bool
+	ProvideSnapshotsVolumeParam bool
+	DefaultVolumesToFsBackup    bool
+	UseVolumeSnapshots          bool
+	VeleroServerDebugMode       bool
 }
 
 type SnapshotCheckPoint struct {
@@ -79,17 +83,19 @@ type SnapshotCheckPoint struct {
 }
 
 type BackupConfig struct {
-	BackupName              string
-	Namespace               string
-	BackupLocation          string
-	UseVolumeSnapshots      bool
-	Selector                string
-	TTL                     time.Duration
-	IncludeResources        string
-	ExcludeResources        string
-	IncludeClusterResources bool
-	OrderedResources        string
-	UseResticIfFSBackup     bool
+	BackupName                  string
+	Namespace                   string
+	BackupLocation              string
+	UseVolumeSnapshots          bool
+	ProvideSnapshotsVolumeParam bool
+	Selector                    string
+	TTL                         time.Duration
+	IncludeResources            string
+	ExcludeResources            string
+	IncludeClusterResources     bool
+	OrderedResources            string
+	UseResticIfFSBackup         bool
+	DefaultVolumesToFsBackup    bool
 }
 
 type VeleroCLI2Version struct {

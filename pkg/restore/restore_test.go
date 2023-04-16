@@ -45,17 +45,19 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
-	velerov1informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
-	riav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/restoreitemaction/v1"
+	riav2 "github.com/vmware-tanzu/velero/pkg/plugin/velero/restoreitemaction/v2"
 	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	uploadermocks "github.com/vmware-tanzu/velero/pkg/podvolume/mocks"
 	"github.com/vmware-tanzu/velero/pkg/test"
 	testutil "github.com/vmware-tanzu/velero/pkg/test"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
+	. "github.com/vmware-tanzu/velero/pkg/util/results"
 	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
@@ -568,7 +570,7 @@ func TestRestoreResourceFiltering(t *testing.T) {
 			}
 			require.NoError(t, h.restorer.discoveryHelper.Refresh())
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -579,7 +581,6 @@ func TestRestoreResourceFiltering(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				nil, // restoreItemActions
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
@@ -649,7 +650,7 @@ func TestRestoreNamespaceMapping(t *testing.T) {
 			}
 			require.NoError(t, h.restorer.discoveryHelper.Refresh())
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -660,7 +661,6 @@ func TestRestoreNamespaceMapping(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				nil, // restoreItemActions
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
@@ -734,7 +734,7 @@ func TestRestoreResourcePriorities(t *testing.T) {
 		}
 		require.NoError(t, h.restorer.discoveryHelper.Refresh())
 
-		data := Request{
+		data := &Request{
 			Log:              h.log,
 			Restore:          tc.restore,
 			Backup:           tc.backup,
@@ -745,7 +745,6 @@ func TestRestoreResourcePriorities(t *testing.T) {
 		warnings, errs := h.restorer.Restore(
 			data,
 			nil, // restoreItemActions
-			nil, // snapshot location lister
 			nil, // volume snapshotter getter
 		)
 
@@ -812,7 +811,7 @@ func TestInvalidTarballContents(t *testing.T) {
 			}
 			require.NoError(t, h.restorer.discoveryHelper.Refresh())
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -823,7 +822,6 @@ func TestInvalidTarballContents(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				nil, // restoreItemActions
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 			assertWantErrsOrWarnings(t, tc.wantWarnings, warnings)
@@ -859,15 +857,16 @@ func assertWantErrsOrWarnings(t *testing.T, wantRes Result, res Result) {
 // with the expected metadata/spec/status in the API.
 func TestRestoreItems(t *testing.T) {
 	tests := []struct {
-		name         string
-		restore      *velerov1api.Restore
-		backup       *velerov1api.Backup
-		apiResources []*test.APIResource
-		tarball      io.Reader
-		want         []*test.APIResource
+		name                 string
+		restore              *velerov1api.Restore
+		backup               *velerov1api.Backup
+		apiResources         []*test.APIResource
+		tarball              io.Reader
+		want                 []*test.APIResource
+		expectedRestoreItems map[itemKey]restoredItemStatus
 	}{
 		{
-			name:    "metadata other than namespace/name/labels/annotations gets removed",
+			name:    "metadata uid/resourceVersion/etc. gets removed",
 			restore: defaultRestore().Result(),
 			backup:  defaultBackup().Result(),
 			tarball: test.NewTarWriter(t).
@@ -877,6 +876,7 @@ func TestRestoreItems(t *testing.T) {
 							builder.WithLabels("key-1", "val-1"),
 							builder.WithAnnotations("key-1", "val-1"),
 							builder.WithFinalizers("finalizer-1"),
+							builder.WithUID("uid"),
 						).
 						Result(),
 				).
@@ -890,9 +890,14 @@ func TestRestoreItems(t *testing.T) {
 						ObjectMeta(
 							builder.WithLabels("key-1", "val-1", "velero.io/backup-name", "backup-1", "velero.io/restore-name", "restore-1"),
 							builder.WithAnnotations("key-1", "val-1"),
+							builder.WithFinalizers("finalizer-1"),
 						).
 						Result(),
 				),
+			},
+			expectedRestoreItems: map[itemKey]restoredItemStatus{
+				{resource: "v1/Namespace", namespace: "", name: "ns-1"}: {action: "created", itemExists: true},
+				{resource: "v1/Pod", namespace: "ns-1", name: "pod-1"}:  {action: "created", itemExists: true},
 			},
 		},
 		{
@@ -1000,6 +1005,10 @@ func TestRestoreItems(t *testing.T) {
 			want: []*test.APIResource{
 				test.ServiceAccounts(builder.ForServiceAccount("ns-1", "sa-1").Result()),
 			},
+			expectedRestoreItems: map[itemKey]restoredItemStatus{
+				{resource: "v1/Namespace", namespace: "", name: "ns-1"}:          {action: "created", itemExists: true},
+				{resource: "v1/ServiceAccount", namespace: "ns-1", name: "sa-1"}: {action: "skipped", itemExists: true},
+			},
 		},
 		{
 			name:    "update secret data and labels when secret exists in cluster and is not identical to the backed up one, existing resource policy is update",
@@ -1013,6 +1022,10 @@ func TestRestoreItems(t *testing.T) {
 			},
 			want: []*test.APIResource{
 				test.Secrets(builder.ForSecret("ns-1", "sa-1").ObjectMeta(builder.WithLabels("velero.io/backup-name", "backup-1", "velero.io/restore-name", "restore-1")).Data(map[string][]byte{"key-1": []byte("value-1")}).Result()),
+			},
+			expectedRestoreItems: map[itemKey]restoredItemStatus{
+				{resource: "v1/Namespace", namespace: "", name: "ns-1"}:  {action: "created", itemExists: true},
+				{resource: "v1/Secret", namespace: "ns-1", name: "sa-1"}: {action: "updated", itemExists: true},
 			},
 		},
 		{
@@ -1107,6 +1120,53 @@ func TestRestoreItems(t *testing.T) {
 				}),
 			},
 		},
+		{
+			name:    "metadata managedFields gets restored",
+			restore: defaultRestore().Result(),
+			backup:  defaultBackup().Result(),
+			tarball: test.NewTarWriter(t).
+				AddItems("pods",
+					builder.ForPod("ns-1", "pod-1").
+						ObjectMeta(
+							builder.WithManagedFields([]metav1.ManagedFieldsEntry{
+								{
+									Manager:    "kubectl",
+									Operation:  "Apply",
+									APIVersion: "v1",
+									FieldsType: "FieldsV1",
+									FieldsV1: &metav1.FieldsV1{
+										Raw: []byte(`{"f:data": {"f:key":{}}}`),
+									},
+								},
+							}),
+						).
+						Result(),
+				).
+				Done(),
+			apiResources: []*test.APIResource{
+				test.Pods(),
+			},
+			want: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("ns-1", "pod-1").
+						ObjectMeta(
+							builder.WithLabels("velero.io/backup-name", "backup-1", "velero.io/restore-name", "restore-1"),
+							builder.WithManagedFields([]metav1.ManagedFieldsEntry{
+								{
+									Manager:    "kubectl",
+									Operation:  "Apply",
+									APIVersion: "v1",
+									FieldsType: "FieldsV1",
+									FieldsV1: &metav1.FieldsV1{
+										Raw: []byte(`{"f:data": {"f:key":{}}}`),
+									},
+								},
+							}),
+						).
+						Result(),
+				),
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -1117,23 +1177,26 @@ func TestRestoreItems(t *testing.T) {
 				h.AddItems(t, r)
 			}
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
 				PodVolumeBackups: nil,
 				VolumeSnapshots:  nil,
 				BackupReader:     tc.tarball,
+				RestoredItems:    map[itemKey]restoredItemStatus{},
 			}
 			warnings, errs := h.restorer.Restore(
 				data,
 				nil, // restoreItemActions
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
 			assertEmptyResults(t, warnings, errs)
 			assertRestoredItems(t, h, tc.want)
+			if len(tc.expectedRestoreItems) > 0 {
+				assert.EqualValues(t, tc.expectedRestoreItems, data.RestoredItems)
+			}
 		})
 	}
 }
@@ -1142,9 +1205,16 @@ func TestRestoreItems(t *testing.T) {
 // to run for specific resources/namespaces and simply records the items
 // that it is executed for.
 type recordResourcesAction struct {
-	selector        velero.ResourceSelector
-	ids             []string
-	additionalItems []velero.ResourceIdentifier
+	selector                    velero.ResourceSelector
+	ids                         []string
+	additionalItems             []velero.ResourceIdentifier
+	operationID                 string
+	waitForAdditionalItems      bool
+	additionalItemsReadyTimeout time.Duration
+}
+
+func (a *recordResourcesAction) Name() string {
+	return ""
 }
 
 func (a *recordResourcesAction) AppliesTo() (velero.ResourceSelector, error) {
@@ -1155,16 +1225,34 @@ func (a *recordResourcesAction) Execute(input *velero.RestoreItemActionExecuteIn
 	metadata, err := meta.Accessor(input.Item)
 	if err != nil {
 		return &velero.RestoreItemActionExecuteOutput{
-			UpdatedItem:     input.Item,
-			AdditionalItems: a.additionalItems,
+			UpdatedItem:                 input.Item,
+			AdditionalItems:             a.additionalItems,
+			OperationID:                 a.operationID,
+			WaitForAdditionalItems:      a.waitForAdditionalItems,
+			AdditionalItemsReadyTimeout: a.additionalItemsReadyTimeout,
 		}, err
 	}
 	a.ids = append(a.ids, kubeutil.NamespaceAndName(metadata))
 
 	return &velero.RestoreItemActionExecuteOutput{
-		UpdatedItem:     input.Item,
-		AdditionalItems: a.additionalItems,
+		UpdatedItem:                 input.Item,
+		AdditionalItems:             a.additionalItems,
+		OperationID:                 a.operationID,
+		WaitForAdditionalItems:      a.waitForAdditionalItems,
+		AdditionalItemsReadyTimeout: a.additionalItemsReadyTimeout,
 	}, nil
+}
+
+func (a *recordResourcesAction) Progress(operationID string, restore *velerov1api.Restore) (velero.OperationProgress, error) {
+	return velero.OperationProgress{}, nil
+}
+
+func (a *recordResourcesAction) Cancel(operationID string, restore *velerov1api.Restore) error {
+	return nil
+}
+
+func (a *recordResourcesAction) AreAdditionalItemsReady(additionalItems []velero.ResourceIdentifier, restore *velerov1api.Restore) (bool, error) {
+	return true, nil
 }
 
 func (a *recordResourcesAction) ForResource(resource string) *recordResourcesAction {
@@ -1322,12 +1410,12 @@ func TestRestoreActionsRunForCorrectItems(t *testing.T) {
 				h.AddItems(t, r)
 			}
 
-			actions := []riav1.RestoreItemAction{}
+			actions := []riav2.RestoreItemAction{}
 			for action := range tc.actions {
 				actions = append(actions, action)
 			}
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -1338,7 +1426,6 @@ func TestRestoreActionsRunForCorrectItems(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				actions,
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
@@ -1356,8 +1443,9 @@ func TestRestoreActionsRunForCorrectItems(t *testing.T) {
 // pluggableAction is a restore item action that can be plugged with an Execute
 // function body at runtime.
 type pluggableAction struct {
-	selector    velero.ResourceSelector
-	executeFunc func(*velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error)
+	selector     velero.ResourceSelector
+	executeFunc  func(*velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error)
+	progressFunc func(string, *velerov1api.Restore) (velero.OperationProgress, error)
 }
 
 func (a *pluggableAction) Execute(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
@@ -1370,13 +1458,29 @@ func (a *pluggableAction) Execute(input *velero.RestoreItemActionExecuteInput) (
 	return a.executeFunc(input)
 }
 
+func (a *pluggableAction) Name() string {
+	return ""
+}
+
 func (a *pluggableAction) AppliesTo() (velero.ResourceSelector, error) {
 	return a.selector, nil
+}
+
+func (a *pluggableAction) Progress(operationID string, restore *velerov1api.Restore) (velero.OperationProgress, error) {
+	return velero.OperationProgress{}, nil
+}
+
+func (a *pluggableAction) Cancel(operationID string, restore *velerov1api.Restore) error {
+	return nil
 }
 
 func (a *pluggableAction) addSelector(selector velero.ResourceSelector) *pluggableAction {
 	a.selector = selector
 	return a
+}
+
+func (a *pluggableAction) AreAdditionalItemsReady(additionalItems []velero.ResourceIdentifier, restore *velerov1api.Restore) (bool, error) {
+	return true, nil
 }
 
 // TestRestoreActionModifications runs restores with restore item actions that modify resources, and
@@ -1409,7 +1513,7 @@ func TestRestoreActionModifications(t *testing.T) {
 		backup       *velerov1api.Backup
 		apiResources []*test.APIResource
 		tarball      io.Reader
-		actions      []riav1.RestoreItemAction
+		actions      []riav2.RestoreItemAction
 		want         []*test.APIResource
 	}{
 		{
@@ -1418,7 +1522,7 @@ func TestRestoreActionModifications(t *testing.T) {
 			backup:       defaultBackup().Result(),
 			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").Result()).Done(),
 			apiResources: []*test.APIResource{test.Pods()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.SetLabels(map[string]string{"updated": "true"})
 				}),
@@ -1435,7 +1539,7 @@ func TestRestoreActionModifications(t *testing.T) {
 			backup:       defaultBackup().Result(),
 			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").ObjectMeta(builder.WithLabels("should-be-removed", "true")).Result()).Done(),
 			apiResources: []*test.APIResource{test.Pods()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.SetLabels(nil)
 				}),
@@ -1450,7 +1554,7 @@ func TestRestoreActionModifications(t *testing.T) {
 			backup:       defaultBackup().Result(),
 			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").Result()).Done(),
 			apiResources: []*test.APIResource{test.Pods()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				modifyingActionGetter(func(item *unstructured.Unstructured) {
 					item.SetLabels(map[string]string{"updated": "true"})
 				}).addSelector(velero.ResourceSelector{
@@ -1491,7 +1595,7 @@ func TestRestoreActionModifications(t *testing.T) {
 				}
 			}
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -1502,12 +1606,179 @@ func TestRestoreActionModifications(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				tc.actions,
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
 			assertEmptyResults(t, warnings, errs)
 			assertRestoredItems(t, h, tc.want)
+		})
+	}
+}
+
+// TestRestoreWithAsyncOperations runs restores which return operationIDs and
+// verifies that the itemoperations are tracked as appropriate. Verification is done by
+// looking at the restore request's itemOperationsList field.
+func TestRestoreWithAsyncOperations(t *testing.T) {
+	// completedOperationAction is a *pluggableAction, whose Execute(...)
+	// method returns an operationID which will always be done when calling Progress.
+	completedOperationAction := &pluggableAction{
+		executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+			obj, ok := input.Item.(*unstructured.Unstructured)
+			if !ok {
+				return nil, errors.Errorf("unexpected type %T", input.Item)
+			}
+			return &velero.RestoreItemActionExecuteOutput{
+				UpdatedItem: obj,
+				OperationID: obj.GetName() + "-1",
+			}, nil
+
+		},
+		progressFunc: func(operationID string, restore *velerov1api.Restore) (velero.OperationProgress, error) {
+			return velero.OperationProgress{
+				Completed:   true,
+				Description: "Done!",
+			}, nil
+		},
+	}
+
+	// incompleteOperationAction is a *pluggableAction, whose Execute(...)
+	// method returns an operationID which will never be done when calling Progress.
+	incompleteOperationAction := &pluggableAction{
+		executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+			obj, ok := input.Item.(*unstructured.Unstructured)
+			if !ok {
+				return nil, errors.Errorf("unexpected type %T", input.Item)
+			}
+			return &velero.RestoreItemActionExecuteOutput{
+				UpdatedItem: obj,
+				OperationID: obj.GetName() + "-1",
+			}, nil
+
+		},
+		progressFunc: func(operationID string, restore *velerov1api.Restore) (velero.OperationProgress, error) {
+			return velero.OperationProgress{
+				Completed:   false,
+				Description: "Working...",
+			}, nil
+		},
+	}
+
+	// noOperationAction is a *pluggableAction, whose Execute(...)
+	// method does not return an operationID.
+	noOperationAction := &pluggableAction{
+		executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+			obj, ok := input.Item.(*unstructured.Unstructured)
+			if !ok {
+				return nil, errors.Errorf("unexpected type %T", input.Item)
+			}
+			return &velero.RestoreItemActionExecuteOutput{
+				UpdatedItem: obj,
+			}, nil
+
+		},
+	}
+
+	tests := []struct {
+		name         string
+		restore      *velerov1api.Restore
+		backup       *velerov1api.Backup
+		apiResources []*test.APIResource
+		tarball      io.Reader
+		actions      []riav2.RestoreItemAction
+		want         []*itemoperation.RestoreOperation
+	}{
+		{
+			name:         "action that starts a short-running process records operation",
+			restore:      defaultRestore().Result(),
+			backup:       defaultBackup().Result(),
+			apiResources: []*test.APIResource{test.Pods()},
+			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").Result()).Done(),
+			actions: []riav2.RestoreItemAction{
+				completedOperationAction,
+			},
+			want: []*itemoperation.RestoreOperation{
+				{
+					Spec: itemoperation.RestoreOperationSpec{
+						RestoreName: "restore-1",
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: kuberesource.Pods,
+							Namespace:     "ns-1",
+							Name:          "pod-1"},
+						OperationID: "pod-1-1",
+					},
+					Status: itemoperation.OperationStatus{
+						Phase: "New",
+					},
+				},
+			},
+		},
+		{
+			name:         "action that starts a long-running process records operation",
+			restore:      defaultRestore().Result(),
+			backup:       defaultBackup().Result(),
+			apiResources: []*test.APIResource{test.Pods()},
+			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-2").Result()).Done(),
+			actions: []riav2.RestoreItemAction{
+				incompleteOperationAction,
+			},
+			want: []*itemoperation.RestoreOperation{
+				{
+					Spec: itemoperation.RestoreOperationSpec{
+						RestoreName: "restore-1",
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: kuberesource.Pods,
+							Namespace:     "ns-1",
+							Name:          "pod-2"},
+						OperationID: "pod-2-1",
+					},
+					Status: itemoperation.OperationStatus{
+						Phase: "New",
+					},
+				},
+			},
+		},
+		{
+			name:         "action that has no operation doesn't record one",
+			restore:      defaultRestore().Result(),
+			backup:       defaultBackup().Result(),
+			apiResources: []*test.APIResource{test.Pods()},
+			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-3").Result()).Done(),
+			actions: []riav2.RestoreItemAction{
+				noOperationAction,
+			},
+			want: []*itemoperation.RestoreOperation{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+
+			for _, r := range tc.apiResources {
+				h.AddItems(t, r)
+			}
+
+			data := &Request{
+				Log:              h.log,
+				Restore:          tc.restore,
+				Backup:           tc.backup,
+				PodVolumeBackups: nil,
+				VolumeSnapshots:  nil,
+				BackupReader:     tc.tarball,
+			}
+			warnings, errs := h.restorer.Restore(
+				data,
+				tc.actions,
+				nil, // volume snapshotter getter
+			)
+
+			assertEmptyResults(t, warnings, errs)
+			resultOper := *data.GetItemOperationsList()
+			// set want Created times so it won't fail the assert.Equal test
+			for i, wantOper := range tc.want {
+				wantOper.Status.Created = resultOper[i].Status.Created
+			}
+			assert.Equal(t, tc.want, *data.GetItemOperationsList())
 		})
 	}
 }
@@ -1522,7 +1793,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 		backup       *velerov1api.Backup
 		tarball      io.Reader
 		apiResources []*test.APIResource
-		actions      []riav1.RestoreItemAction
+		actions      []riav2.RestoreItemAction
 		want         map[*test.APIResource][]string
 	}{
 		{
@@ -1531,7 +1802,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			backup:       defaultBackup().Result(),
 			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").Result(), builder.ForPod("ns-2", "pod-2").Result()).Done(),
 			apiResources: []*test.APIResource{test.Pods()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				&pluggableAction{
 					selector: velero.ResourceSelector{IncludedNamespaces: []string{"ns-1"}},
 					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
@@ -1554,7 +1825,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			backup:       defaultBackup().Result(),
 			tarball:      test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").Result(), builder.ForPod("ns-2", "pod-2").Result()).Done(),
 			apiResources: []*test.APIResource{test.Pods()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				&pluggableAction{
 					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 						return &velero.RestoreItemActionExecuteOutput{
@@ -1579,7 +1850,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 				AddItems("persistentvolumes", builder.ForPersistentVolume("pv-1").Result()).
 				Done(),
 			apiResources: []*test.APIResource{test.Pods(), test.PVs()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				&pluggableAction{
 					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 						return &velero.RestoreItemActionExecuteOutput{
@@ -1605,7 +1876,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 				AddItems("persistentvolumes", builder.ForPersistentVolume("pv-1").Result()).
 				Done(),
 			apiResources: []*test.APIResource{test.Pods(), test.PVs()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				&pluggableAction{
 					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 						return &velero.RestoreItemActionExecuteOutput{
@@ -1631,7 +1902,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 				AddItems("persistentvolumes", builder.ForPersistentVolume("pv-1").Result()).
 				Done(),
 			apiResources: []*test.APIResource{test.Pods(), test.PVs()},
-			actions: []riav1.RestoreItemAction{
+			actions: []riav2.RestoreItemAction{
 				&pluggableAction{
 					executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 						return &velero.RestoreItemActionExecuteOutput{
@@ -1658,7 +1929,7 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 				h.AddItems(t, r)
 			}
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -1669,7 +1940,6 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				tc.actions,
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
@@ -2633,10 +2903,9 @@ func TestRestorePersistentVolumes(t *testing.T) {
 				return renamed, nil
 			}
 
-			// set up the VolumeSnapshotLocation informer/lister and add test data to it
-			vslInformer := velerov1informers.NewSharedInformerFactory(h.VeleroClient, 0).Velero().V1().VolumeSnapshotLocations()
+			// set up the VolumeSnapshotLocation client and add test data to it
 			for _, vsl := range tc.volumeSnapshotLocations {
-				require.NoError(t, vslInformer.Informer().GetStore().Add(vsl))
+				require.NoError(t, h.restorer.kbClient.Create(context.Background(), vsl))
 			}
 
 			for _, r := range tc.apiResources {
@@ -2654,7 +2923,7 @@ func TestRestorePersistentVolumes(t *testing.T) {
 				}
 			}
 
-			data := Request{
+			data := &Request{
 				Log:             h.log,
 				Restore:         tc.restore,
 				Backup:          tc.backup,
@@ -2664,7 +2933,6 @@ func TestRestorePersistentVolumes(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				nil, // restoreItemActions
-				vslInformer.Lister(),
 				tc.volumeSnapshotterGetter,
 			)
 
@@ -2789,7 +3057,7 @@ func TestRestoreWithPodVolume(t *testing.T) {
 					Return(nil)
 			}
 
-			data := Request{
+			data := &Request{
 				Log:              h.log,
 				Restore:          tc.restore,
 				Backup:           tc.backup,
@@ -2800,7 +3068,6 @@ func TestRestoreWithPodVolume(t *testing.T) {
 			warnings, errs := h.restorer.Restore(
 				data,
 				nil, // restoreItemActions
-				nil, // snapshot location lister
 				nil, // volume snapshotter getter
 			)
 
@@ -2823,10 +3090,16 @@ func TestResetMetadata(t *testing.T) {
 			expectedErr: true,
 		},
 		{
-			name:        "keep name, namespace, labels, annotations only",
-			obj:         NewTestUnstructured().WithMetadata("name", "blah", "namespace", "labels", "annotations", "foo").Unstructured,
+			name:        "keep name, namespace, labels, annotations, managedFields, finalizers",
+			obj:         NewTestUnstructured().WithMetadata("name", "namespace", "labels", "annotations", "managedFields", "finalizers").Unstructured,
 			expectedErr: false,
-			expectedRes: NewTestUnstructured().WithMetadata("name", "namespace", "labels", "annotations").Unstructured,
+			expectedRes: NewTestUnstructured().WithMetadata("name", "namespace", "labels", "annotations", "managedFields", "finalizers").Unstructured,
+		},
+		{
+			name:        "remove uid, ownerReferences",
+			obj:         NewTestUnstructured().WithMetadata("name", "namespace", "uid", "ownerReferences").Unstructured,
+			expectedErr: false,
+			expectedRes: NewTestUnstructured().WithMetadata("name", "namespace").Unstructured,
 		},
 		{
 			name:        "keep status",
@@ -3119,6 +3392,7 @@ func newHarness(t *testing.T) *harness {
 
 	apiServer := test.NewAPIServer(t)
 	log := logrus.StandardLogger()
+	kbClient := velerotest.NewFakeControllerRuntimeClient(t)
 
 	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, log)
 	require.NoError(t, err)
@@ -3126,7 +3400,6 @@ func newHarness(t *testing.T) *harness {
 	return &harness{
 		APIServer: apiServer,
 		restorer: &kubernetesRestorer{
-			restoreClient:              apiServer.VeleroClient.VeleroV1(),
 			discoveryHelper:            discoveryHelper,
 			dynamicFactory:             client.NewDynamicFactory(apiServer.DynamicClient),
 			namespaceClient:            apiServer.KubeClient.CoreV1().Namespaces(),
@@ -3137,6 +3410,7 @@ func newHarness(t *testing.T) *harness {
 			// unsupported
 			podVolumeRestorerFactory: nil,
 			podVolumeTimeout:         0,
+			kbClient:                 kbClient,
 		},
 		log: log,
 	}

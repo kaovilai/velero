@@ -32,7 +32,8 @@ import (
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 	clientset "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
-	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
+	"github.com/vmware-tanzu/velero/pkg/util/results"
 )
 
 func DescribeRestore(ctx context.Context, kbClient kbclient.Client, restore *velerov1api.Restore, podVolumeRestores []velerov1api.PodVolumeRestore, details bool, veleroClient clientset.Interface, insecureSkipTLSVerify bool, caCertFile string) string {
@@ -154,11 +155,46 @@ func DescribeRestore(ctx context.Context, kbClient kbclient.Client, restore *vel
 			s = string(restore.Spec.ExistingResourcePolicy)
 		}
 		d.Printf("Existing Resource Policy: \t%s\n", s)
+		d.Printf("ItemOperationTimeout:\t%s\n", restore.Spec.ItemOperationTimeout.Duration)
 
 		d.Println()
 		d.Printf("Preserve Service NodePorts:\t%s\n", BoolPointerString(restore.Spec.PreserveNodePorts, "false", "true", "auto"))
 
+		d.Println()
+		describeRestoreItemOperations(ctx, kbClient, d, restore, details, insecureSkipTLSVerify, caCertFile)
+
+		if details {
+			describeRestoreResourceList(ctx, kbClient, d, restore, insecureSkipTLSVerify, caCertFile)
+			d.Println()
+		}
 	})
+}
+
+func describeRestoreItemOperations(ctx context.Context, kbClient kbclient.Client, d *Describer, restore *velerov1api.Restore, details bool, insecureSkipTLSVerify bool, caCertPath string) {
+	status := restore.Status
+	if status.RestoreItemOperationsAttempted > 0 {
+		if !details {
+			d.Printf("Restore Item Operations:\t%d of %d completed successfully, %d failed (specify --details for more information)\n", status.RestoreItemOperationsCompleted, status.RestoreItemOperationsAttempted, status.RestoreItemOperationsFailed)
+			return
+		}
+
+		buf := new(bytes.Buffer)
+		if err := downloadrequest.Stream(ctx, kbClient, restore.Namespace, restore.Name, velerov1api.DownloadTargetKindRestoreItemOperations, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath); err != nil {
+			d.Printf("Restore Item Operations:\t<error getting operation info: %v>\n", err)
+			return
+		}
+
+		var operations []*itemoperation.RestoreOperation
+		if err := json.NewDecoder(buf).Decode(&operations); err != nil {
+			d.Printf("Restore Item Operations:\t<error reading operation info: %v>\n", err)
+			return
+		}
+
+		d.Printf("Restore Item Operations:\n")
+		for _, operation := range operations {
+			describeRestoreItemOperation(d, operation)
+		}
+	}
 }
 
 func describeRestoreResults(ctx context.Context, kbClient kbclient.Client, d *Describer, restore *velerov1api.Restore, insecureSkipTLSVerify bool, caCertPath string) {
@@ -167,7 +203,7 @@ func describeRestoreResults(ctx context.Context, kbClient kbclient.Client, d *De
 	}
 
 	var buf bytes.Buffer
-	var resultMap map[string]pkgrestore.Result
+	var resultMap map[string]results.Result
 
 	if err := downloadrequest.Stream(ctx, kbClient, restore.Namespace, restore.Name, velerov1api.DownloadTargetKindRestoreResults, &buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath); err != nil {
 		d.Printf("Warnings:\t<error getting warnings: %v>\n\nErrors:\t<error getting errors: %v>\n", err, err)
@@ -181,15 +217,15 @@ func describeRestoreResults(ctx context.Context, kbClient kbclient.Client, d *De
 
 	if restore.Status.Warnings > 0 {
 		d.Println()
-		describeRestoreResult(d, "Warnings", resultMap["warnings"])
+		describeResult(d, "Warnings", resultMap["warnings"])
 	}
 	if restore.Status.Errors > 0 {
 		d.Println()
-		describeRestoreResult(d, "Errors", resultMap["errors"])
+		describeResult(d, "Errors", resultMap["errors"])
 	}
 }
 
-func describeRestoreResult(d *Describer, name string, result pkgrestore.Result) {
+func describeResult(d *Describer, name string, result results.Result) {
 	d.Printf("%s:\n", name)
 	d.DescribeSlice(1, "Velero", result.Velero)
 	d.DescribeSlice(1, "Cluster", result.Cluster)
@@ -200,6 +236,34 @@ func describeRestoreResult(d *Describer, name string, result pkgrestore.Result) 
 		for ns, warnings := range result.Namespaces {
 			d.DescribeSlice(2, ns, warnings)
 		}
+	}
+}
+
+func describeRestoreItemOperation(d *Describer, operation *itemoperation.RestoreOperation) {
+	d.Printf("\tOperation for %s %s/%s:\n", operation.Spec.ResourceIdentifier, operation.Spec.ResourceIdentifier.Namespace, operation.Spec.ResourceIdentifier.Name)
+	d.Printf("\t\tRestore Item Action Plugin:\t%s\n", operation.Spec.RestoreItemAction)
+	d.Printf("\t\tOperation ID:\t%s\n", operation.Spec.OperationID)
+	d.Printf("\t\tPhase:\t%s\n", operation.Status.Phase)
+	if operation.Status.Error != "" {
+		d.Printf("\t\tOperation Error:\t%s\n", operation.Status.Error)
+	}
+	if operation.Status.NTotal > 0 || operation.Status.NCompleted > 0 {
+		d.Printf("\t\tProgress:\t%v of %v complete (%s)\n",
+			operation.Status.NCompleted,
+			operation.Status.NTotal,
+			operation.Status.OperationUnits)
+	}
+	if operation.Status.Description != "" {
+		d.Printf("\t\tProgress description:\t%s\n", operation.Status.Description)
+	}
+	if operation.Status.Created != nil {
+		d.Printf("\t\tCreated:\t%s\n", operation.Status.Created.String())
+	}
+	if operation.Status.Started != nil {
+		d.Printf("\t\tStarted:\t%s\n", operation.Status.Started.String())
+	}
+	if operation.Status.Updated != nil {
+		d.Printf("\t\tUpdated:\t%s\n", operation.Status.Updated.String())
 	}
 }
 
@@ -274,4 +338,35 @@ func groupRestoresByPhase(restores []velerov1api.PodVolumeRestore) map[string][]
 	}
 
 	return restoresByPhase
+}
+
+func describeRestoreResourceList(ctx context.Context, kbClient kbclient.Client, d *Describer, restore *velerov1api.Restore, insecureSkipTLSVerify bool, caCertPath string) {
+	buf := new(bytes.Buffer)
+	if err := downloadrequest.Stream(ctx, kbClient, restore.Namespace, restore.Name, velerov1api.DownloadTargetKindRestoreResourceList, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath); err != nil {
+		if err == downloadrequest.ErrNotFound {
+			d.Println("Resource List:\t<restore resource list not found>")
+		} else {
+			d.Printf("Resource List:\t<error getting restore resource list: %v>\n", err)
+		}
+		return
+	}
+
+	var resourceList map[string][]string
+	if err := json.NewDecoder(buf).Decode(&resourceList); err != nil {
+		d.Printf("Resource List:\t<error reading restore resource list: %v>\n", err)
+		return
+	}
+
+	d.Println("Resource List:")
+
+	// Sort GVKs in output
+	gvks := make([]string, 0, len(resourceList))
+	for gvk := range resourceList {
+		gvks = append(gvks, gvk)
+	}
+	sort.Strings(gvks)
+
+	for _, gvk := range gvks {
+		d.Printf("\t%s:\n\t\t- %s\n", gvk, strings.Join(resourceList[gvk], "\n\t\t- "))
+	}
 }

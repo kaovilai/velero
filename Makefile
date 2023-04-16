@@ -82,7 +82,7 @@ see: https://velero.io/docs/main/build-from-source/#making-images-and-updating-v
 endef
 
 # The version of restic binary to be downloaded
-RESTIC_VERSION ?= 0.13.1
+RESTIC_VERSION ?= 0.15.0
 
 CLI_PLATFORMS ?= linux-amd64 linux-arm linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 linux-ppc64le
 BUILDX_PLATFORMS ?= $(subst -,/,$(ARCH))
@@ -95,9 +95,6 @@ ifneq ($(shell git status --porcelain 2> /dev/null),)
 else
 	GIT_TREE_STATE ?= clean
 endif
-
-# The default linters used by lint and local-lint
-LINTERS ?= "gosec,goconst,gofmt,goimports,unparam"
 
 ###
 ### These variables should not need tweaking.
@@ -120,7 +117,7 @@ build-%:
 
 all-build: $(addprefix build-, $(CLI_PLATFORMS))
 
-all-containers: container-builder-env
+all-containers:
 	@$(MAKE) --no-print-directory container
 	@$(MAKE) --no-print-directory container BIN=velero-restore-helper
 
@@ -178,20 +175,6 @@ shell: build-dirs build-env
 		$(BUILDER_IMAGE) \
 		/bin/sh $(CMD)
 
-container-builder-env:
-ifneq ($(BUILDX_ENABLED), true)
-	$(error $(BUILDX_ERROR))
-endif
-	@docker buildx build \
-	--target=builder-env \
-	--build-arg=GOPROXY=$(GOPROXY) \
-	--build-arg=PKG=$(PKG) \
-	--build-arg=VERSION=$(VERSION) \
-	--build-arg=GIT_SHA=$(GIT_SHA) \
-	--build-arg=GIT_TREE_STATE=$(GIT_TREE_STATE) \
-	--build-arg=REGISTRY=$(REGISTRY) \
-	-f $(VELERO_DOCKERFILE) .
-
 container:
 ifneq ($(BUILDX_ENABLED), true)
 	$(error $(BUILDX_ERROR))
@@ -200,6 +183,7 @@ endif
 	--output=type=$(BUILDX_OUTPUT_TYPE) \
 	--platform $(BUILDX_PLATFORMS) \
 	$(addprefix -t , $(IMAGE_TAGS)) \
+	--build-arg=GOPROXY=$(GOPROXY) \
 	--build-arg=PKG=$(PKG) \
 	--build-arg=BIN=$(BIN) \
 	--build-arg=VERSION=$(VERSION) \
@@ -209,6 +193,12 @@ endif
 	--build-arg=RESTIC_VERSION=$(RESTIC_VERSION) \
 	-f $(VELERO_DOCKERFILE) .
 	@echo "container: $(IMAGE):$(VERSION)"
+ifeq ($(BUILDX_OUTPUT_TYPE)_$(REGISTRY), registry_velero)
+	docker pull $(IMAGE):$(VERSION)
+	rm -f $(BIN)-$(VERSION).tar
+	docker save $(IMAGE):$(VERSION) -o $(BIN)-$(VERSION).tar
+	gzip -f $(BIN)-$(VERSION).tar
+endif
 
 SKIP_TESTS ?=
 test: build-dirs
@@ -228,22 +218,12 @@ endif
 
 lint:
 ifneq ($(SKIP_TESTS), 1)
-	@$(MAKE) shell CMD="-c 'hack/lint.sh $(LINTERS)'"
+	@$(MAKE) shell CMD="-c 'hack/lint.sh'"
 endif
 
 local-lint:
 ifneq ($(SKIP_TESTS), 1)
-	@hack/lint.sh $(LINTERS)
-endif
-
-lint-all:
-ifneq ($(SKIP_TESTS), 1)
-	@$(MAKE) shell CMD="-c 'hack/lint.sh $(LINTERS) true'"
-endif
-
-local-lint-all:
-ifneq ($(SKIP_TESTS), 1)
-	@hack/lint.sh $(LINTERS) true
+	@hack/lint.sh
 endif
 
 update:

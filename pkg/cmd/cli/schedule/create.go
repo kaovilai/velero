@@ -23,8 +23,10 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/cmd"
@@ -83,8 +85,6 @@ type CreateOptions struct {
 	Schedule                   string
 	UseOwnerReferencesInBackup bool
 	Paused                     bool
-
-	labelSelector *metav1.LabelSelector
 }
 
 func NewCreateOptions() *CreateOptions {
@@ -135,24 +135,33 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		},
 		Spec: api.ScheduleSpec{
 			Template: api.BackupSpec{
-				IncludedNamespaces:       o.BackupOptions.IncludeNamespaces,
-				ExcludedNamespaces:       o.BackupOptions.ExcludeNamespaces,
-				IncludedResources:        o.BackupOptions.IncludeResources,
-				ExcludedResources:        o.BackupOptions.ExcludeResources,
-				IncludeClusterResources:  o.BackupOptions.IncludeClusterResources.Value,
-				LabelSelector:            o.BackupOptions.Selector.LabelSelector,
-				SnapshotVolumes:          o.BackupOptions.SnapshotVolumes.Value,
-				TTL:                      metav1.Duration{Duration: o.BackupOptions.TTL},
-				StorageLocation:          o.BackupOptions.StorageLocation,
-				VolumeSnapshotLocations:  o.BackupOptions.SnapshotLocations,
-				DefaultVolumesToFsBackup: o.BackupOptions.DefaultVolumesToFsBackup.Value,
-				OrderedResources:         orders,
-				CSISnapshotTimeout:       metav1.Duration{Duration: o.BackupOptions.CSISnapshotTimeout},
+				IncludedNamespaces:               o.BackupOptions.IncludeNamespaces,
+				ExcludedNamespaces:               o.BackupOptions.ExcludeNamespaces,
+				IncludedResources:                o.BackupOptions.IncludeResources,
+				ExcludedResources:                o.BackupOptions.ExcludeResources,
+				IncludedClusterScopedResources:   o.BackupOptions.IncludeClusterScopedResources,
+				ExcludedClusterScopedResources:   o.BackupOptions.ExcludeClusterScopedResources,
+				IncludedNamespaceScopedResources: o.BackupOptions.IncludeNamespaceScopedResources,
+				ExcludedNamespaceScopedResources: o.BackupOptions.ExcludeNamespaceScopedResources,
+				IncludeClusterResources:          o.BackupOptions.IncludeClusterResources.Value,
+				LabelSelector:                    o.BackupOptions.Selector.LabelSelector,
+				SnapshotVolumes:                  o.BackupOptions.SnapshotVolumes.Value,
+				TTL:                              metav1.Duration{Duration: o.BackupOptions.TTL},
+				StorageLocation:                  o.BackupOptions.StorageLocation,
+				VolumeSnapshotLocations:          o.BackupOptions.SnapshotLocations,
+				DefaultVolumesToFsBackup:         o.BackupOptions.DefaultVolumesToFsBackup.Value,
+				OrderedResources:                 orders,
+				CSISnapshotTimeout:               metav1.Duration{Duration: o.BackupOptions.CSISnapshotTimeout},
+				ItemOperationTimeout:             metav1.Duration{Duration: o.BackupOptions.ItemOperationTimeout},
 			},
 			Schedule:                   o.Schedule,
 			UseOwnerReferencesInBackup: &o.UseOwnerReferencesInBackup,
 			Paused:                     o.Paused,
 		},
+	}
+
+	if o.BackupOptions.ResPoliciesConfigmap != "" {
+		schedule.Spec.Template.ResourcePolicy = &v1.TypedLocalObjectReference{Kind: resourcepolicies.ConfigmapRefType, Name: o.BackupOptions.ResPoliciesConfigmap}
 	}
 
 	if printed, err := output.PrintWithFormat(c, schedule); printed || err != nil {

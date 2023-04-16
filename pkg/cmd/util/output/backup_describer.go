@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
@@ -35,6 +36,10 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 	"github.com/vmware-tanzu/velero/pkg/features"
 	clientset "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
+
+	"github.com/vmware-tanzu/velero/pkg/util/collections"
+	"github.com/vmware-tanzu/velero/pkg/util/results"
 	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
@@ -66,6 +71,8 @@ func DescribeBackup(
 		case velerov1api.BackupPhaseCompleted:
 			phaseString = color.GreenString(phaseString)
 		case velerov1api.BackupPhaseDeleting:
+		case velerov1api.BackupPhaseWaitingForPluginOperations, velerov1api.BackupPhaseWaitingForPluginOperationsPartiallyFailed:
+		case velerov1api.BackupPhaseFinalizing, velerov1api.BackupPhaseFinalizingPartiallyFailed:
 		case velerov1api.BackupPhaseInProgress:
 		case velerov1api.BackupPhaseNew:
 		}
@@ -77,6 +84,11 @@ func DescribeBackup(
 
 		d.Printf("Phase:\t%s%s\n", phaseString, logsNote)
 
+		if backup.Spec.ResourcePolicy != nil {
+			d.Println()
+			DescribeResourcePolicies(d, backup.Spec.ResourcePolicy)
+		}
+
 		status := backup.Status
 		if len(status.ValidationErrors) > 0 {
 			d.Println()
@@ -87,8 +99,7 @@ func DescribeBackup(
 		}
 
 		d.Println()
-		d.Printf("Errors:\t%d\n", status.Errors)
-		d.Printf("Warnings:\t%d\n", status.Warnings)
+		DescribeBackupResults(ctx, kbClient, d, backup, insecureSkipTLSVerify, caCertFile)
 
 		d.Println()
 		DescribeBackupSpec(d, backup.Spec)
@@ -113,6 +124,13 @@ func DescribeBackup(
 	})
 }
 
+// DescribeResourcePolicies describes resource policiesin human-readable format
+func DescribeResourcePolicies(d *Describer, resPolicies *v1.TypedLocalObjectReference) {
+	d.Printf("Resource policies:\n")
+	d.Printf("\tType:\t%s\n", resPolicies.Kind)
+	d.Printf("\tName:\t%s\n", resPolicies.Name)
+}
+
 // DescribeBackupSpec describes a backup spec in human-readable format.
 func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	// TODO make a helper for this and use it in all the describers.
@@ -133,20 +151,47 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 
 	d.Println()
 	d.Printf("Resources:\n")
-	if len(spec.IncludedResources) == 0 {
-		s = "*"
+	if collections.UseOldResourceFilters(spec) {
+		if len(spec.IncludedResources) == 0 {
+			s = "*"
+		} else {
+			s = strings.Join(spec.IncludedResources, ", ")
+		}
+		d.Printf("\tIncluded:\t%s\n", s)
+		if len(spec.ExcludedResources) == 0 {
+			s = emptyDisplay
+		} else {
+			s = strings.Join(spec.ExcludedResources, ", ")
+		}
+		d.Printf("\tExcluded:\t%s\n", s)
+		d.Printf("\tCluster-scoped:\t%s\n", BoolPointerString(spec.IncludeClusterResources, "excluded", "included", "auto"))
 	} else {
-		s = strings.Join(spec.IncludedResources, ", ")
-	}
-	d.Printf("\tIncluded:\t%s\n", s)
-	if len(spec.ExcludedResources) == 0 {
-		s = emptyDisplay
-	} else {
-		s = strings.Join(spec.ExcludedResources, ", ")
-	}
-	d.Printf("\tExcluded:\t%s\n", s)
+		if len(spec.IncludedClusterScopedResources) == 0 {
+			s = emptyDisplay
+		} else {
+			s = strings.Join(spec.IncludedClusterScopedResources, ", ")
+		}
+		d.Printf("\tIncluded cluster-scoped:\t%s\n", s)
+		if len(spec.ExcludedClusterScopedResources) == 0 {
+			s = emptyDisplay
+		} else {
+			s = strings.Join(spec.ExcludedClusterScopedResources, ", ")
+		}
+		d.Printf("\tExcluded cluster-scoped:\t%s\n", s)
 
-	d.Printf("\tCluster-scoped:\t%s\n", BoolPointerString(spec.IncludeClusterResources, "excluded", "included", "auto"))
+		if len(spec.IncludedNamespaceScopedResources) == 0 {
+			s = "*"
+		} else {
+			s = strings.Join(spec.IncludedNamespaceScopedResources, ", ")
+		}
+		d.Printf("\tIncluded namespace-scoped:\t%s\n", s)
+		if len(spec.ExcludedNamespaceScopedResources) == 0 {
+			s = emptyDisplay
+		} else {
+			s = strings.Join(spec.ExcludedNamespaceScopedResources, ", ")
+		}
+		d.Printf("\tExcluded namespace-scoped:\t%s\n", s)
+	}
 
 	d.Println()
 	s = emptyDisplay
@@ -166,6 +211,7 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 
 	d.Println()
 	d.Printf("CSISnapshotTimeout:\t%s\n", spec.CSISnapshotTimeout.Duration)
+	d.Printf("ItemOperationTimeout:\t%s\n", spec.ItemOperationTimeout.Duration)
 
 	d.Println()
 	if len(spec.Hooks.Resources) == 0 {
@@ -284,6 +330,8 @@ func DescribeBackupStatus(ctx context.Context, kbClient kbclient.Client, d *Desc
 		d.Println()
 	}
 
+	describeBackupItemOperations(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertPath)
+
 	if details {
 		describeBackupResourceList(ctx, kbClient, d, backup, insecureSkipTLSVerify, caCertPath)
 		d.Println()
@@ -315,6 +363,33 @@ func DescribeBackupStatus(ctx context.Context, kbClient kbclient.Client, d *Desc
 	}
 
 	d.Printf("Velero-Native Snapshots: <none included>\n")
+}
+
+func describeBackupItemOperations(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, details bool, insecureSkipTLSVerify bool, caCertPath string) {
+	status := backup.Status
+	if status.BackupItemOperationsAttempted > 0 {
+		if !details {
+			d.Printf("Backup Item Operations:\t%d of %d completed successfully, %d failed (specify --details for more information)\n", status.BackupItemOperationsCompleted, status.BackupItemOperationsAttempted, status.BackupItemOperationsFailed)
+			return
+		}
+
+		buf := new(bytes.Buffer)
+		if err := downloadrequest.Stream(ctx, kbClient, backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupItemOperations, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath); err != nil {
+			d.Printf("Backup Item Operations:\t<error getting operation info: %v>\n", err)
+			return
+		}
+
+		var operations []*itemoperation.BackupOperation
+		if err := json.NewDecoder(buf).Decode(&operations); err != nil {
+			d.Printf("Backup Item Operations:\t<error reading operation info: %v>\n", err)
+			return
+		}
+
+		d.Printf("Backup Item Operations:\n")
+		for _, operation := range operations {
+			describeBackupItemOperation(d, operation)
+		}
+	}
 }
 
 func describeBackupResourceList(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string) {
@@ -363,6 +438,40 @@ func describeSnapshot(d *Describer, pvName, snapshotID, volumeType, volumeAZ str
 		iopsString = fmt.Sprintf("%d", *iops)
 	}
 	d.Printf("\t\tIOPS:\t%s\n", iopsString)
+}
+
+func describeBackupItemOperation(d *Describer, operation *itemoperation.BackupOperation) {
+	d.Printf("\tOperation for %s %s/%s:\n", operation.Spec.ResourceIdentifier, operation.Spec.ResourceIdentifier.Namespace, operation.Spec.ResourceIdentifier.Name)
+	d.Printf("\t\tBackup Item Action Plugin:\t%s\n", operation.Spec.BackupItemAction)
+	d.Printf("\t\tOperation ID:\t%s\n", operation.Spec.OperationID)
+	if len(operation.Spec.PostOperationItems) > 0 {
+		d.Printf("\t\tItems to Update:\n")
+	}
+	for _, item := range operation.Spec.PostOperationItems {
+		d.Printf("\t\t\t%s %s/%s\n", item, item.Namespace, item.Name)
+	}
+	d.Printf("\t\tPhase:\t%s\n", operation.Status.Phase)
+	if operation.Status.Error != "" {
+		d.Printf("\t\tOperation Error:\t%s\n", operation.Status.Error)
+	}
+	if operation.Status.NTotal > 0 || operation.Status.NCompleted > 0 {
+		d.Printf("\t\tProgress:\t%v of %v complete (%s)\n",
+			operation.Status.NCompleted,
+			operation.Status.NTotal,
+			operation.Status.OperationUnits)
+	}
+	if operation.Status.Description != "" {
+		d.Printf("\t\tProgress description:\t%s\n", operation.Status.Description)
+	}
+	if operation.Status.Created != nil {
+		d.Printf("\t\tCreated:\t%s\n", operation.Status.Created.String())
+	}
+	if operation.Status.Started != nil {
+		d.Printf("\t\tStarted:\t%s\n", operation.Status.Started.String())
+	}
+	if operation.Status.Updated != nil {
+		d.Printf("\t\tUpdated:\t%s\n", operation.Status.Updated.String())
+	}
 }
 
 // DescribeDeleteBackupRequests describes delete backup requests in human-readable format.
@@ -563,5 +672,41 @@ func DescribeVSC(d *Describer, details bool, vsc snapshotv1api.VolumeSnapshotCon
 
 	if vsc.Status.ReadyToUse != nil {
 		d.Printf("\tReady to use: %t\n", *vsc.Status.ReadyToUse)
+	}
+}
+
+// DescribeBackupResults describes errors and warnings in human-readable format.
+func DescribeBackupResults(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string) {
+	if backup.Status.Warnings == 0 && backup.Status.Errors == 0 {
+		return
+	}
+
+	var buf bytes.Buffer
+	var resultMap map[string]results.Result
+
+	// If err 'ErrNotFound' occurs, it means the backup bundle in the bucket has already been there before the backup-result file is introduced.
+	// We only display the count of errors and warnings in this case.
+	err := downloadrequest.Stream(ctx, kbClient, backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupResults, &buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath)
+	if err == downloadrequest.ErrNotFound {
+		d.Printf("Errors:\t%d\n", backup.Status.Errors)
+		d.Printf("Warnings:\t%d\n", backup.Status.Warnings)
+		return
+	} else if err != nil {
+		d.Printf("Warnings:\t<error getting warnings: %v>\n\nErrors:\t<error getting errors: %v>\n", err, err)
+		return
+	}
+
+	if err := json.NewDecoder(&buf).Decode(&resultMap); err != nil {
+		d.Printf("Warnings:\t<error decoding warnings: %v>\n\nErrors:\t<error decoding errors: %v>\n", err, err)
+		return
+	}
+
+	if backup.Status.Warnings > 0 {
+		d.Println()
+		describeResult(d, "Warnings", resultMap["warnings"])
+	}
+	if backup.Status.Errors > 0 {
+		d.Println()
+		describeResult(d, "Errors", resultMap["errors"])
 	}
 }

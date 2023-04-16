@@ -19,9 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -30,7 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
+	clocks "k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -56,7 +56,7 @@ func NewPodVolumeRestoreReconciler(logger logrus.FieldLogger, client client.Clie
 		logger:           logger.WithField("controller", "PodVolumeRestore"),
 		credentialGetter: credentialGetter,
 		fileSystem:       filesystem.NewFileSystem(),
-		clock:            &clock.RealClock{},
+		clock:            &clocks.RealClock{},
 	}
 }
 
@@ -65,7 +65,7 @@ type PodVolumeRestoreReconciler struct {
 	logger           logrus.FieldLogger
 	credentialGetter *credentials.CredentialGetter
 	fileSystem       filesystem.Interface
-	clock            clock.Clock
+	clock            clocks.WithTickerAndDelayedExecution
 }
 
 type RestoreProgressUpdater struct {
@@ -122,11 +122,7 @@ func (c *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if err = c.processRestore(ctx, pvr, pod, log); err != nil {
-		original = pvr.DeepCopy()
-		pvr.Status.Phase = velerov1api.PodVolumeRestorePhaseFailed
-		pvr.Status.Message = err.Error()
-		pvr.Status.CompletionTimestamp = &metav1.Time{Time: c.clock.Now()}
-		if e := c.Patch(ctx, pvr, client.MergeFrom(original)); e != nil {
+		if e := UpdatePVRStatusToFailed(c, ctx, pvr, err.Error(), c.clock.Now()); e != nil {
 			log.WithError(err).Error("Unable to update status to failed")
 		}
 
@@ -143,6 +139,15 @@ func (c *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 	log.Info("Restore completed")
 	return ctrl.Result{}, nil
+}
+
+func UpdatePVRStatusToFailed(c client.Client, ctx context.Context, pvr *velerov1api.PodVolumeRestore, errString string, time time.Time) error {
+	original := pvr.DeepCopy()
+	pvr.Status.Phase = velerov1api.PodVolumeRestorePhaseFailed
+	pvr.Status.Message = errString
+	pvr.Status.CompletionTimestamp = &metav1.Time{Time: time}
+
+	return c.Patch(ctx, pvr, client.MergeFrom(original))
 }
 
 func (c *PodVolumeRestoreReconciler) shouldProcess(ctx context.Context, log logrus.FieldLogger, pvr *velerov1api.PodVolumeRestore) (bool, *corev1api.Pod, error) {
@@ -302,7 +307,7 @@ func (c *PodVolumeRestoreReconciler) processRestore(ctx context.Context, req *ve
 	// Write a done file with name=<restore-uid> into the just-created .velero dir
 	// within the volume. The velero init container on the pod is waiting
 	// for this file to exist in each restored volume before completing.
-	if err := ioutil.WriteFile(filepath.Join(volumePath, ".velero", string(restoreUID)), nil, 0644); err != nil { //nolint:gosec
+	if err := os.WriteFile(filepath.Join(volumePath, ".velero", string(restoreUID)), nil, 0644); err != nil { //nolint:gosec
 		return errors.Wrap(err, "error writing done file")
 	}
 
@@ -313,7 +318,7 @@ func (r *PodVolumeRestoreReconciler) NewRestoreProgressUpdater(pvr *velerov1api.
 	return &RestoreProgressUpdater{pvr, log, ctx, r.Client}
 }
 
-//UpdateProgress which implement ProgressUpdater interface to update pvr progress status
+// UpdateProgress which implement ProgressUpdater interface to update pvr progress status
 func (r *RestoreProgressUpdater) UpdateProgress(p *uploader.UploaderProgress) {
 	original := r.PodVolumeRestore.DeepCopy()
 	r.PodVolumeRestore.Status.Progress = velerov1api.PodVolumeOperationProgress{TotalBytes: p.TotalBytes, BytesDone: p.BytesDone}
