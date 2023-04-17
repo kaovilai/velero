@@ -1,0 +1,6 @@
+[allowlist]
+description = "global allow lists"
+paths = [
+    '''gitleaks.toml''',
+    '''site/content/docs/v.\.../contributions/oracle-config.md'''
+]
