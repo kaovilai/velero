@@ -51,8 +51,16 @@ else
 	BUILDER_IMAGE_TAG := $(shell git log -1 --pretty=%h $(BUILDER_IMAGE_DOCKERFILE))
 endif
 
+ifeq ($(shell command -v docker 2> /dev/null),)
+    BUILDER=podman
+    IMAGE_TOOL=podamn
+else
+    BUILDER=docker buildx
+    IMAGE_TOOL=docker
+endif
+
 BUILDER_IMAGE := $(REGISTRY)/build-image:$(BUILDER_IMAGE_TAG)
-BUILDER_IMAGE_CACHED := $(shell docker images -q ${BUILDER_IMAGE} 2>/dev/null )
+BUILDER_IMAGE_CACHED := $(shell ${IMAGE_TOOL} images -q ${BUILDER_IMAGE} 2>/dev/null )
 
 HUGO_IMAGE := hugo-builder
 
@@ -79,6 +87,7 @@ ifeq ($(shell docker buildx inspect 2>/dev/null | awk '/Status/ { print $$2 }'),
 else
 	BUILDX_ENABLED ?= false
 endif
+
 
 define BUILDX_ERROR
 buildx not enabled, refusing to run this recipe
@@ -162,7 +171,7 @@ shell: build-dirs build-env
 	@# because the Kubernetes code-generator tools require the project to
 	@# exist in a directory hierarchy ending like this (but *NOT* necessarily
 	@# under $GOPATH).
-	@docker run \
+	${IMAGE_TOOL} run \
 		-e GOFLAGS \
 		-e GOPROXY \
 		-i $(TTY) \
@@ -180,10 +189,7 @@ shell: build-dirs build-env
 		/bin/sh $(CMD)
 
 container:
-ifneq ($(BUILDX_ENABLED), true)
-	$(error $(BUILDX_ERROR))
-endif
-	@docker buildx build --pull \
+	${BUILDER} build --pull \
 	--output=type=$(BUILDX_OUTPUT_TYPE) \
 	--platform $(BUILDX_PLATFORMS) \
 	$(addprefix -t , $(IMAGE_TAGS)) \
@@ -199,9 +205,9 @@ endif
 	-f $(VELERO_DOCKERFILE) .
 	@echo "container: $(IMAGE):$(VERSION)"
 ifeq ($(BUILDX_OUTPUT_TYPE)_$(REGISTRY), registry_velero)
-	docker pull $(IMAGE):$(VERSION)
+	${IMAGE_TOOL} pull $(IMAGE):$(VERSION)
 	rm -f $(BIN)-$(VERSION).tar
-	docker save $(IMAGE):$(VERSION) -o $(BIN)-$(VERSION).tar
+	${BUILDER} save $(IMAGE):$(VERSION) -o $(BIN)-$(VERSION).tar
 	gzip -f $(BIN)-$(VERSION).tar
 endif
 
@@ -260,7 +266,7 @@ else ifneq ($(BUILDER_IMAGE_CACHED),)
 	@echo "Using Cached Image: $(BUILDER_IMAGE)"
 else
 	@echo "Trying to pull build-image: $(BUILDER_IMAGE)"
-	docker pull -q $(BUILDER_IMAGE) || $(MAKE) build-image
+	${IMAGE_TOOL} pull -q $(BUILDER_IMAGE) || $(MAKE) build-image
 endif
 
 build-image:
@@ -268,13 +274,13 @@ build-image:
 	@# This makes sure we don't leave the orphaned image behind.
 	$(eval old_id=$(shell docker image inspect  --format '{{ .ID }}' ${BUILDER_IMAGE} 2>/dev/null))
 ifeq ($(BUILDX_ENABLED), true)
-	@cd hack/build-image && docker buildx build --build-arg=GOPROXY=$(GOPROXY) --output=type=docker --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
+	@cd hack/build-image && ${BUILDER} build --build-arg=GOPROXY=$(GOPROXY) --output=type=docker --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
 else
-	@cd hack/build-image && docker build --build-arg=GOPROXY=$(GOPROXY) --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
+	@cd hack/build-image && ${BUILDER} build --build-arg=GOPROXY=$(GOPROXY) --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
 endif
-	$(eval new_id=$(shell docker image inspect  --format '{{ .ID }}' ${BUILDER_IMAGE} 2>/dev/null))
+	$(eval new_id=$(shell ${IMAGE_TOOL} image inspect  --format '{{ .ID }}' ${BUILDER_IMAGE} 2>/dev/null))
 	@if [ "$(old_id)" != "" ] && [ "$(old_id)" != "$(new_id)" ]; then \
-		docker rmi -f $$id || true; \
+		${IMAGE_TOOL} rmi -f $$id || true; \
 	fi
 
 push-build-image:
@@ -285,21 +291,21 @@ ifneq "$(origin BUILDER_IMAGE_DOCKERFILE)" "file"
 	@echo "Dockerfile for builder image has been overridden"
 	@echo "Skipping push of custom image"
 else
-	docker push $(BUILDER_IMAGE)
+	${BUILDER} push $(BUILDER_IMAGE)
 endif
 
 build-image-hugo:
-	cd site && docker build --pull -t $(HUGO_IMAGE) .
+	cd site && ${BUILDER} build --pull -t $(HUGO_IMAGE) .
 
 clean:
 # if we have a cached image then use it to run go clean --modcache
 # this test checks if we there is an image id in the BUILDER_IMAGE_CACHED variable.
 ifneq ($(strip $(BUILDER_IMAGE_CACHED)),)
 	$(MAKE) shell CMD="-c 'go clean --modcache'"
-	docker rmi -f $(BUILDER_IMAGE) || true
+	${IMAGE_TOOL} rmi -f $(BUILDER_IMAGE) || true
 endif
 	rm -rf .go _output
-	docker rmi $(HUGO_IMAGE)
+	${IMAGE_TOOL} rmi $(HUGO_IMAGE)
 
 
 .PHONY: modules
@@ -344,7 +350,7 @@ release:
 		./hack/release-tools/goreleaser.sh'"
 
 serve-docs: build-image-hugo
-	docker run \
+	${IMAGE_TOOL} run \
 	--rm \
 	-v "$$(pwd)/site:/srv/hugo" \
 	-it -p 1313:1313 \

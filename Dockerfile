@@ -31,7 +31,7 @@ ENV CGO_ENABLED=0 \
     GOPROXY=${GOPROXY} \
     GOOS=${TARGETOS} \
     GOARCH=${TARGETARCH} \
-    GOARM=${TARGETVARIANT} \
+    GOARM=7 \
     LDFLAGS="-X ${PKG}/pkg/buildinfo.Version=${VERSION} -X ${PKG}/pkg/buildinfo.GitSHA=${GIT_SHA} -X ${PKG}/pkg/buildinfo.GitTreeState=${GIT_TREE_STATE} -X ${PKG}/pkg/buildinfo.ImageRegistry=${REGISTRY}"
 
 WORKDIR /go/src/github.com/vmware-tanzu/velero
@@ -39,7 +39,6 @@ WORKDIR /go/src/github.com/vmware-tanzu/velero
 COPY . /go/src/github.com/vmware-tanzu/velero
 
 RUN mkdir -p /output/usr/bin && \
-    export GOARM=$( echo "${GOARM}" | cut -c2-) && \
     go build -o /output/${BIN} \
     -ldflags "${LDFLAGS}" ${PKG}/cmd/${BIN}
 
@@ -57,12 +56,11 @@ env CGO_ENABLED=0 \
     GOPROXY=${GOPROXY} \
     GOOS=${TARGETOS} \
     GOARCH=${TARGETARCH} \
-    GOARM=${TARGETVARIANT}
+    GOARM=7
 
 COPY . /go/src/github.com/vmware-tanzu/velero
 
 RUN mkdir -p /output/usr/bin && \
-    export GOARM=$(echo "${GOARM}" | cut -c2-) && \
     /go/src/github.com/vmware-tanzu/velero/hack/build-restic.sh
 
 # Velero image packing section
