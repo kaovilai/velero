@@ -53,7 +53,7 @@ endif
 
 ifeq ($(shell command -v docker 2> /dev/null),)
     BUILDER=podman
-    IMAGE_TOOL=podamn
+    IMAGE_TOOL=podman
 else
     BUILDER=docker buildx
     IMAGE_TOOL=docker
@@ -86,6 +86,13 @@ ifeq ($(shell docker buildx inspect 2>/dev/null | awk '/Status/ { print $$2 }'),
 	BUILDX_ENABLED ?= true
 else
 	BUILDX_ENABLED ?= false
+endif
+
+# if BUILDX_ENABLED is true, check if the builder is docker buildx, if overriden to podman, disable buildx usage.
+ifeq ($(BUILDX_ENABLED), true)
+ifneq ($(BUILDER), docker buildx)
+	BUILDX_ENABLED := false
+endif
 endif
 
 
@@ -188,10 +195,10 @@ shell: build-dirs build-env
 		$(BUILDER_IMAGE) \
 		/bin/sh $(CMD)
 
-container:
-	${BUILDER} build --pull \
-	--output=type=$(BUILDX_OUTPUT_TYPE) \
-	--platform $(BUILDX_PLATFORMS) \
+# --output=type=$(BUILDX_OUTPUT_TYPE) \ this line is used to do --output=type=docker
+# it loads the images built to docker images
+# for compatiblity with podman, we remove this line, as podman build already loads the images to local
+container: BUILDARGS=--platform $(BUILDX_PLATFORMS) \
 	$(addprefix -t , $(IMAGE_TAGS)) \
 	$(addprefix -t , $(GCR_IMAGE_TAGS)) \
 	--build-arg=GOPROXY=$(GOPROXY) \
@@ -203,6 +210,16 @@ container:
 	--build-arg=REGISTRY=$(REGISTRY) \
 	--build-arg=RESTIC_VERSION=$(RESTIC_VERSION) \
 	-f $(VELERO_DOCKERFILE) .
+container:
+	echo $(BUILDARGS)
+ifeq ($(BUILDX_ENABLED), true)
+	${BUILDER} build --pull \
+	--output=type=$(BUILDX_OUTPUT_TYPE) \
+	$(BUILDARGS)
+else
+	${BUILDER} build --pull \
+	$(BUILDARGS)
+endif
 	@echo "container: $(IMAGE):$(VERSION)"
 ifeq ($(BUILDX_OUTPUT_TYPE)_$(REGISTRY), registry_velero)
 	${IMAGE_TOOL} pull $(IMAGE):$(VERSION)
@@ -274,7 +291,7 @@ build-image:
 	@# This makes sure we don't leave the orphaned image behind.
 	$(eval old_id=$(shell docker image inspect  --format '{{ .ID }}' ${BUILDER_IMAGE} 2>/dev/null))
 ifeq ($(BUILDX_ENABLED), true)
-	@cd hack/build-image && ${BUILDER} build --build-arg=GOPROXY=$(GOPROXY) --output=type=docker --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
+	@cd hack/build-image && ${BUILDER} buildx build --build-arg=GOPROXY=$(GOPROXY) --output=type=docker --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
 else
 	@cd hack/build-image && ${BUILDER} build --build-arg=GOPROXY=$(GOPROXY) --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
 endif
