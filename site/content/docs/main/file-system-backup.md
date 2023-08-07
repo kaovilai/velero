@@ -64,6 +64,12 @@ for namespace2 would be `https://s3-us-west-2.amazonaws.com/bucket/kopia/ns2`.
 There may be additional installation steps depending on the cloud provider plugin you are using. You should refer to the 
 [plugin specific documentation](supported-providers.md) for the must up to date information.  
 
+**Note:** Currently, Velero creates a secret named `velero-repo-credentials` in the velero install namespace, this secret consists of a default backup
+repository password, the backup repository is created during the first execution of FS Backup after installing Velero with node agent. If you do not
+want to use the default password set by Velero, please make sure you update the secret to use your own password of choice, the value of the key to update is `Data[repository-password]`. Please ensure
+that the password is base64 encoded in the secret. Also, please make sure that you update this secret prior to the first FS Backup/creation of backup repository. If you update the secret with a new password after a few FS Backups/backup repository creation,
+then in such a scenario as a side effect, Velero will not be able to connect with the older FS Backups.
+
 ### Configure Node Agent DaemonSet spec
 
 After installation, some PaaS/CaaS platforms based on Kubernetes also require modifications the node-agent DaemonSet spec. 
