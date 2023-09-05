@@ -293,6 +293,9 @@ func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.Group
 	clusterScoped := !resource.Namespaced
 	namespacesToList := getNamespacesToList(r.backupRequest.NamespaceIncludesExcludes)
 
+	clusterScoped := !resource.Namespaced
+	namespacesToList := getNamespacesToList(r.backupRequest.NamespaceIncludesExcludes)
+
 	// If we get here, we're backing up something other than namespaces
 	if clusterScoped {
 		namespacesToList = []string{""}
