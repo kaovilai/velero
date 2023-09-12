@@ -175,7 +175,7 @@ func (s *resticServer) run() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.Handler())
 		s.logger.Infof("Starting metric server for restic at address [%s]", s.metricsAddress)
-		if err := http.ListenAndServe(s.metricsAddress, metricsMux); err != nil {
+		if err := http.ListenAndServe(s.metricsAddress, metricsMux); err != nil { //nolint:gosec
 			s.logger.Fatalf("Failed to start metric server for restic at [%s]: %v", s.metricsAddress, err)
 		}
 	}()
@@ -291,7 +291,7 @@ func (s *resticServer) markInProgressPVBsFailed(client ctrlclient.Client) {
 		log.WithError(errors.WithStack(err)).Error("failed to list podvolumebackups")
 		return
 	}
-	for _, pvb := range pvbs.Items {
+	for i, pvb := range pvbs.Items {
 		if pvb.Status.Phase != velerov1api.PodVolumeBackupPhaseInProgress {
 			log.Debugf("the status of podvolumebackup %q is %q, skip", pvb.GetName(), pvb.Status.Phase)
 			continue
@@ -300,12 +300,11 @@ func (s *resticServer) markInProgressPVBsFailed(client ctrlclient.Client) {
 			log.Debugf("the node of podvolumebackup %q is %q, not %q, skip", pvb.GetName(), pvb.Spec.Node, s.nodeName)
 			continue
 		}
-		original := pvb.DeepCopy()
-		pvb.Status.Phase = velerov1api.PodVolumeBackupPhaseFailed
-		pvb.Status.Message = fmt.Sprintf("get a podvolumebackup with status %q during the server starting, mark it as %q", velerov1api.PodVolumeBackupPhaseInProgress, pvb.Status.Phase)
-		pvb.Status.CompletionTimestamp = &metav1.Time{Time: time.Now()}
-		if err := client.Patch(s.ctx, &pvb, ctrlclient.MergeFrom(original)); err != nil {
-			log.WithError(errors.WithStack(err)).Errorf("failed to patch podvolumebackup %q", pvb.GetName())
+
+		if err := controller.UpdatePVBStatusToFailed(client, s.ctx, &pvbs.Items[i],
+			fmt.Sprintf("get a podvolumebackup with status %q during the server starting, mark it as %q", velerov1api.PodVolumeBackupPhaseInProgress, velerov1api.PodVolumeBackupPhaseFailed),
+			time.Now()); err != nil {
+			s.logger.WithError(errors.WithStack(err)).Errorf("failed to patch podvolumebackup %q", pvb.GetName())
 			continue
 		}
 		log.WithField("podvolumebackup", pvb.GetName()).Warn(pvb.Status.Message)
@@ -318,7 +317,7 @@ func (s *resticServer) markInProgressPVRsFailed(client ctrlclient.Client) {
 		log.WithError(errors.WithStack(err)).Error("failed to list podvolumerestores")
 		return
 	}
-	for _, pvr := range pvrs.Items {
+	for i, pvr := range pvrs.Items {
 		if pvr.Status.Phase != velerov1api.PodVolumeRestorePhaseInProgress {
 			log.Debugf("the status of podvolumerestore %q is %q, skip", pvr.GetName(), pvr.Status.Phase)
 			continue
@@ -338,12 +337,10 @@ func (s *resticServer) markInProgressPVRsFailed(client ctrlclient.Client) {
 			continue
 		}
 
-		original := pvr.DeepCopy()
-		pvr.Status.Phase = velerov1api.PodVolumeRestorePhaseFailed
-		pvr.Status.Message = fmt.Sprintf("get a podvolumerestore with status %q during the server starting, mark it as %q", velerov1api.PodVolumeRestorePhaseInProgress, pvr.Status.Phase)
-		pvr.Status.CompletionTimestamp = &metav1.Time{Time: time.Now()}
-		if err := client.Patch(s.ctx, &pvr, ctrlclient.MergeFrom(original)); err != nil {
-			log.WithError(errors.WithStack(err)).Errorf("failed to patch podvolumerestore %q", pvr.GetName())
+		if err := controller.UpdatePVRStatusToFailed(client, s.ctx, &pvrs.Items[i],
+			fmt.Sprintf("get a podvolumerestore with status %q during the server starting, mark it as %q", velerov1api.PodVolumeRestorePhaseInProgress, velerov1api.PodVolumeRestorePhaseFailed),
+			time.Now()); err != nil {
+			s.logger.WithError(errors.WithStack(err)).Errorf("failed to patch podvolumerestore %q", pvr.GetName())
 			continue
 		}
 		log.WithField("podvolumerestore", pvr.GetName()).Warn(pvr.Status.Message)

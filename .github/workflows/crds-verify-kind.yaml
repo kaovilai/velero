@@ -14,7 +14,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.17
+          go-version: 1.19.8
         id: go
       # Look for a CLI that's made for this PR
       - name: Fetch built CLI
@@ -57,9 +57,6 @@ jobs:
       matrix:
         # Latest k8s versions. There's no series-based tag, nor is there a latest tag.
         k8s:
-          - 1.16.15
-          - 1.17.17
-          - 1.18.15
           - 1.19.7
           - 1.20.2
           - 1.21.1

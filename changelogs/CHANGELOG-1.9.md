@@ -1,3 +1,81 @@
+## v1.9.7
+### 2023-04-14
+
+### Download
+https://github.com/vmware-tanzu/velero/releases/tag/v1.9.7
+
+### Container Image
+`velero/velero:v1.9.7`
+
+### Documentation
+https://velero.io/docs/v1.9/
+
+### Upgrading
+https://velero.io/docs/v1.9/upgrade-to-1.9/
+
+### All changes
+  * Bump Golang version to v1.19.8 (#6148, @blackpiglet)
+
+## v1.9.6
+### 2023-02-21
+
+### Download
+https://github.com/vmware-tanzu/velero/releases/tag/v1.9.6
+
+### Container Image
+`velero/velero:v1.9.6`
+
+### Documentation
+https://velero.io/docs/v1.9/
+
+### Upgrading
+https://velero.io/docs/v1.9/upgrade-to-1.9/
+
+### All changes
+  * Bump up Golang version and fix CVEs. (#5884, @blackpiglet)
+  * Add labels for velero installed namespace to support PSA. (#5887, @blackpiglet)
+  * Fix Dockerfile issue. (#5761, @blackpiglet)
+  * Add PR container build action, which will not push image. Add GOARM parameter. (#5777, @blackpiglet)
+  * Correct PVB/PVR Failed Phase patching during startup (#5829, @kaovilai)
+
+## v1.9.5
+### 2022-12-19
+
+### Download
+https://github.com/vmware-tanzu/velero/releases/tag/v1.9.5
+
+### Container Image
+`velero/velero:v1.9.5`
+
+### Documentation
+https://velero.io/docs/v1.9/
+
+### Upgrading
+https://velero.io/docs/v1.9/upgrade-to-1.9/
+
+### All changes
+  * Add Restic builder in Dockerfile, and keep the used built Golang image version in accordance with upstream Restic. (#5685, @blackpiglet)
+
+## v1.9.4
+### 2022-11-30
+
+### Download
+https://github.com/vmware-tanzu/velero/releases/tag/v1.9.4
+
+### Container Image
+`velero/velero:v1.9.4`
+
+### Documentation
+https://velero.io/docs/v1.9/
+
+### Upgrading
+https://velero.io/docs/v1.9/upgrade-to-1.9/
+
+### All changes
+  * Fix CVE for trivy scan (#5642, @qiuming-best)
+  * Remove old kubernetes versions from kind CI (#5627, @Lyndon-Li))
+  * Restore ClusterBootstrap before Cluster (#5617, @ywk253100)
+
 ## v1.9.3
 ### 2022-11-03
 
@@ -14,7 +92,9 @@ https://velero.io/docs/v1.9/
 https://velero.io/docs/v1.9/upgrade-to-1.9/
 
 ### All changes
-
+  * Fix controller problematic log output (#5570, @qiuming-best) 
+  * Add compile restic binary for CVE fix (#5564, @qiuming-best) 
+  * Bump up golang version to 1.18.8 (#5558, @qiuming-best) 
   * Enhance the restore priorities list to support specifying the low prioritized resources that need to be restored in the last (#5529, @ywk253100)
   * Fix v1.9.3 CSI VolumeSnapshot status duplicate issue. (#5518, @blackpiglet)
   * Bump up the distroless image to the latest version (#5500, @ywk253100)

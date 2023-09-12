@@ -14,7 +14,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.17
+          go-version: 1.19.8
         id: go
       # Look for a CLI that's made for this PR
       - name: Fetch built CLI
@@ -60,11 +60,6 @@ jobs:
     strategy:
       matrix:
         k8s:
-          # doesn't cover 1.15 as 1.15 doesn't support "apiextensions.k8s.io/v1" that is needed for the case
-          #- 1.15.12
-          - 1.16.15
-          - 1.17.17
-          - 1.18.20
           - 1.19.16
           - 1.20.15
           - 1.21.12
@@ -76,7 +71,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.17
+          go-version: 1.19.8
         id: go
       - name: Check out the code
         uses: actions/checkout@v2
@@ -122,7 +117,7 @@ jobs:
               CREDS_FILE=/tmp/credential BSL_BUCKET=bucket \
               ADDITIONAL_OBJECT_STORE_PROVIDER=aws ADDITIONAL_BSL_CONFIG=region=minio,s3ForcePathStyle="true",s3Url=http://$(hostname -i):9000 \
               ADDITIONAL_CREDS_FILE=/tmp/credential ADDITIONAL_BSL_BUCKET=additional-bucket \
-              GINKGO_FOCUS='Basic\].+\[ClusterResource' VELERO_IMAGE=velero:pr-test \
+              GINKGO_FOCUS='Basic\]\[ClusterResource' VELERO_IMAGE=velero:pr-test \
               make -C test/e2e run
         timeout-minutes: 30
       - name: Upload debug bundle

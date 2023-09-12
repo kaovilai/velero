@@ -30,6 +30,11 @@ import (
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 )
 
+const (
+	podSecurityLevel   = "privileged"
+	podSecurityVersion = "latest"
+)
+
 var (
 	DefaultVeleroPodCPURequest = "500m"
 	DefaultVeleroPodMemRequest = "128Mi"
@@ -136,13 +141,22 @@ func ClusterRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
 }
 
 func Namespace(namespace string) *corev1.Namespace {
-	return &corev1.Namespace{
+	ns := &corev1.Namespace{
 		ObjectMeta: objectMeta("", namespace),
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Namespace",
 			APIVersion: corev1.SchemeGroupVersion.String(),
 		},
 	}
+
+	ns.Labels["pod-security.kubernetes.io/enforce"] = podSecurityLevel
+	ns.Labels["pod-security.kubernetes.io/enforce-version"] = podSecurityVersion
+	ns.Labels["pod-security.kubernetes.io/audit"] = podSecurityLevel
+	ns.Labels["pod-security.kubernetes.io/audit-version"] = podSecurityVersion
+	ns.Labels["pod-security.kubernetes.io/warn"] = podSecurityLevel
+	ns.Labels["pod-security.kubernetes.io/warn-version"] = podSecurityVersion
+
+	return ns
 }
 
 func BackupStorageLocation(namespace, provider, bucket, prefix string, config map[string]string, caCert []byte) *velerov1api.BackupStorageLocation {
