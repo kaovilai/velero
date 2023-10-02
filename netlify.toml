@@ -1,6 +1,6 @@
 [build]
   base = "site/"
-  command = "hugo --gc --minify"
+  command = "hugo -v --gc --minify"
   publish = "site/public"
 
 [context.production.environment]
