@@ -151,7 +151,7 @@ run: ginkgo
 		-standby-cluster=$(STANDBY_CLUSTER) \
 		-uploader-type=$(UPLOADER_TYPE) \
 		-snapshot-move-data=$(SNAPSHOT_MOVE_DATA) \
-		-data-mover-plugin=$(DATA_MOVER_plugin) \
+		-data-mover-plugin=$(DATA_MOVER_PLUGIN) \
 		-standby-cluster-cloud-provider=$(STANDBY_CLUSTER_CLOUD_PROVIDER) \
 		-standby-cluster-plugins=$(STANDBY_CLUSTER_PLUGINS) \
 		-standby-cluster-object-store-provider=$(STANDBY_CLUSTER_OBJECT_STORE_PROVIDER) \
