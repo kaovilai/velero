@@ -47,6 +47,7 @@ import (
 	. "github.com/vmware-tanzu/velero/test/util/k8s"
 	. "github.com/vmware-tanzu/velero/test/util/velero"
 )
+var displayHelp = false
 
 func init() {
 	flag.StringVar(&VeleroCfg.CloudProvider, "cloud-provider", "", "cloud that Velero will be installed into.  Required.")
@@ -92,6 +93,7 @@ func init() {
 	flag.StringVar(&VeleroCfg.StandbyClusterPlugins, "standby-cluster-plugins", "", "plugins provider for standby cluster.")
 	flag.StringVar(&VeleroCfg.StandbyClusterOjbectStoreProvider, "standby-cluster-object-store-provider", "", "object store provider for standby cluster.")
 	flag.BoolVar(&VeleroCfg.DebugVeleroPodRestart, "debug-velero-pod-restart", false, "a switch for debugging velero pod restart.")
+	flag.BoolVar(&displayHelp, "help", false, "display help message")
 }
 
 var _ = Describe("[APIGroup][APIVersion] Velero tests with various CRD API group versions", APIGropuVersionsTest)
@@ -184,6 +186,10 @@ func GetKubeconfigContext() error {
 }
 
 func TestE2e(t *testing.T) {
+	if displayHelp {
+		flag.Usage()
+		return
+	}
 	// Skip running E2E tests when running only "short" tests because:
 	// 1. E2E tests are long running tests involving installation of Velero and performing backup and restore operations.
 	// 2. E2E tests require a Kubernetes cluster to install and run velero which further requires more configuration. See above referenced command line flags.
