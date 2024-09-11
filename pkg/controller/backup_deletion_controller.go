@@ -49,6 +49,7 @@ import (
 	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/repository"
+	repotypes "github.com/vmware-tanzu/velero/pkg/repository/types"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
@@ -524,7 +525,7 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 		return []error{errors.Wrapf(err, "failed to retrieve config for snapshot info")}
 	}
 	var errs []error
-	directSnapshots := map[string][]repository.SnapshotIdentifier{}
+	directSnapshots := map[string][]repotypes.SnapshotIdentifier{}
 	for i := range list.Items {
 		cm := list.Items[i]
 		if cm.Data == nil || len(cm.Data) == 0 {
@@ -538,7 +539,7 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 			continue
 		}
 
-		snapshot := repository.SnapshotIdentifier{}
+		snapshot := repotypes.SnapshotIdentifier{}
 		if err := json.Unmarshal(b, &snapshot); err != nil {
 			errs = append(errs, errors.Wrapf(err, "failed to unmarshal snapshot info"))
 			continue
@@ -550,7 +551,7 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 		}
 
 		if directSnapshots[snapshot.VolumeNamespace] == nil {
-			directSnapshots[snapshot.VolumeNamespace] = []repository.SnapshotIdentifier{}
+			directSnapshots[snapshot.VolumeNamespace] = []repotypes.SnapshotIdentifier{}
 		}
 
 		directSnapshots[snapshot.VolumeNamespace] = append(directSnapshots[snapshot.VolumeNamespace], snapshot)
@@ -618,7 +619,7 @@ func (r *backupDeletionReconciler) patchBackup(ctx context.Context, backup *vele
 
 // getSnapshotsInBackup returns a list of all pod volume snapshot ids associated with
 // a given Velero backup.
-func getSnapshotsInBackup(ctx context.Context, backup *velerov1api.Backup, kbClient client.Client) (map[string][]repository.SnapshotIdentifier, error) {
+func getSnapshotsInBackup(ctx context.Context, backup *velerov1api.Backup, kbClient client.Client) (map[string][]repotypes.SnapshotIdentifier, error) {
 	podVolumeBackups := &velerov1api.PodVolumeBackupList{}
 	options := &client.ListOptions{
 		LabelSelector: labels.Set(map[string]string{
@@ -635,7 +636,7 @@ func getSnapshotsInBackup(ctx context.Context, backup *velerov1api.Backup, kbCli
 }
 
 func batchDeleteSnapshots(ctx context.Context, repoEnsurer *repository.Ensurer, repoMgr repository.Manager,
-	directSnapshots map[string][]repository.SnapshotIdentifier, backup *velerov1api.Backup, logger logrus.FieldLogger) []error {
+	directSnapshots map[string][]repotypes.SnapshotIdentifier, backup *velerov1api.Backup, logger logrus.FieldLogger) []error {
 	var errs []error
 	for volumeNamespace, snapshots := range directSnapshots {
 		batchForget := []string{}

@@ -56,6 +56,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero/mocks"
 	"github.com/vmware-tanzu/velero/pkg/repository"
 	repomocks "github.com/vmware-tanzu/velero/pkg/repository/mocks"
+	repotypes "github.com/vmware-tanzu/velero/pkg/repository/types"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
@@ -698,13 +699,13 @@ func TestGetSnapshotsInBackup(t *testing.T) {
 	tests := []struct {
 		name                  string
 		podVolumeBackups      []velerov1api.PodVolumeBackup
-		expected              map[string][]repository.SnapshotIdentifier
+		expected              map[string][]repotypes.SnapshotIdentifier
 		longBackupNameEnabled bool
 	}{
 		{
 			name:             "no pod volume backups",
 			podVolumeBackups: nil,
-			expected:         map[string][]repository.SnapshotIdentifier{},
+			expected:         map[string][]repotypes.SnapshotIdentifier{},
 		},
 		{
 			name: "no pod volume backups with matching label",
@@ -724,7 +725,7 @@ func TestGetSnapshotsInBackup(t *testing.T) {
 					Status: velerov1api.PodVolumeBackupStatus{SnapshotID: "snap-2"},
 				},
 			},
-			expected: map[string][]repository.SnapshotIdentifier{},
+			expected: map[string][]repotypes.SnapshotIdentifier{},
 		},
 		{
 			name: "some pod volume backups with matching label",
@@ -765,7 +766,7 @@ func TestGetSnapshotsInBackup(t *testing.T) {
 					Status: velerov1api.PodVolumeBackupStatus{SnapshotID: ""},
 				},
 			},
-			expected: map[string][]repository.SnapshotIdentifier{
+			expected: map[string][]repotypes.SnapshotIdentifier{
 				"ns-1": {
 					{
 						VolumeNamespace: "ns-1",
@@ -820,7 +821,7 @@ func TestGetSnapshotsInBackup(t *testing.T) {
 					Status: velerov1api.PodVolumeBackupStatus{SnapshotID: ""},
 				},
 			},
-			expected: map[string][]repository.SnapshotIdentifier{
+			expected: map[string][]repotypes.SnapshotIdentifier{
 				"ns-1": {
 					{
 						VolumeNamespace: "ns-1",
@@ -856,18 +857,18 @@ func TestGetSnapshotsInBackup(t *testing.T) {
 	}
 }
 
-func batchDeleteSucceed(ctx context.Context, repoEnsurer *repository.Ensurer, repoMgr repository.Manager, directSnapshots map[string][]repository.SnapshotIdentifier, backup *velerov1api.Backup, logger logrus.FieldLogger) []error {
+func batchDeleteSucceed(ctx context.Context, repoEnsurer *repository.Ensurer, repoMgr repository.Manager, directSnapshots map[string][]repotypes.SnapshotIdentifier, backup *velerov1api.Backup, logger logrus.FieldLogger) []error {
 	return nil
 }
 
-func batchDeleteFail(ctx context.Context, repoEnsurer *repository.Ensurer, repoMgr repository.Manager, directSnapshots map[string][]repository.SnapshotIdentifier, backup *velerov1api.Backup, logger logrus.FieldLogger) []error {
+func batchDeleteFail(ctx context.Context, repoEnsurer *repository.Ensurer, repoMgr repository.Manager, directSnapshots map[string][]repotypes.SnapshotIdentifier, backup *velerov1api.Backup, logger logrus.FieldLogger) []error {
 	return []error{
 		errors.New("fake-delete-1"),
 		errors.New("fake-delete-2"),
 	}
 }
 
-func generateSnapshotData(snapshot *repository.SnapshotIdentifier) (map[string]string, error) {
+func generateSnapshotData(snapshot *repotypes.SnapshotIdentifier) (map[string]string, error) {
 	if snapshot == nil {
 		return nil, nil
 	}
@@ -891,7 +892,7 @@ func TestDeleteMovedSnapshots(t *testing.T) {
 		repoMgr            repository.Manager
 		batchDeleteSucceed bool
 		backupName         string
-		snapshots          []*repository.SnapshotIdentifier
+		snapshots          []*repotypes.SnapshotIdentifier
 		expected           []string
 	}{
 		{
@@ -905,14 +906,14 @@ func TestDeleteMovedSnapshots(t *testing.T) {
 			name:       "bad cm info",
 			repoMgr:    repomocks.NewManager(t),
 			backupName: "backup-01",
-			snapshots:  []*repository.SnapshotIdentifier{nil},
+			snapshots:  []*repotypes.SnapshotIdentifier{nil},
 			expected:   []string{"no snapshot info in config"},
 		},
 		{
 			name:       "invalid snapshots",
 			repoMgr:    repomocks.NewManager(t),
 			backupName: "backup-01",
-			snapshots: []*repository.SnapshotIdentifier{
+			snapshots: []*repotypes.SnapshotIdentifier{
 				{
 					RepositoryType:  "repo-1",
 					VolumeNamespace: "ns-1",
@@ -937,7 +938,7 @@ func TestDeleteMovedSnapshots(t *testing.T) {
 			name:       "batch delete succeed",
 			repoMgr:    repomocks.NewManager(t),
 			backupName: "backup-01",
-			snapshots: []*repository.SnapshotIdentifier{
+			snapshots: []*repotypes.SnapshotIdentifier{
 
 				{
 					SnapshotID:      "snapshot-1",
@@ -952,7 +953,7 @@ func TestDeleteMovedSnapshots(t *testing.T) {
 			name:       "batch delete fail",
 			repoMgr:    repomocks.NewManager(t),
 			backupName: "backup-01",
-			snapshots: []*repository.SnapshotIdentifier{
+			snapshots: []*repotypes.SnapshotIdentifier{
 				{
 					RepositoryType:  "repo-1",
 					VolumeNamespace: "ns-1",
