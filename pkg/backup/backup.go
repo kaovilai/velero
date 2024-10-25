@@ -739,6 +739,11 @@ func getNamespacesManagedByArgoCD(kbClient kbclient.Client, includedNamespaces [
 	for _, nsName := range includedNamespaces {
 		ns := corev1api.Namespace{}
 		if err := kbClient.Get(context.Background(), kbclient.ObjectKey{Name: nsName}, &ns); err != nil {
+			// check for only those ns that exist and are included in backup
+			// here we ignore cases like "" or "*" specified under includedNamespaces
+			if apierrors.IsNotFound(err) {
+				continue
+			}
 			log.WithError(err).Errorf("error getting namespace %s", nsName)
 			continue
 		}
