@@ -1,5 +1,14 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Velero Q&A
-    url: https://github.com/vmware-tanzu/velero/discussions/categories/community-support-q-a 
-    about: Have questions about Velero? Please ask them here.
+  - name: Velero Documentation
+    url: https://velero.io/docs/
+    about: Check the documentation for answers to common questions
+  - name: Velero Community Support
+    url: https://github.com/vmware-tanzu/velero/discussions
+    about: Please ask general questions here
+  - name: Velero Slack Channel
+    url: https://kubernetes.slack.com/archives/C6VCGP4MT
+    about: Join the #velero channel on Kubernetes Slack for community support
+  - name: Join Kubernetes Slack
+    url: http://slack.k8s.io/
+    about: Get an invitation to join the Kubernetes Slack workspace

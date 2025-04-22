@@ -1,0 +1,89 @@
+name: Feature Enhancement Request
+description: Suggest an idea for this project
+labels: ["kind/enhancement", "triage/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting an enhancement to Velero!
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Describe the problem/challenge you have
+      description: A description of the current limitation/problem/challenge that you are experiencing.
+      placeholder: I'm trying to accomplish X, but Y is difficult because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear and concise description of what you want to happen.
+      placeholder: I would like Velero to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else you would like to add
+      description: Miscellaneous information that will assist in solving the issue.
+      placeholder: Additional context, alternatives considered, related issues...
+
+  - type: input
+    id: velero-version
+    attributes:
+      label: Velero version
+      description: Use `velero version`
+      placeholder: e.g., v1.10.0
+    validations:
+      required: true
+
+  - type: input
+    id: kubernetes-version
+    attributes:
+      label: Kubernetes version
+      description: Use `kubectl version`
+      placeholder: e.g., v1.26.1
+    validations:
+      required: true
+
+  - type: input
+    id: kubernetes-installer
+    attributes:
+      label: Kubernetes installer & version
+      placeholder: e.g., EKS v1.26, kOps 1.25, etc.
+
+  - type: input
+    id: cloud-provider
+    attributes:
+      label: Cloud provider or hardware configuration
+      placeholder: e.g., AWS, Azure, GCP, on-premises, etc.
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS
+      description: From `/etc/os-release`
+      placeholder: e.g., Ubuntu 22.04, RHEL 8, etc.
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Community Support
+        
+        If you need help, you can engage with the community in the following places:
+        - [Velero Slack channel](https://kubernetes.slack.com/archives/C6VCGP4MT)
+        - [Get an invitation to Kubernetes Slack](http://slack.k8s.io/)
+        - [GitHub Discussions](https://github.com/vmware-tanzu/velero/discussions)
+        
+        ## Vote on this issue!
+        
+        This is an invitation to the Velero community to vote on issues. You can see the project's [top voted issues listed here](https://github.com/vmware-tanzu/velero/issues?q=is%3Aissue+is%3Aopen+sort%3Areactions-%2B1-desc).
+        
+        Use the "reaction smiley face" up to the right of this comment to vote:
+        
+        - 👍 for "The project would be better with this feature added"
+        - 👎 for "This feature will not enhance the project in a meaningful way"
