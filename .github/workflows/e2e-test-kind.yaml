@@ -67,7 +67,8 @@ jobs:
               \"Basic && (ClusterResource || NodePort || StorageClass)\", \
               \"ResourceFiltering && !Restic\", \
               \"ResourceModifier || (Backups && BackupsSync) || PrivilegesMgmt || OrderedResources\", \
-              \"(NamespaceMapping && Single && Restic) || (NamespaceMapping && Multiple && Restic)\"\
+              \"(NamespaceMapping && Single && Restic) || (NamespaceMapping && Multiple && Restic)\", \
+              \"CSI\"\
             ]}" >> $GITHUB_OUTPUT
 
   # Run E2E test against all Kubernetes versions on kind
@@ -94,6 +95,58 @@ jobs:
           skipClusterLogsExport: true
           version: "v0.27.0"
           image: "kindest/node:v${{ matrix.k8s }}"
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            featureGates:
+              CSIVolumeHealth: true
+            nodes:
+            - role: control-plane
+            - role: worker
+      - name: Install CSI Snapshot Controller and Hostpath CSI Driver
+        run: |
+          # Install CSI Snapshot CRDs
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v6.2.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v6.2.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v6.2.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml
+          
+          # Install Snapshot Controller
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v6.2.2/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v6.2.2/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml
+          
+          # Install Hostpath CSI Driver
+          git clone https://github.com/kubernetes-csi/csi-driver-host-path.git
+          cd csi-driver-host-path
+          ./deploy/kubernetes-latest/deploy.sh
+          
+          # Create a VolumeSnapshotClass
+          cat <<EOF | kubectl apply -f -
+          apiVersion: snapshot.storage.k8s.io/v1
+          kind: VolumeSnapshotClass
+          metadata:
+            name: csi-hostpath-snapclass
+          driver: hostpath.csi.k8s.io
+          deletionPolicy: Delete
+          EOF
+          
+          # Create a StorageClass for the CSI driver
+          cat <<EOF | kubectl apply -f -
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: csi-hostpath-sc
+          provisioner: hostpath.csi.k8s.io
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          allowVolumeExpansion: true
+          EOF
+          
+          # Wait for the snapshot controller to be ready
+          kubectl wait --for=condition=ready --timeout=60s -n kube-system pod -l app=snapshot-controller
+          
+          # Wait for the CSI driver pods to be ready
+          kubectl wait --for=condition=ready --timeout=120s -n default pod -l app=csi-hostpathplugin
+
       - name: Fetch built CLI
         id: cli-cache
         uses: actions/cache@v4
@@ -132,6 +185,7 @@ jobs:
               ADDITIONAL_CREDS_FILE=/tmp/credential \
               ADDITIONAL_BSL_BUCKET=additional-bucket \
               VELERO_IMAGE=velero:pr-test-linux-amd64 \
+              FEATURES=EnableCSI \
               GINKGO_LABELS="${{ matrix.labels }}" \
               make -C test/ run-e2e
         timeout-minutes: 30
