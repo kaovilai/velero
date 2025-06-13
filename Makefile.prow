@@ -11,7 +11,6 @@
 # Configuration Variables
 GOFLAGS := -mod=mod
 CONGEN_VERSION := 0.16.5
-CODEGEN_VERSION := 0.22.2
 PROWBIN := /tmp/prowbin
 
 # GOPATH Setup
