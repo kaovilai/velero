@@ -385,6 +385,7 @@ if err == nil && priorityClassName != "" {
 ```
 
 Note: Since validation only logs warnings (not errors), it won't block operations if a priority class doesn't exist. This allows for scenarios where priority classes might be created after Velero installation.
+
 ## Alternatives Considered
 
 1. **Using a single flag for all components**: We could have used a single flag for all components, but this would not allow for different priority classes for different components. Since maintenance jobs and data movers typically require lower priority than the Velero server, separate flags provide more flexibility.
@@ -531,6 +532,7 @@ When configuring priority classes for Velero components, consider the following 
    - Rationale: These are temporary workloads that can be delayed during resource contention
 
 This hierarchy ensures that core Velero components remain operational even under resource pressure, while allowing less critical workloads to be preempted if necessary.
+
 This approach has several advantages:
 
 - Leverages existing configuration mechanisms, minimizing new CLI flags
