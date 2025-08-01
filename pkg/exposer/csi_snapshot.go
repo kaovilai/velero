@@ -82,6 +82,9 @@ type CSISnapshotExposeParam struct {
 
 	// NodeOS specifies the OS of node that the source volume is attaching
 	NodeOS string
+
+	// PriorityClassName is the priority class name for the data mover pod
+	PriorityClassName string
 }
 
 // CSISnapshotExposeWaitParam define the input param for WaitExposed of CSI snapshots
@@ -224,6 +227,7 @@ func (e *csiSnapshotExposer) Expose(ctx context.Context, ownerObject corev1api.O
 		backupPVCReadOnly,
 		spcNoRelabeling,
 		csiExposeParam.NodeOS,
+		csiExposeParam.PriorityClassName,
 	)
 	if err != nil {
 		return errors.Wrap(err, "error to create backup pod")
@@ -446,6 +450,7 @@ func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject co
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        backupVSCName,
 			Annotations: snapshotVSC.Annotations,
+			Labels:      map[string]string{},
 		},
 		Spec: snapshotv1api.VolumeSnapshotContentSpec{
 			VolumeSnapshotRef: corev1api.ObjectReference{
@@ -461,6 +466,17 @@ func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject co
 			Driver:                  snapshotVSC.Spec.Driver,
 			VolumeSnapshotClassName: snapshotVSC.Spec.VolumeSnapshotClassName,
 		},
+	}
+
+	/*
+		We need to keep the label of the managing node for distributed snapshots.
+		The external snapshot manager will only manage snapshots matching it's node if that feature is enabled.
+
+		https://github.com/kubernetes-csi/external-snapshotter/tree/4cedb3f45790ac593ebfa3324c490abedf739477?tab=readme-ov-file#distributed-snapshotting
+		https://github.com/kubernetes-csi/external-snapshotter/blob/4cedb3f45790ac593ebfa3324c490abedf739477/pkg/utils/util.go#L158
+	*/
+	if manager, ok := snapshotVSC.Labels[kube.VolumeSnapshotContentManagedByLabel]; ok {
+		vsc.ObjectMeta.Labels[kube.VolumeSnapshotContentManagedByLabel] = manager
 	}
 
 	return e.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, vsc, metav1.CreateOptions{})
@@ -538,6 +554,7 @@ func (e *csiSnapshotExposer) createBackupPod(
 	backupPVCReadOnly bool,
 	spcNoRelabeling bool,
 	nodeOS string,
+	priorityClassName string,
 ) (*corev1api.Pod, error) {
 	podName := ownerObject.Name
 
@@ -547,6 +564,11 @@ func (e *csiSnapshotExposer) createBackupPod(
 	podInfo, err := getInheritedPodInfo(ctx, e.kubeClient, ownerObject.Namespace, nodeOS)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to get inherited pod info from node-agent")
+	}
+
+	// Log the priority class if it's set
+	if priorityClassName != "" {
+		e.log.Debugf("Setting priority class %q for data mover pod %s", priorityClassName, podName)
 	}
 
 	var gracePeriod int64
@@ -679,6 +701,7 @@ func (e *csiSnapshotExposer) createBackupPod(
 					Resources:     resources,
 				},
 			},
+			PriorityClassName:             priorityClassName,
 			ServiceAccountName:            podInfo.serviceAccount,
 			TerminationGracePeriodSeconds: &gracePeriod,
 			Volumes:                       volumes,
