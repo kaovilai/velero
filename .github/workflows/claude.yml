@@ -19,10 +19,10 @@ jobs:
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: ${{ github.actor == 'kaovilai' && 'write' || 'read' }}
       pull-requests: read
       issues: read
-      id-token: write
+      id-token: ${{ github.actor == 'kaovilai' && 'write' || 'read' }}
       actions: read # Required for Claude to read CI results on PRs
     steps:
       - name: Checkout repository
@@ -49,8 +49,8 @@ jobs:
           # Optional: Trigger when specific user is assigned to an issue
           # assignee_trigger: "claude-bot"
           
-          # Optional: Allow Claude to run specific commands
-          allowed_tools: "Bash(git remote:*),Bash(git fetch:*),Bash(git checkout:*),Bash(git rebase:*),Bash(git branch:*)"
+          # Optional: Allow Claude to run specific commands (only for authorized users)
+          allowed_tools: ${{ github.actor == 'kaovilai' && 'Bash(git remote:*),Bash(git fetch:*),Bash(git checkout:*),Bash(git rebase:*),Bash(git branch:*)' || '' }}
           
           # Optional: Add custom instructions for Claude to customize its behavior for your project
           # custom_instructions: |
