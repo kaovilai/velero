@@ -1,9 +1,6 @@
 ---
 name: Bug report
 about: Tell us about a problem you are experiencing
-title: ''
-labels: ''
-assignees: ''
 
 ---
 
