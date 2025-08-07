@@ -174,6 +174,7 @@ When working in forks and contributing back to the main repository, follow these
 1. **Issue References:**
    - **Always use** `vmware-tanzu/velero#123` format when referencing issues
    - **Never use** `kaovilai/velero#123` or bare `#123` references
+   - **Exception:** Bare `#123` references are allowed for changes targeting `kaovilai/main` (such as CLAUDE.md updates)
    - This ensures commit messages point to the canonical upstream repository
 
 2. **Single Commit Per Branch:**
@@ -192,8 +193,13 @@ When working in forks and contributing back to the main repository, follow these
 
    Implements vmware-tanzu/velero#456"
 
+   # Good examples for kaovilai/main changes:
+   git commit -m "docs: add comprehensive commit message guidelines
+
+   Fixes #108"
+
    # Bad examples (avoid these):
-   git commit -m "fix issue #123"           # Missing repo reference
+   git commit -m "fix issue #123"           # Missing repo reference (unless for kaovilai/main)
    git commit -m "fix kaovilai/velero#123"  # Wrong repo reference
    ```
 
