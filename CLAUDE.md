@@ -167,6 +167,26 @@ make test-perf
    # Binary will be in _output/bin/
    ```
 
+### Commit Message Guidelines
+
+When writing commit messages that reference issues, always use the canonical upstream repository reference:
+
+- **Correct:** `Fixes vmware-tanzu/velero#123`
+- **Incorrect:** `Fixes kaovilai/velero#123` or `Fixes #123`
+
+This ensures issue references point to the official VMware Tanzu Velero repository regardless of which fork the development work is done in.
+
+**Example commit messages:**
+```
+fix: resolve backup validation error
+
+Fixes vmware-tanzu/velero#456
+
+feat: add support for new storage provider
+
+Implements vmware-tanzu/velero#789
+```
+
 ### Code Quality
 
 The project uses:
