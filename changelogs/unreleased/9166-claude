@@ -1,0 +1,3 @@
+Resolve backup timeout issue
+
+Fixes vmware-tanzu/velero#116
