@@ -43,7 +43,8 @@ jobs:
             actions: read
           
           # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4)
-          # model: "claude-opus-4-20250514"
+          # model: "claude-opus-4-1-20250805"
+          model: ${{ (contains(github.event.comment.body, '/opus') || contains(github.event.issue.body, '/opus') || contains(github.event.issue.title, '/opus') || contains(github.event.review.body, '/opus') || contains(github.event.pull_request.title, '/opus')) && 'claude-opus-4-1-20250805' || '' }}
           
           # Optional: Customize the trigger phrase (default: @claude)
           # trigger_phrase: "/claude"
