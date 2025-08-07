@@ -167,6 +167,44 @@ make test-perf
    # Binary will be in _output/bin/
    ```
 
+### Commit Message Guidelines
+
+When working in forks and contributing back to the main repository, follow these commit message conventions:
+
+1. **Issue References:**
+   - **Always use** `vmware-tanzu/velero#123` format when referencing issues
+   - **Never use** `kaovilai/velero#123` or bare `#123` references
+   - This ensures commit messages point to the canonical upstream repository
+
+2. **Single Commit Per Branch:**
+   - Maintain only **1 commit** between `vmware-tanzu/velero:main` and your feature branch
+   - Use `git commit --amend` or `git rebase -i` to squash multiple commits
+   - Exception: When targeting release branches, follow the same single-commit rule relative to that base branch
+
+3. **Commit Message Format:**
+   ```bash
+   # Good examples:
+   git commit -m "fix: resolve backup timeout issue
+
+   Fixes vmware-tanzu/velero#123"
+
+   git commit -m "feat: add support for custom retention policies
+
+   Implements vmware-tanzu/velero#456"
+
+   # Bad examples (avoid these):
+   git commit -m "fix issue #123"           # Missing repo reference
+   git commit -m "fix kaovilai/velero#123"  # Wrong repo reference
+   ```
+
+4. **Squashing Commits:**
+   ```bash
+   # If you have multiple commits, squash them:
+   git rebase -i HEAD~3  # Interactive rebase for last 3 commits
+   # Or amend your latest commit:
+   git commit --amend -m "Updated commit message"
+   ```
+
 ### Code Quality
 
 The project uses:
