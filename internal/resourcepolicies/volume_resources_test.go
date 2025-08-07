@@ -32,6 +32,7 @@ func setStructuredVolume(capacity resource.Quantity, sc string, nfs *nFSVolumeSo
 		nfs:          nfs,
 		csi:          csi,
 		pvcLabels:    pvcLabels,
+		pvcPhase:     "",
 	}
 }
 
@@ -125,6 +126,83 @@ func TestPVCLabelsMatch(t *testing.T) {
 				nil,
 			),
 			expectedMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			match := tt.condition.match(tt.volume)
+			assert.Equal(t, tt.expectedMatch, match, "expected match %v, got %v", tt.expectedMatch, match)
+		})
+	}
+}
+
+func TestPVCPhaseMatch(t *testing.T) {
+	tests := []struct {
+		name          string
+		condition     *pvcPhaseCondition
+		volume        *structuredVolume
+		expectedMatch bool
+	}{
+		{
+			name: "match Pending phase",
+			condition: &pvcPhaseCondition{
+				phase: "Pending",
+			},
+			volume: &structuredVolume{
+				pvcPhase: "Pending",
+			},
+			expectedMatch: true,
+		},
+		{
+			name: "match Bound phase",
+			condition: &pvcPhaseCondition{
+				phase: "Bound",
+			},
+			volume: &structuredVolume{
+				pvcPhase: "Bound",
+			},
+			expectedMatch: true,
+		},
+		{
+			name: "match Lost phase",
+			condition: &pvcPhaseCondition{
+				phase: "Lost",
+			},
+			volume: &structuredVolume{
+				pvcPhase: "Lost",
+			},
+			expectedMatch: true,
+		},
+		{
+			name: "no match - different phases",
+			condition: &pvcPhaseCondition{
+				phase: "Pending",
+			},
+			volume: &structuredVolume{
+				pvcPhase: "Bound",
+			},
+			expectedMatch: false,
+		},
+		{
+			name: "empty condition phase matches any",
+			condition: &pvcPhaseCondition{
+				phase: "",
+			},
+			volume: &structuredVolume{
+				pvcPhase: "Pending",
+			},
+			expectedMatch: true,
+		},
+		{
+			name: "condition matches empty volume phase",
+			condition: &pvcPhaseCondition{
+				phase: "",
+			},
+			volume: &structuredVolume{
+				pvcPhase: "",
+			},
+			expectedMatch: true,
 		},
 	}
 

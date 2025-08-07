@@ -51,6 +51,7 @@ type structuredVolume struct {
 	csi          *csiVolumeSource
 	volumeType   SupportedVolume
 	pvcLabels    map[string]string
+	pvcPhase     string
 }
 
 func (s *structuredVolume) parsePV(pv *corev1api.PersistentVolume) {
@@ -70,8 +71,11 @@ func (s *structuredVolume) parsePV(pv *corev1api.PersistentVolume) {
 }
 
 func (s *structuredVolume) parsePVC(pvc *corev1api.PersistentVolumeClaim) {
-	if pvc != nil && len(pvc.GetLabels()) > 0 {
-		s.pvcLabels = pvc.Labels
+	if pvc != nil {
+		if len(pvc.GetLabels()) > 0 {
+			s.pvcLabels = pvc.Labels
+		}
+		s.pvcPhase = string(pvc.Status.Phase)
 	}
 }
 
@@ -107,6 +111,33 @@ func (c *pvcLabelsCondition) match(v *structuredVolume) bool {
 }
 
 func (c *pvcLabelsCondition) validate() error {
+	return nil
+}
+
+type pvcPhaseCondition struct {
+	phase string
+}
+
+func (c *pvcPhaseCondition) match(v *structuredVolume) bool {
+	if c.phase == "" {
+		return true
+	}
+	return v.pvcPhase == c.phase
+}
+
+func (c *pvcPhaseCondition) validate() error {
+	if c.phase == "" {
+		return nil
+	}
+	// Validate that phase is one of the known PVC phases
+	validPhases := map[string]bool{
+		"Pending": true,
+		"Bound":   true,
+		"Lost":    true,
+	}
+	if !validPhases[c.phase] {
+		return fmt.Errorf("invalid PVC phase: %s. Valid phases are: Pending, Bound, Lost", c.phase)
+	}
 	return nil
 }
 
