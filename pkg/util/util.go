@@ -19,6 +19,8 @@ package util
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
+	"strings"
 )
 
 func Contains(slice []string, key string) bool {
@@ -35,4 +37,79 @@ func Contains(slice []string, key string) bool {
 func GenerateSha256FromRestoreUIDAndVsName(restoreUID string, vsName string) string {
 	sha256Bytes := sha256.Sum256([]byte(restoreUID + "/" + vsName))
 	return hex.EncodeToString(sha256Bytes[:])
+}
+
+// SanitizeBackupStorageLocationError sanitizes error messages from backup storage
+// location validation by removing verbose HTTP response details while preserving
+// essential error information.
+func SanitizeBackupStorageLocationError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	errMsg := err.Error()
+
+	// Common patterns to sanitize from Azure HTTP responses
+	patterns := []struct {
+		regex       *regexp.Regexp
+		replacement string
+	}{
+		// Remove HTTP status codes and response details
+		{
+			regexp.MustCompile(`(?i)status code: \d+`),
+			"",
+		},
+		// Remove HTTP response bodies containing XML/JSON
+		{
+			regexp.MustCompile(`(?s)response body: .*?(?:\n|$)`),
+			"",
+		},
+		// Remove Azure-specific error details like request IDs
+		{
+			regexp.MustCompile(`(?i)requestid:[a-f0-9-]+`),
+			"",
+		},
+		// Remove timestamp information
+		{
+			regexp.MustCompile(`(?i)time:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\.\d]*Z?`),
+			"",
+		},
+		// Remove Azure storage error context
+		{
+			regexp.MustCompile(`(?s)azure storage error: .*?(?:\n|$)`),
+			"",
+		},
+	}
+
+	// Apply sanitization patterns
+	for _, pattern := range patterns {
+		errMsg = pattern.regex.ReplaceAllString(errMsg, pattern.replacement)
+	}
+
+	// Clean up extra whitespace and newlines
+	errMsg = regexp.MustCompile(`\s+`).ReplaceAllString(errMsg, " ")
+	errMsg = strings.TrimSpace(errMsg)
+
+	// Extract meaningful error information
+	switch {
+	case strings.Contains(strings.ToLower(errMsg), "container") && strings.Contains(strings.ToLower(errMsg), "not found"):
+		return "container not found"
+	case strings.Contains(strings.ToLower(errMsg), "container") && strings.Contains(strings.ToLower(errMsg), "does not exist"):
+		return "container does not exist"
+	case strings.Contains(strings.ToLower(errMsg), "bucket") && strings.Contains(strings.ToLower(errMsg), "not found"):
+		return "bucket not found"
+	case strings.Contains(strings.ToLower(errMsg), "bucket") && strings.Contains(strings.ToLower(errMsg), "does not exist"):
+		return "bucket does not exist"
+	case strings.Contains(strings.ToLower(errMsg), "access denied") || strings.Contains(strings.ToLower(errMsg), "forbidden"):
+		return "access denied"
+	case strings.Contains(strings.ToLower(errMsg), "unauthorized"):
+		return "unauthorized access"
+	case strings.Contains(strings.ToLower(errMsg), "invalid credentials"):
+		return "invalid credentials"
+	case len(errMsg) == 0:
+		return "unknown error"
+	default:
+		// Return the sanitized error message if no specific pattern matches
+		return errMsg
+	}
 }

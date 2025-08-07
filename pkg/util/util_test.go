@@ -17,6 +17,7 @@ limitations under the License.
 package util
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -59,6 +60,72 @@ func TestContains(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			actualResult := Contains(tc.inSlice, tc.inKey)
 			assert.Equal(t, tc.expectedResult, actualResult)
+		})
+	}
+}
+
+func TestSanitizeBackupStorageLocationError(t *testing.T) {
+	testCases := []struct {
+		name           string
+		inputError     error
+		expectedResult string
+	}{
+		{
+			name:           "nil error",
+			inputError:     nil,
+			expectedResult: "",
+		},
+		{
+			name:           "Azure container not found with HTTP details",
+			inputError:     errors.New("azure storage error: status code: 404 response body: <Error><Code>ContainerNotFound</Code><Message>The specified container does not exist. RequestId:abc-123-def Time:2023-01-01T10:00:00.000Z</Message></Error>"),
+			expectedResult: "container does not exist",
+		},
+		{
+			name:           "Azure container not found simple",
+			inputError:     errors.New("container not found"),
+			expectedResult: "container not found",
+		},
+		{
+			name:           "S3 bucket does not exist",
+			inputError:     errors.New("bucket does not exist"),
+			expectedResult: "bucket does not exist",
+		},
+		{
+			name:           "Access denied error",
+			inputError:     errors.New("access denied: insufficient permissions"),
+			expectedResult: "access denied",
+		},
+		{
+			name:           "Unauthorized error",
+			inputError:     errors.New("unauthorized access to resource"),
+			expectedResult: "unauthorized access",
+		},
+		{
+			name:           "Invalid credentials",
+			inputError:     errors.New("invalid credentials provided"),
+			expectedResult: "invalid credentials",
+		},
+		{
+			name:           "Complex Azure error with multiple patterns",
+			inputError:     errors.New("azure storage error: status code: 404 requestid:abc-123-def time:2023-01-01T10:00:00.000Z response body: <Error><Code>ContainerNotFound</Code></Error> container does not exist"),
+			expectedResult: "container does not exist",
+		},
+		{
+			name:           "Generic error message",
+			inputError:     errors.New("network timeout occurred"),
+			expectedResult: "network timeout occurred",
+		},
+		{
+			name:           "Empty error message after sanitization",
+			inputError:     errors.New("status code: 500 requestid:xyz time:2023-01-01T10:00:00.000Z"),
+			expectedResult: "unknown error",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := SanitizeBackupStorageLocationError(tc.inputError)
+			assert.Equal(t, tc.expectedResult, result)
 		})
 	}
 }

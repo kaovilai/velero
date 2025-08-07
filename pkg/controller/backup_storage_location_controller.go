@@ -36,6 +36,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/constant"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	"github.com/vmware-tanzu/velero/pkg/util"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
@@ -127,7 +128,8 @@ func (r *backupStorageLocationReconciler) Reconcile(ctx context.Context, req ctr
 				err = errors.Wrapf(err, "BackupStorageLocation %q is unavailable", location.Name)
 				unavailableErrors = append(unavailableErrors, err.Error())
 				location.Status.Phase = velerov1api.BackupStorageLocationPhaseUnavailable
-				location.Status.Message = err.Error()
+				// Sanitize error message to remove verbose HTTP response details
+				location.Status.Message = util.SanitizeBackupStorageLocationError(err)
 			} else {
 				log.Info("BackupStorageLocations is valid, marking as available")
 				location.Status.Phase = velerov1api.BackupStorageLocationPhaseAvailable
