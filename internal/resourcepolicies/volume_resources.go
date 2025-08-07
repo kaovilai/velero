@@ -51,6 +51,7 @@ type structuredVolume struct {
 	csi          *csiVolumeSource
 	volumeType   SupportedVolume
 	pvcLabels    map[string]string
+	pvcPhase     string
 }
 
 func (s *structuredVolume) parsePV(pv *corev1api.PersistentVolume) {
@@ -70,8 +71,11 @@ func (s *structuredVolume) parsePV(pv *corev1api.PersistentVolume) {
 }
 
 func (s *structuredVolume) parsePVC(pvc *corev1api.PersistentVolumeClaim) {
-	if pvc != nil && len(pvc.GetLabels()) > 0 {
-		s.pvcLabels = pvc.Labels
+	if pvc != nil {
+		if len(pvc.GetLabels()) > 0 {
+			s.pvcLabels = pvc.Labels
+		}
+		s.pvcPhase = string(pvc.Status.Phase)
 	}
 }
 
@@ -107,6 +111,23 @@ func (c *pvcLabelsCondition) match(v *structuredVolume) bool {
 }
 
 func (c *pvcLabelsCondition) validate() error {
+	return nil
+}
+
+// pvcPhaseCondition defines a condition that matches if the PVC's phase matches the provided phase
+type pvcPhaseCondition struct {
+	phase string
+}
+
+func (c *pvcPhaseCondition) match(v *structuredVolume) bool {
+	// No phase specified: always match
+	if c.phase == "" {
+		return true
+	}
+	return v.pvcPhase == c.phase
+}
+
+func (c *pvcPhaseCondition) validate() error {
 	return nil
 }
 

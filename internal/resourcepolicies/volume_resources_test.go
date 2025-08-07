@@ -35,6 +35,17 @@ func setStructuredVolume(capacity resource.Quantity, sc string, nfs *nFSVolumeSo
 	}
 }
 
+func setStructuredVolumeWithPhase(capacity resource.Quantity, sc string, nfs *nFSVolumeSource, csi *csiVolumeSource, pvcLabels map[string]string, pvcPhase string) *structuredVolume {
+	return &structuredVolume{
+		capacity:     capacity,
+		storageClass: sc,
+		nfs:          nfs,
+		csi:          csi,
+		pvcLabels:    pvcLabels,
+		pvcPhase:     pvcPhase,
+	}
+}
+
 func TestPVCLabelsMatch(t *testing.T) {
 	tests := []struct {
 		name          string

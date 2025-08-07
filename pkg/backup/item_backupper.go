@@ -714,7 +714,10 @@ func (ib *itemBackupper) getMatchAction(obj runtime.Unstructured, groupResource 
 
 		pvName := pvc.Spec.VolumeName
 		if pvName == "" {
-			return nil, errors.Errorf("PVC has no volume backing this claim")
+			// PVC is unbound (e.g., in Pending state)
+			// Check volume policies before returning an error to allow skipping
+			vfd := resourcepolicies.NewVolumeFilterData(nil, nil, pvc)
+			return ib.backupRequest.ResPolicies.GetMatchAction(vfd)
 		}
 
 		pv := &corev1api.PersistentVolume{}

@@ -39,6 +39,10 @@ type nFSVolumeSource struct {
 }
 
 // volumeConditions defined the current format of conditions we parsed
+type pvcConditions struct {
+	Phase string `yaml:"phase,omitempty"`
+}
+
 type volumeConditions struct {
 	Capacity     string            `yaml:"capacity,omitempty"`
 	StorageClass []string          `yaml:"storageClass,omitempty"`
@@ -46,6 +50,7 @@ type volumeConditions struct {
 	CSI          *csiVolumeSource  `yaml:"csi,omitempty"`
 	VolumeTypes  []SupportedVolume `yaml:"volumeTypes,omitempty"`
 	PVCLabels    map[string]string `yaml:"pvcLabels,omitempty"`
+	PVC          *pvcConditions    `yaml:"pvc,omitempty"`
 }
 
 func (c *capacityCondition) validate() error {

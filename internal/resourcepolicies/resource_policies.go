@@ -146,6 +146,9 @@ func (p *Policies) BuildPolicy(resPolicies *ResourcePolicies) error {
 		if len(con.PVCLabels) > 0 {
 			volP.conditions = append(volP.conditions, &pvcLabelsCondition{labels: con.PVCLabels})
 		}
+		if con.PVC != nil && con.PVC.Phase != "" {
+			volP.conditions = append(volP.conditions, &pvcPhaseCondition{phase: con.PVC.Phase})
+		}
 		p.volumePolicies = append(p.volumePolicies, volP)
 	}
 
@@ -191,6 +194,8 @@ func (p *Policies) GetMatchAction(res any) (*Action, error) {
 		if data.PVC != nil {
 			volume.parsePVC(data.PVC)
 		}
+	case data.PVC != nil:
+		volume.parsePVC(data.PVC)
 	default:
 		return nil, errors.New("failed to convert object")
 	}
