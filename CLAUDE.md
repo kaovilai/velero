@@ -224,12 +224,12 @@ The project uses:
 
 When tasks include phrases like "against upstream/main" or reference the upstream `vmware-tanzu/velero` repository, provide a PR creation link using this format:
 
-```
+```text
 https://github.com/vmware-tanzu/velero/compare/main...kaovilai:velero:branch-name
 ```
 
 **Example:**
-```
+```text
 https://github.com/vmware-tanzu/velero/compare/main...kaovilai:velero:claude/issue-110-20250807-1927
 ```
 
