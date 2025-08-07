@@ -336,6 +336,11 @@ ifneq ($(SKIP_TESTS), 1)
 	@hack/lint.sh
 endif
 
+lint-fix:
+ifneq ($(SKIP_TESTS), 1)
+	@$(MAKE) shell CMD="-c 'golangci-lint run --fix --new-from-rev=upstream/main'"
+endif
+
 update:
 	@$(MAKE) shell CMD="-c 'hack/update-all.sh'"
 
