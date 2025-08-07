@@ -39,6 +39,8 @@ jobs:
 
           # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4)
           # model: "claude-opus-4-20250514"
+          # Replace line 41 with:
+          model: ${{ (contains(github.event.pull_request.body, '/opus') || contains(github.event.pull_request.title, '/opus')) && 'claude-opus-4-1-20250805' || '' }}
           
           # Direct prompt for automated review (no @claude mention needed)
           direct_prompt: |
