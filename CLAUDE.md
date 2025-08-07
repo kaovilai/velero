@@ -220,6 +220,26 @@ The project uses:
 - Unit tests with table-driven patterns
 - End-to-end tests using Ginkgo/Gomega
 
+### Creating Pull Requests Against Upstream
+
+When tasks include phrases like "against upstream/main" or reference the upstream `vmware-tanzu/velero` repository, provide a PR creation link using this format:
+
+```
+https://github.com/vmware-tanzu/velero/compare/main...kaovilai:velero:branch-name
+```
+
+**Example:**
+```
+https://github.com/vmware-tanzu/velero/compare/main...kaovilai:velero:claude/issue-110-20250807-1927
+```
+
+**Key points:**
+- Use three dots (`...`) between the base branch and the fork branch
+- Format: `upstream-repo/compare/base-branch...fork-owner:fork-repo:feature-branch`
+- The upstream repository is `vmware-tanzu/velero`
+- The fork is typically `kaovilai:velero`
+- This creates a PR from the fork branch to the upstream main branch
+
 ### Plugin Development
 
 Velero supports plugins for:
