@@ -52,7 +52,7 @@ jobs:
           # assignee_trigger: "claude-bot"
           
           # Optional: Allow Claude to run specific commands (only for authorized users)
-          allowed_tools: ${{ github.actor == 'kaovilai' && 'Bash(git remote:*),Bash(git fetch:*),Bash(git checkout:*),Bash(git rebase:*),Bash(git branch:*),Bash(curl:*)' || '' }}
+          allowed_tools: ${{ github.actor == 'kaovilai' && 'Bash(git remote:*),Bash(git fetch:*),Bash(git checkout:*),Bash(git rebase:*),Bash(git branch:*),Bash(curl:*),Bash(make:*)' || '' }}
           
           # Optional: Add custom instructions for Claude to customize its behavior for your project
           # custom_instructions: |
