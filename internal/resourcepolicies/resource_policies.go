@@ -109,6 +109,9 @@ func (p *Policies) BuildPolicy(resPolicies *ResourcePolicies) error {
 		if len(con.PVCLabels) > 0 {
 			volP.conditions = append(volP.conditions, &pvcLabelsCondition{labels: con.PVCLabels})
 		}
+		if con.PVC != nil && con.PVC.Phase != "" {
+			volP.conditions = append(volP.conditions, &pvcPhaseCondition{phase: con.PVC.Phase})
+		}
 		p.volumePolicies = append(p.volumePolicies, volP)
 	}
 

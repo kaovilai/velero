@@ -958,6 +958,78 @@ volumePolicies:
 			},
 			skip: false,
 		},
+		{
+			name: "PVC phase Pending should be skipped",
+			yamlData: `version: v1
+volumePolicies:
+- conditions:
+    pvc:
+      phase: Pending
+  action:
+    type: skip`,
+			vol: nil,
+			pvc: &corev1api.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "pending-pvc",
+				},
+				Status: corev1api.PersistentVolumeClaimStatus{
+					Phase: corev1api.ClaimPending,
+				},
+			},
+			skip: true,
+		},
+		{
+			name: "PVC phase Bound should not be skipped",
+			yamlData: `version: v1
+volumePolicies:
+- conditions:
+    pvc:
+      phase: Pending
+  action:
+    type: skip`,
+			vol: nil,
+			pvc: &corev1api.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "bound-pvc",
+				},
+				Status: corev1api.PersistentVolumeClaimStatus{
+					Phase: corev1api.ClaimBound,
+				},
+			},
+			skip: false,
+		},
+		{
+			name: "PVC phase Pending with bound PV should be skipped",
+			yamlData: `version: v1
+volumePolicies:
+- conditions:
+    pvc:
+      phase: Pending
+  action:
+    type: skip`,
+			vol: &corev1api.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pv-test",
+				},
+				Spec: corev1api.PersistentVolumeSpec{
+					Capacity: corev1api.ResourceList{
+						corev1api.ResourceStorage: resource.MustParse("1Gi"),
+					},
+				},
+			},
+			pvc: &corev1api.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "pending-pvc-with-pv",
+				},
+				Status: corev1api.PersistentVolumeClaimStatus{
+					Phase: corev1api.ClaimPending,
+				},
+			},
+			skip: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1034,32 +1106,56 @@ func TestParsePVC(t *testing.T) {
 		name           string
 		pvc            *corev1api.PersistentVolumeClaim
 		expectedLabels map[string]string
+		expectedPhase  string
 		expectErr      bool
 	}{
 		{
-			name: "valid PVC with labels",
+			name: "valid PVC with labels and Pending phase",
 			pvc: &corev1api.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"env": "prod"},
 				},
+				Status: corev1api.PersistentVolumeClaimStatus{
+					Phase: corev1api.ClaimPending,
+				},
 			},
 			expectedLabels: map[string]string{"env": "prod"},
+			expectedPhase:  "Pending",
 			expectErr:      false,
 		},
 		{
-			name: "valid PVC with empty labels",
+			name: "valid PVC with empty labels and Bound phase",
 			pvc: &corev1api.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{},
 				},
+				Status: corev1api.PersistentVolumeClaimStatus{
+					Phase: corev1api.ClaimBound,
+				},
 			},
 			expectedLabels: nil,
+			expectedPhase:  "Bound",
+			expectErr:      false,
+		},
+		{
+			name: "PVC with Lost phase",
+			pvc: &corev1api.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "test"},
+				},
+				Status: corev1api.PersistentVolumeClaimStatus{
+					Phase: corev1api.ClaimLost,
+				},
+			},
+			expectedLabels: map[string]string{"app": "test"},
+			expectedPhase:  "Lost",
 			expectErr:      false,
 		},
 		{
 			name:           "nil PVC pointer",
 			pvc:            (*corev1api.PersistentVolumeClaim)(nil),
 			expectedLabels: nil,
+			expectedPhase:  "",
 			expectErr:      false,
 		},
 	}
@@ -1070,6 +1166,7 @@ func TestParsePVC(t *testing.T) {
 			s.parsePVC(tc.pvc)
 
 			assert.Equal(t, tc.expectedLabels, s.pvcLabels)
+			assert.Equal(t, tc.expectedPhase, s.pvcPhase)
 		})
 	}
 }
