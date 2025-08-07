@@ -240,6 +240,27 @@ https://github.com/vmware-tanzu/velero/compare/main...kaovilai:velero:claude/iss
 - The fork is typically `kaovilai:velero`
 - This creates a PR from the fork branch to the upstream main branch
 
+### Changelog Requirements for Upstream PRs
+
+When contributing changes to the upstream `vmware-tanzu/velero` repository, you must include a changelog file:
+
+1. **Changelog File Location:**
+   ```
+   changelogs/unreleased/<PR-NUMBER>-<description>
+   ```
+
+2. **Naming Convention:**
+   - The changelog file name MUST match the upstream PR number in `vmware-tanzu/velero`
+   - **Example:** If your upstream PR is `vmware-tanzu/velero#9166`, create `changelogs/unreleased/9166-claude`
+   - **Not:** `changelogs/unreleased/7233-claude` (wrong PR number)
+
+3. **File Content:**
+   ```
+   <description of changes>
+   ```
+
+**Important:** Always use the upstream PR number, not the fork PR number. This ensures consistency in the changelog system when changes are merged into the main repository.
+
 ### Plugin Development
 
 Velero supports plugins for:
