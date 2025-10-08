@@ -348,3 +348,340 @@ func TestConcatenateObjects(t *testing.T) {
 		})
 	}
 }
+
+// TestNewShimRepoWithCBT tests CBT-aware repository creation
+func TestNewShimRepoWithCBT(t *testing.T) {
+	tests := []struct {
+		name       string
+		cbtEnabled bool
+	}{
+		{
+			name:       "CBT enabled",
+			cbtEnabled: true,
+		},
+		{
+			name:       "CBT disabled",
+			cbtEnabled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backupRepo := &mocks.BackupRepo{}
+			shimRepo := NewShimRepoWithCBT(backupRepo, tt.cbtEnabled)
+
+			assert.NotNil(t, shimRepo)
+
+			// Verify the shim repository has the correct CBT flag
+			sr, ok := shimRepo.(*shimRepository)
+			require.True(t, ok, "Should be able to cast to shimRepository")
+			assert.Equal(t, tt.cbtEnabled, sr.cbtEnabled)
+		})
+	}
+}
+
+// TestNewShimRepo_DefaultsCBTDisabled tests that default constructor has CBT disabled
+func TestNewShimRepo_DefaultsCBTDisabled(t *testing.T) {
+	backupRepo := &mocks.BackupRepo{}
+	shimRepo := NewShimRepo(backupRepo)
+
+	sr, ok := shimRepo.(*shimRepository)
+	require.True(t, ok)
+	assert.False(t, sr.cbtEnabled, "Default NewShimRepo should have CBT disabled")
+}
+
+// TestShimObjectWriter_CBTEnabled tests zero-block optimization with CBT enabled
+func TestShimObjectWriter_CBTEnabled(t *testing.T) {
+	tests := []struct {
+		name           string
+		data           []byte
+		cbtEnabled     bool
+		expectWrite    bool
+		expectedBytes  int
+		description    string
+	}{
+		{
+			name:           "CBT enabled - zero block above threshold",
+			data:           make([]byte, 8192), // 8KB of zeros
+			cbtEnabled:     true,
+			expectWrite:    false, // Should skip write
+			expectedBytes:  8192,  // But should return successful write count
+			description:    "Should skip writing large zero blocks when CBT is enabled",
+		},
+		{
+			name:           "CBT enabled - non-zero block",
+			data:           []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+			cbtEnabled:     true,
+			expectWrite:    true, // Should write
+			expectedBytes:  10,
+			description:    "Should write non-zero data even when CBT is enabled",
+		},
+		{
+			name:           "CBT disabled - zero block",
+			data:           make([]byte, 8192), // 8KB of zeros
+			cbtEnabled:     false,
+			expectWrite:    true, // Should write
+			expectedBytes:  8192,
+			description:    "Should write zero blocks when CBT is disabled",
+		},
+		{
+			name:           "CBT enabled - small zero block below threshold",
+			data:           make([]byte, 1024), // 1KB of zeros (below 4KB threshold)
+			cbtEnabled:     true,
+			expectWrite:    true, // Should write (below threshold)
+			expectedBytes:  1024,
+			description:    "Should write small zero blocks even when CBT is enabled",
+		},
+		{
+			name:           "CBT enabled - exactly at threshold",
+			data:           make([]byte, 4096), // Exactly 4KB
+			cbtEnabled:     true,
+			expectWrite:    false, // Should skip (at threshold)
+			expectedBytes:  4096,
+			description:    "Should skip zero blocks exactly at threshold when CBT is enabled",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objWriter := &mocks.ObjectWriter{}
+
+			if tt.expectWrite {
+				objWriter.On("Write", tt.data).Return(tt.expectedBytes, nil).Once()
+			}
+
+			shimWriter := &shimObjectWriter{
+				repoWriter: objWriter,
+				cbtEnabled: tt.cbtEnabled,
+			}
+
+			n, err := shimWriter.Write(tt.data)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedBytes, n, tt.description)
+
+			if tt.expectWrite {
+				objWriter.AssertExpectations(t)
+			} else {
+				// Verify Write was NOT called on the underlying writer
+				objWriter.AssertNotCalled(t, "Write", mock.Anything)
+			}
+		})
+	}
+}
+
+// TestIsAllZeros tests the zero detection helper function
+func TestIsAllZeros(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected bool
+	}{
+		{
+			name:     "all zeros",
+			data:     make([]byte, 1024),
+			expected: true,
+		},
+		{
+			name:     "single non-zero at start",
+			data:     append([]byte{1}, make([]byte, 1023)...),
+			expected: false,
+		},
+		{
+			name:     "single non-zero at end",
+			data:     append(make([]byte, 1023), 1),
+			expected: false,
+		},
+		{
+			name:     "single non-zero in middle",
+			data:     func() []byte {
+				d := make([]byte, 1024)
+				d[512] = 1
+				return d
+			}(),
+			expected: false,
+		},
+		{
+			name:     "all non-zero",
+			data:     []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+			expected: false,
+		},
+		{
+			name:     "empty slice",
+			data:     []byte{},
+			expected: true,
+		},
+		{
+			name:     "single zero byte",
+			data:     []byte{0},
+			expected: true,
+		},
+		{
+			name:     "single non-zero byte",
+			data:     []byte{1},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isAllZeros(tt.data)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestShimObjectWriter_NewObjectWriterPropagatesCBT tests that NewObjectWriter propagates CBT flag
+func TestShimObjectWriter_NewObjectWriterPropagatesCBT(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name       string
+		cbtEnabled bool
+	}{
+		{
+			name:       "propagates CBT enabled",
+			cbtEnabled: true,
+		},
+		{
+			name:       "propagates CBT disabled",
+			cbtEnabled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objWriter := &mocks.ObjectWriter{}
+			backupRepo := &mocks.BackupRepo{}
+			backupRepo.On("NewObjectWriter", mock.Anything, mock.Anything).Return(objWriter)
+
+			shimRepo := NewShimRepoWithCBT(backupRepo, tt.cbtEnabled)
+
+			writer := shimRepo.NewObjectWriter(ctx, object.WriterOptions{
+				Description: "test",
+			})
+
+			require.NotNil(t, writer)
+
+			// Verify the writer has the correct CBT flag
+			sw, ok := writer.(*shimObjectWriter)
+			require.True(t, ok, "Should be able to cast to shimObjectWriter")
+			assert.Equal(t, tt.cbtEnabled, sw.cbtEnabled, "CBT flag should be propagated to writer")
+		})
+	}
+}
+
+// TestShimObjectWriter_ZeroBlockThreshold tests boundary conditions for threshold
+func TestShimObjectWriter_ZeroBlockThreshold(t *testing.T) {
+	objWriter := &mocks.ObjectWriter{}
+
+	tests := []struct {
+		name        string
+		size        int
+		expectWrite bool
+	}{
+		{
+			name:        "below threshold - 1 byte",
+			size:        1,
+			expectWrite: true,
+		},
+		{
+			name:        "below threshold - 4095 bytes",
+			size:        4095,
+			expectWrite: true,
+		},
+		{
+			name:        "at threshold - 4096 bytes",
+			size:        4096,
+			expectWrite: false,
+		},
+		{
+			name:        "above threshold - 4097 bytes",
+			size:        4097,
+			expectWrite: false,
+		},
+		{
+			name:        "above threshold - 1MB",
+			size:        1024 * 1024,
+			expectWrite: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := make([]byte, tt.size)
+
+			if tt.expectWrite {
+				objWriter.On("Write", data).Return(tt.size, nil).Once()
+			}
+
+			shimWriter := &shimObjectWriter{
+				repoWriter: objWriter,
+				cbtEnabled: true,
+			}
+
+			n, err := shimWriter.Write(data)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.size, n)
+
+			if tt.expectWrite {
+				objWriter.AssertExpectations(t)
+			} else {
+				objWriter.AssertNotCalled(t, "Write", mock.Anything)
+			}
+
+			// Reset mock for next iteration
+			objWriter.ExpectedCalls = nil
+			objWriter.Calls = nil
+		})
+	}
+}
+
+// TestShimObjectWriter_CBTDisabledWritesAllData tests that CBT disabled preserves all data
+func TestShimObjectWriter_CBTDisabledWritesAllData(t *testing.T) {
+	// This is critical: when CBT is disabled, even zero blocks must be written
+	// because they could be legitimate data
+
+	testData := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "large zero block",
+			data: make([]byte, 1024*1024), // 1MB zeros
+		},
+		{
+			name: "mixed data with zeros",
+			data: func() []byte {
+				d := make([]byte, 8192)
+				d[0] = 1
+				d[8191] = 1
+				return d
+			}(),
+		},
+		{
+			name: "all zeros at threshold",
+			data: make([]byte, 4096),
+		},
+	}
+
+	for _, td := range testData {
+		t.Run(td.name, func(t *testing.T) {
+			objWriter := &mocks.ObjectWriter{}
+			objWriter.On("Write", td.data).Return(len(td.data), nil).Once()
+
+			shimWriter := &shimObjectWriter{
+				repoWriter: objWriter,
+				cbtEnabled: false, // CBT disabled
+			}
+
+			n, err := shimWriter.Write(td.data)
+
+			require.NoError(t, err)
+			assert.Equal(t, len(td.data), n)
+			objWriter.AssertExpectations(t)
+			objWriter.AssertCalled(t, "Write", td.data)
+		})
+	}
+}

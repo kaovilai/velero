@@ -35,12 +35,14 @@ import (
 // shimRepository which is one adapter for unified repo and kopia.
 // it implement kopia RepositoryWriter interfaces
 type shimRepository struct {
-	udmRepo udmrepo.BackupRepo
+	udmRepo    udmrepo.BackupRepo
+	cbtEnabled bool // Indicates if CBT optimization is active for this backup
 }
 
 // shimObjectWriter object writer for unifited repo
 type shimObjectWriter struct {
 	repoWriter udmrepo.ObjectWriter
+	cbtEnabled bool // Only skip zero blocks when CBT is active
 }
 
 // shimObjectReader object reader for unifited repo
@@ -49,8 +51,15 @@ type shimObjectReader struct {
 }
 
 func NewShimRepo(repo udmrepo.BackupRepo) repo.RepositoryWriter {
+	return NewShimRepoWithCBT(repo, false)
+}
+
+// NewShimRepoWithCBT creates a shim repository with CBT optimization flag
+// When cbtEnabled is true, zero-block optimization will be applied during writes
+func NewShimRepoWithCBT(repo udmrepo.BackupRepo, cbtEnabled bool) repo.RepositoryWriter {
 	return &shimRepository{
-		udmRepo: repo,
+		udmRepo:    repo,
+		cbtEnabled: cbtEnabled,
 	}
 }
 
@@ -190,6 +199,7 @@ func (sr *shimRepository) NewObjectWriter(ctx context.Context, option object.Wri
 
 	return &shimObjectWriter{
 		repoWriter: writer,
+		cbtEnabled: sr.cbtEnabled,
 	}
 }
 
@@ -277,9 +287,38 @@ func (sr *shimObjectReader) Length() int64 {
 	return sr.repoReader.Length()
 }
 
-// Write data
+const (
+	// Minimum block size to check for zeros (4KB)
+	// Smaller writes are passed through without checking
+	zeroBlockThreshold = 4096
+)
+
+// Write data with zero-block optimization (only when CBT is active)
+// CBTAwareReader zero-fills unchanged regions, we can skip them here
+// to save CPU (hashing) and memory (Kopia chunk storage)
 func (sr *shimObjectWriter) Write(p []byte) (n int, err error) {
+	// Optimization: Skip writing large zero blocks ONLY when CBT is active
+	// This is safe because CBTAwareReader explicitly zero-fills unchanged regions
+	// When CBT is not active, zeros could be legitimate data and must be preserved
+	if sr.cbtEnabled && len(p) >= zeroBlockThreshold && isAllZeros(p) {
+		// Pretend we wrote the data without actually writing
+		// Kopia's dedup would have created a single shared zero chunk anyway,
+		// but this saves the hashing and index operations
+		return len(p), nil
+	}
+
 	return sr.repoWriter.Write(p)
+}
+
+// isAllZeros checks if a byte slice contains only zeros
+func isAllZeros(p []byte) bool {
+	// Optimized check - bail early on first non-zero byte
+	for _, b := range p {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Periodically called to preserve the state of data written to the repo so far.

@@ -20,17 +20,24 @@ limitations under the License.
 package kopia
 
 import (
+	"io"
 	"os"
 	"syscall"
 
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/fs/virtualfs"
 	"github.com/pkg/errors"
+
+	"github.com/vmware-tanzu/velero/pkg/util/csi"
 )
 
 const ErrNotPermitted = "operation not permitted"
 
 func getLocalBlockEntry(sourcePath string) (fs.Entry, error) {
+	return getLocalBlockEntryWithCBT(sourcePath, nil, 0)
+}
+
+func getLocalBlockEntryWithCBT(sourcePath string, cbtRanges []csi.ByteRange, totalSize int64) (fs.Entry, error) {
 	source, err := resolveSymlink(sourcePath)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolveSymlink")
@@ -53,6 +60,20 @@ func getLocalBlockEntry(sourcePath string) (fs.Entry, error) {
 		return nil, errors.Wrapf(err, "unable to open the source device %s", source)
 	}
 
-	sf := virtualfs.StreamingFileFromReader(source, device)
+	var reader io.ReadCloser
+	if cbtRanges != nil && len(cbtRanges) > 0 {
+		// Use CBT-aware reader for selective reading
+		// Determine total size from file info if not provided
+		size := totalSize
+		if size == 0 {
+			size = fileInfo.Size()
+		}
+		reader = NewCBTAwareReader(device, cbtRanges, size)
+	} else {
+		// Use device directly for full read
+		reader = device
+	}
+
+	sf := virtualfs.StreamingFileFromReader(source, reader)
 	return virtualfs.NewStaticDirectory(source, []fs.Entry{sf}), nil
 }
