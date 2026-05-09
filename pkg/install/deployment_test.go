@@ -100,6 +100,55 @@ func TestDeployment(t *testing.T) {
 	assert.Len(t, deploy.Spec.Template.Spec.Containers[0].Args, 2)
 	assert.Equal(t, "--repo-maintenance-job-configmap=test-repo-maintenance-config", deploy.Spec.Template.Spec.Containers[0].Args[1])
 
-	assert.Equal(t, "linux", deploy.Spec.Template.Spec.NodeSelector["kubernetes.io/os"])
-	assert.Equal(t, "linux", string(deploy.Spec.Template.Spec.OS.Name))
+	assert.Equal(t, &corev1api.Affinity{
+		NodeAffinity: &corev1api.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1api.NodeSelector{
+				NodeSelectorTerms: []corev1api.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1api.NodeSelectorRequirement{
+							{
+								Key:      "kubernetes.io/os",
+								Values:   []string{"windows"},
+								Operator: corev1api.NodeSelectorOpNotIn,
+							},
+						},
+					},
+				},
+			},
+		},
+	}, deploy.Spec.Template.Spec.Affinity)
+}
+
+func TestDeploymentWithPriorityClassName(t *testing.T) {
+	testCases := []struct {
+		name              string
+		priorityClassName string
+		expectedValue     string
+	}{
+		{
+			name:              "with priority class name",
+			priorityClassName: "high-priority",
+			expectedValue:     "high-priority",
+		},
+		{
+			name:              "without priority class name",
+			priorityClassName: "",
+			expectedValue:     "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a deployment with the priority class name option
+			var opts []podTemplateOption
+			if tc.priorityClassName != "" {
+				opts = append(opts, WithPriorityClassName(tc.priorityClassName))
+			}
+
+			deployment := Deployment("velero", opts...)
+
+			// Verify the priority class name is set correctly
+			assert.Equal(t, tc.expectedValue, deployment.Spec.Template.Spec.PriorityClassName)
+		})
+	}
 }

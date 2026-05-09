@@ -943,6 +943,24 @@ func TestNewObjectBackupStoreGetter(t *testing.T) {
 			wantBucket:    "bucket",
 			wantPrefix:    "prefix/",
 		},
+		{
+			name:     "when the Bucket field is an MRAP ARN, it should be valid",
+			location: builder.ForBackupStorageLocation("", "").Provider("provider-1").Bucket("arn:aws:s3::123456789012:accesspoint/abcdef0123456.mrap").Result(),
+			objectStoreGetter: objectStoreGetter{
+				"provider-1": newInMemoryObjectStore("arn:aws:s3::123456789012:accesspoint/abcdef0123456.mrap"),
+			},
+			credFileStore: velerotest.NewFakeCredentialsFileStore("", nil),
+			wantBucket:    "arn:aws:s3::123456789012:accesspoint/abcdef0123456.mrap",
+		},
+		{
+			name:     "when the Bucket field is an MRAP ARN with trailing slash, it should be valid and trimmed",
+			location: builder.ForBackupStorageLocation("", "").Provider("provider-1").Bucket("arn:aws:s3::123456789012:accesspoint/abcdef0123456.mrap/").Result(),
+			objectStoreGetter: objectStoreGetter{
+				"provider-1": newInMemoryObjectStore("arn:aws:s3::123456789012:accesspoint/abcdef0123456.mrap"),
+			},
+			credFileStore: velerotest.NewFakeCredentialsFileStore("", nil),
+			wantBucket:    "arn:aws:s3::123456789012:accesspoint/abcdef0123456.mrap",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1015,6 +1033,32 @@ func TestNewObjectBackupStoreGetterConfig(t *testing.T) {
 				"bucket":          "bucket",
 				"prefix":          "",
 				"credentialsFile": "/tmp/credentials/secret-file",
+			},
+		},
+		{
+			name: "location with CACertRef is initialized with caCert from secret",
+			location: builder.ForBackupStorageLocation("", "").Provider(provider).Bucket(bucket).CACertRef(
+				builder.ForSecretKeySelector("cacert-secret", "ca.crt").Result(),
+			).Result(),
+			getter: NewObjectBackupStoreGetterWithSecretStore(
+				velerotest.NewFakeCredentialsFileStore("", nil),
+				velerotest.NewFakeCredentialsSecretStore("cacert-from-secret", nil),
+			),
+			wantConfig: map[string]string{
+				"bucket": "bucket",
+				"prefix": "",
+				"caCert": "cacert-from-secret",
+			},
+		},
+		{
+			name: "location with CACertRef and no SecretStore uses no caCert",
+			location: builder.ForBackupStorageLocation("", "").Provider(provider).Bucket(bucket).CACertRef(
+				builder.ForSecretKeySelector("cacert-secret", "ca.crt").Result(),
+			).Result(),
+			getter: NewObjectBackupStoreGetter(velerotest.NewFakeCredentialsFileStore("", nil)),
+			wantConfig: map[string]string{
+				"bucket": "bucket",
+				"prefix": "",
 			},
 		},
 	}

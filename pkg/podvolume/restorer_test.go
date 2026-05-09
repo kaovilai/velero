@@ -25,7 +25,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	appsv1api "k8s.io/api/apps/v1"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,7 +38,6 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/repository"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
-	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 func TestGetVolumesRepositoryType(t *testing.T) {
@@ -57,34 +55,34 @@ func TestGetVolumesRepositoryType(t *testing.T) {
 		{
 			name: "empty repository type, first one",
 			volumes: map[string]volumeBackupInfo{
-				"volume1": {"fake-snapshot-id-1", "fake-uploader-1", ""},
-				"volume2": {"", "", "fake-type"},
+				"volume1": {"fake-snapshot-id-1", 0, "fake-uploader-1", ""},
+				"volume2": {"", 0, "", "fake-type"},
 			},
 			expectedErr: "empty repository type found among volume snapshots, snapshot ID fake-snapshot-id-1, uploader fake-uploader-1",
 		},
 		{
 			name: "empty repository type, last one",
 			volumes: map[string]volumeBackupInfo{
-				"volume1": {"", "", "fake-type"},
-				"volume2": {"", "", "fake-type"},
-				"volume3": {"fake-snapshot-id-3", "fake-uploader-3", ""},
+				"volume1": {"", 0, "", "fake-type"},
+				"volume2": {"", 0, "", "fake-type"},
+				"volume3": {"fake-snapshot-id-3", 0, "fake-uploader-3", ""},
 			},
 			expectedErr: "empty repository type found among volume snapshots, snapshot ID fake-snapshot-id-3, uploader fake-uploader-3",
 		},
 		{
 			name: "empty repository type, middle one",
 			volumes: map[string]volumeBackupInfo{
-				"volume1": {"", "", "fake-type"},
-				"volume2": {"fake-snapshot-id-2", "fake-uploader-2", ""},
-				"volume3": {"", "", "fake-type"},
+				"volume1": {"", 0, "", "fake-type"},
+				"volume2": {"fake-snapshot-id-2", 0, "fake-uploader-2", ""},
+				"volume3": {"", 0, "", "fake-type"},
 			},
 			expectedErr: "empty repository type found among volume snapshots, snapshot ID fake-snapshot-id-2, uploader fake-uploader-2",
 		},
 		{
 			name: "mismatch repository type",
 			volumes: map[string]volumeBackupInfo{
-				"volume1": {"", "", "fake-type1"},
-				"volume2": {"fake-snapshot-id-2", "fake-uploader-2", "fake-type2"},
+				"volume1": {"", 0, "", "fake-type1"},
+				"volume2": {"fake-snapshot-id-2", 0, "fake-uploader-2", "fake-type2"},
 			},
 			prefixOnly:  true,
 			expectedErr: "multiple repository type in one backup",
@@ -92,9 +90,9 @@ func TestGetVolumesRepositoryType(t *testing.T) {
 		{
 			name: "success",
 			volumes: map[string]volumeBackupInfo{
-				"volume1": {"", "", "fake-type"},
-				"volume2": {"", "", "fake-type"},
-				"volume3": {"", "", "fake-type"},
+				"volume1": {"", 0, "", "fake-type"},
+				"volume2": {"", 0, "", "fake-type"},
+				"volume3": {"", 0, "", "fake-type"},
 			},
 			expected: "fake-type",
 		},
@@ -201,24 +199,6 @@ func TestRestorePodVolumes(t *testing.T) {
 			errs: []expectError{
 				{
 					err: "error to check node agent status: daemonset not found",
-				},
-			},
-		},
-		{
-			name: "get repository type fail",
-			pvbs: []*velerov1api.PodVolumeBackup{
-				createPVBObj(true, true, 1, "restic"),
-				createPVBObj(true, true, 2, "kopia"),
-			},
-			kubeClientObj: []runtime.Object{
-				createNodeAgentDaemonset(),
-			},
-			restoredPod:     createPodObj(false, false, false, 2),
-			sourceNamespace: "fake-ns",
-			errs: []expectError{
-				{
-					err:        "multiple repository type in one backup",
-					prefixOnly: true,
 				},
 			},
 		},
@@ -377,27 +357,14 @@ func TestRestorePodVolumes(t *testing.T) {
 			fakeKubeClient := kubefake.NewSimpleClientset(test.kubeClientObj...)
 			var kubeClient kubernetes.Interface = fakeKubeClient
 
-			fakeCRWatchClient := velerotest.NewFakeControllerRuntimeWatchClient(t, test.kubeClientObj...)
-			lw := kube.InternalLW{
-				Client:     fakeCRWatchClient,
-				Namespace:  velerov1api.DefaultNamespace,
-				ObjectList: new(velerov1api.PodVolumeRestoreList),
-			}
-
-			pvrInformer := cache.NewSharedIndexInformer(&lw, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
-
-			go pvrInformer.Run(ctx.Done())
-			require.True(t, cache.WaitForCacheSync(ctx.Done(), pvrInformer.HasSynced))
+			// This test verifies restore behavior itself, not informer sync/watch.
+			pvrInformer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &velerov1api.PodVolumeRestore{}, 0, cache.Indexers{})
 
 			ensurer := repository.NewEnsurer(fakeCRClient, velerotest.NewLogger(), time.Millisecond)
 
 			restoreObj := builder.ForRestore(velerov1api.DefaultNamespace, "fake-restore").Result()
 
-			factory := NewRestorerFactory(repository.NewRepoLocker(), ensurer, kubeClient,
-				fakeCRClient, pvrInformer, velerotest.NewLogger())
-			rs, err := factory.NewRestorer(ctx, restoreObj)
-
-			require.NoError(t, err)
+			rs := newRestorer(ctx, repository.NewRepoLocker(), ensurer, pvrInformer, kubeClient, fakeCRClient, restoreObj, velerotest.NewLogger())
 
 			go func() {
 				if test.ctx != nil {
@@ -406,7 +373,7 @@ func TestRestorePodVolumes(t *testing.T) {
 				} else if test.retPVRs != nil {
 					time.Sleep(time.Second)
 					for _, pvr := range test.retPVRs {
-						rs.(*restorer).results[resultsKey(test.restoredPod.Namespace, test.restoredPod.Name)] <- pvr
+						rs.results[resultsKey(test.restoredPod.Namespace, test.restoredPod.Name)] <- pvr
 					}
 				}
 			}()

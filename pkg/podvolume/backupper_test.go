@@ -29,6 +29,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -40,8 +41,60 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/repository"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
-	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
+
+type fakeInformerRegistration struct{}
+
+func (fakeInformerRegistration) HasSynced() bool { return true }
+
+func (fakeInformerRegistration) HasSyncedChecker() cache.DoneChecker {
+	return fakeDoneChecker{name: "fakeInformerRegistration"}
+}
+
+type fakeDoneChecker struct {
+	name string
+}
+
+func (f fakeDoneChecker) Name() string { return f.name }
+
+func (f fakeDoneChecker) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+type fakeInformer struct {
+	handler cache.ResourceEventHandler
+}
+
+func (f *fakeInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	f.handler = handler
+	return fakeInformerRegistration{}, nil
+}
+
+func (f *fakeInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, _ time.Duration) (cache.ResourceEventHandlerRegistration, error) {
+	return f.AddEventHandler(handler)
+}
+
+func (f *fakeInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, _ cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	return f.AddEventHandler(handler)
+}
+
+func (f *fakeInformer) RemoveEventHandler(_ cache.ResourceEventHandlerRegistration) error {
+	return nil
+}
+
+func (f *fakeInformer) AddIndexers(_ cache.Indexers) error { return nil }
+
+func (f *fakeInformer) HasSynced() bool { return true }
+
+func (f *fakeInformer) HasSyncedChecker() cache.DoneChecker {
+	return fakeDoneChecker{name: "fakeInformer"}
+}
+
+func (f *fakeInformer) IsStopped() bool { return false }
+
+var _ ctrlcache.Informer = (*fakeInformer)(nil)
 
 func TestIsHostPathVolume(t *testing.T) {
 	// hostPath pod volume
@@ -309,8 +362,8 @@ func createNodeObj() *corev1api.Node {
 
 func TestBackupPodVolumes(t *testing.T) {
 	scheme := runtime.NewScheme()
-	velerov1api.AddToScheme(scheme)
-	corev1api.AddToScheme(scheme)
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	require.NoError(t, corev1api.AddToScheme(scheme))
 	log := logrus.New()
 
 	tests := []struct {
@@ -557,39 +610,26 @@ func TestBackupPodVolumes(t *testing.T) {
 			objList = append(objList, test.kubeClientObj...)
 			fakeCtrlClient := fakeClientBuilder.WithRuntimeObjects(objList...).Build()
 
-			fakeCRWatchClient := velerotest.NewFakeControllerRuntimeWatchClient(t, test.kubeClientObj...)
-			lw := kube.InternalLW{
-				Client:     fakeCRWatchClient,
-				Namespace:  velerov1api.DefaultNamespace,
-				ObjectList: new(velerov1api.PodVolumeBackupList),
-			}
-
-			pvbInformer := cache.NewSharedIndexInformer(&lw, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
-
-			go pvbInformer.Run(ctx.Done())
-			require.True(t, cache.WaitForCacheSync(ctx.Done(), pvbInformer.HasSynced))
+			// This test validates creation-time behavior only, so we don't need
+			// informer sync/watch to be running.
+			pvbInformer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
 
 			ensurer := repository.NewEnsurer(fakeCtrlClient, velerotest.NewLogger(), time.Millisecond)
 
 			backupObj := builder.ForBackup(velerov1api.DefaultNamespace, "fake-backup").Result()
 			backupObj.Spec.StorageLocation = test.bsl
 
-			factory := NewBackupperFactory(repository.NewRepoLocker(), ensurer, fakeCtrlClient, pvbInformer, velerotest.NewLogger())
-			bp, err := factory.NewBackupper(ctx, log, backupObj, test.uploaderType)
-
-			require.NoError(t, err)
+			bp := newBackupper(ctx, log, repository.NewRepoLocker(), ensurer, pvbInformer, fakeCtrlClient, test.uploaderType, backupObj)
 
 			if test.mockGetRepositoryType {
-				funcGetRepositoryType = func(string) string { return "" }
+				funcGetRepositoryType = func() string { return "" }
 			} else {
 				funcGetRepositoryType = getRepositoryType
 			}
 
 			pvbs, _, errs := bp.BackupPodVolumes(backupObj, test.sourcePod, test.volumes, nil, velerotest.NewLogger())
 
-			if test.errs == nil {
-				require.NoError(t, err)
-			} else {
+			if test.errs != nil {
 				for i := 0; i < len(errs); i++ {
 					require.EqualError(t, errs[i], test.errs[i])
 				}
@@ -760,17 +800,7 @@ func TestWaitAllPodVolumesProcessed(t *testing.T) {
 		velerov1api.AddToScheme(scheme)
 		client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 
-		lw := kube.InternalLW{
-			Client:     client,
-			Namespace:  velerov1api.DefaultNamespace,
-			ObjectList: new(velerov1api.PodVolumeBackupList),
-		}
-
-		informer := cache.NewSharedIndexInformer(&lw, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
-
-		ctx := t.Context()
-		go informer.Run(ctx.Done())
-		require.True(t, cache.WaitForCacheSync(ctx.Done(), informer.HasSynced))
+		informer := &fakeInformer{}
 
 		logger := logrus.New()
 		logHook := &logHook{}
@@ -778,7 +808,7 @@ func TestWaitAllPodVolumesProcessed(t *testing.T) {
 
 		backuper := newBackupper(c.ctx, log, nil, nil, informer, nil, "", &velerov1api.Backup{})
 		if c.pvb != nil {
-			backuper.pvbIndexer.Add(c.pvb)
+			require.NoError(t, backuper.pvbIndexer.Add(c.pvb))
 			backuper.wg.Add(1)
 		}
 
@@ -787,9 +817,13 @@ func TestWaitAllPodVolumesProcessed(t *testing.T) {
 			err := client.Get(t.Context(), ctrlclient.ObjectKey{Namespace: c.pvb.Namespace, Name: c.pvb.Name}, pvb)
 			require.NoError(t, err)
 
+			oldPVB := pvb.DeepCopy()
 			pvb.Status = *c.statusToBeUpdated
 			err = client.Update(t.Context(), pvb)
 			require.NoError(t, err)
+
+			require.NotNil(t, informer.handler)
+			informer.handler.OnUpdate(oldPVB, pvb)
 		}
 
 		pvbs := backuper.WaitAllPodVolumesProcessed(logger)
@@ -832,4 +866,186 @@ func TestPVCBackupSummary(t *testing.T) {
 	pbs.addBackedup("vol-2")
 	assert.Empty(t, pbs.Skipped)
 	assert.Len(t, pbs.Backedup, 2)
+}
+
+func TestGetMatchAction_PendingPVC(t *testing.T) {
+	// Create resource policies that skip Pending/Lost PVCs
+	resPolicies := &resourcepolicies.ResourcePolicies{
+		Version: "v1",
+		VolumePolicies: []resourcepolicies.VolumePolicy{
+			{
+				Conditions: map[string]any{
+					"pvcPhase": []string{"Pending", "Lost"},
+				},
+				Action: resourcepolicies.Action{
+					Type: resourcepolicies.Skip,
+				},
+			},
+		},
+	}
+	policies := &resourcepolicies.Policies{}
+	err := policies.BuildPolicy(resPolicies)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name           string
+		pvc            *corev1api.PersistentVolumeClaim
+		volume         *corev1api.Volume
+		pv             *corev1api.PersistentVolume
+		expectedAction *resourcepolicies.Action
+		expectError    bool
+	}{
+		{
+			name: "Pending PVC with pvcPhase skip policy should return skip action",
+			pvc: builder.ForPersistentVolumeClaim("ns", "pending-pvc").
+				StorageClass("test-sc").
+				Phase(corev1api.ClaimPending).
+				Result(),
+			volume: &corev1api.Volume{
+				Name: "test-volume",
+				VolumeSource: corev1api.VolumeSource{
+					PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+						ClaimName: "pending-pvc",
+					},
+				},
+			},
+			pv:             nil,
+			expectedAction: &resourcepolicies.Action{Type: resourcepolicies.Skip},
+			expectError:    false,
+		},
+		{
+			name: "Lost PVC with pvcPhase skip policy should return skip action",
+			pvc: builder.ForPersistentVolumeClaim("ns", "lost-pvc").
+				StorageClass("test-sc").
+				Phase(corev1api.ClaimLost).
+				Result(),
+			volume: &corev1api.Volume{
+				Name: "test-volume",
+				VolumeSource: corev1api.VolumeSource{
+					PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+						ClaimName: "lost-pvc",
+					},
+				},
+			},
+			pv:             nil,
+			expectedAction: &resourcepolicies.Action{Type: resourcepolicies.Skip},
+			expectError:    false,
+		},
+		{
+			name: "Bound PVC with matching PV should not match pvcPhase policy",
+			pvc: builder.ForPersistentVolumeClaim("ns", "bound-pvc").
+				StorageClass("test-sc").
+				VolumeName("test-pv").
+				Phase(corev1api.ClaimBound).
+				Result(),
+			volume: &corev1api.Volume{
+				Name: "test-volume",
+				VolumeSource: corev1api.VolumeSource{
+					PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+						ClaimName: "bound-pvc",
+					},
+				},
+			},
+			pv:             builder.ForPersistentVolume("test-pv").StorageClass("test-sc").Result(),
+			expectedAction: nil,
+			expectError:    false,
+		},
+		{
+			name: "Pending PVC with no matching policy should return nil action",
+			pvc: builder.ForPersistentVolumeClaim("ns", "pending-pvc-no-match").
+				StorageClass("test-sc").
+				Phase(corev1api.ClaimPending).
+				Result(),
+			volume: &corev1api.Volume{
+				Name: "test-volume",
+				VolumeSource: corev1api.VolumeSource{
+					PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+						ClaimName: "pending-pvc-no-match",
+					},
+				},
+			},
+			pv:             nil,
+			expectedAction: &resourcepolicies.Action{Type: resourcepolicies.Skip}, // Will match the pvcPhase policy
+			expectError:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build fake client with PV if present
+			var objs []runtime.Object
+			if tc.pv != nil {
+				objs = append(objs, tc.pv)
+			}
+			fakeClient := velerotest.NewFakeControllerRuntimeClient(t, objs...)
+
+			b := &backupper{
+				crClient: fakeClient,
+			}
+
+			action, err := b.getMatchAction(policies, tc.pvc, tc.volume)
+			if tc.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tc.expectedAction == nil {
+				assert.Nil(t, action)
+			} else {
+				require.NotNil(t, action)
+				assert.Equal(t, tc.expectedAction.Type, action.Type)
+			}
+		})
+	}
+}
+
+func TestGetMatchAction_PVCWithoutPVLookupError(t *testing.T) {
+	// Test that when a PVC has a VolumeName but the PV doesn't exist,
+	// the function ignores the error and tries to match with PVC only
+	resPolicies := &resourcepolicies.ResourcePolicies{
+		Version: "v1",
+		VolumePolicies: []resourcepolicies.VolumePolicy{
+			{
+				Conditions: map[string]any{
+					"pvcPhase": []string{"Pending"},
+				},
+				Action: resourcepolicies.Action{
+					Type: resourcepolicies.Skip,
+				},
+			},
+		},
+	}
+	policies := &resourcepolicies.Policies{}
+	err := policies.BuildPolicy(resPolicies)
+	require.NoError(t, err)
+
+	// Pending PVC without a matching PV in the cluster
+	pvc := builder.ForPersistentVolumeClaim("ns", "pending-pvc").
+		StorageClass("test-sc").
+		Phase(corev1api.ClaimPending).
+		Result()
+
+	volume := &corev1api.Volume{
+		Name: "test-volume",
+		VolumeSource: corev1api.VolumeSource{
+			PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+				ClaimName: "pending-pvc",
+			},
+		},
+	}
+
+	// Empty client - no PV exists
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	b := &backupper{
+		crClient: fakeClient,
+	}
+
+	// Should succeed even though PV lookup would fail
+	// because the function ignores PV lookup errors and uses PVC-only matching
+	action, err := b.getMatchAction(policies, pvc, volume)
+	require.NoError(t, err)
+	require.NotNil(t, action)
+	assert.Equal(t, resourcepolicies.Skip, action.Type)
 }

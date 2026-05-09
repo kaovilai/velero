@@ -506,18 +506,17 @@ func TestFindPVRForTargetPod(t *testing.T) {
 
 	scheme := runtime.NewScheme()
 	scheme.AddKnownTypes(velerov1api.SchemeGroupVersion, &velerov1api.PodVolumeRestore{}, &velerov1api.PodVolumeRestoreList{})
-	clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
 
 	// no matching PVR
 	reconciler := &PodVolumeRestoreReconciler{
-		client: clientBuilder.Build(),
+		client: fake.NewClientBuilder().WithScheme(scheme).Build(),
 		logger: logrus.New(),
 	}
 	requests := reconciler.findPVRForTargetPod(t.Context(), pod)
 	assert.Empty(t, requests)
 
 	// contain one matching PVR
-	reconciler.client = clientBuilder.WithLists(&velerov1api.PodVolumeRestoreList{
+	reconciler.client = fake.NewClientBuilder().WithScheme(scheme).WithLists(&velerov1api.PodVolumeRestoreList{
 		Items: []velerov1api.PodVolumeRestore{
 			{
 				ObjectMeta: metav1.ObjectMeta{
@@ -526,6 +525,7 @@ func TestFindPVRForTargetPod(t *testing.T) {
 						velerov1api.PodUIDLabel: string(pod.GetUID()),
 					},
 				},
+				Spec: velerov1api.PodVolumeRestoreSpec{UploaderType: uploader.KopiaType},
 			},
 			{
 				ObjectMeta: metav1.ObjectMeta{
@@ -617,7 +617,25 @@ func initPodVolumeRestoreReconcilerWithError(objects []runtime.Object, cliObj []
 
 	dataPathMgr := datapath.NewManager(1)
 
-	return NewPodVolumeRestoreReconciler(fakeClient, nil, fakeKubeClient, dataPathMgr, nil, "test-node", time.Minute*5, time.Minute, corev1api.ResourceRequirements{}, velerotest.NewLogger()), nil
+	return NewPodVolumeRestoreReconciler(
+		fakeClient,
+		nil,
+		fakeKubeClient,
+		dataPathMgr,
+		nil,
+		"test-node",
+		time.Minute*5,
+		time.Minute,
+		nil,
+		nil,
+		corev1api.ResourceRequirements{},
+		velerotest.NewLogger(),
+		"",
+		false,
+		nil,
+		nil, // podLabels
+		nil, // podAnnotations
+	), nil
 }
 
 func TestPodVolumeRestoreReconcile(t *testing.T) {
@@ -670,6 +688,7 @@ func TestPodVolumeRestoreReconcile(t *testing.T) {
 		mockClose                bool
 		needExclusiveUpdateError error
 		constrained              bool
+		preserveEmptyUploader    bool
 		expected                 *velerov1api.PodVolumeRestore
 		expectDeleted            bool
 		expectCancelRecord       bool
@@ -921,6 +940,13 @@ func TestPodVolumeRestoreReconcile(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if !test.preserveEmptyUploader && test.pvr != nil && test.pvr.Spec.UploaderType == "" {
+				test.pvr.Spec.UploaderType = uploader.KopiaType
+			}
+			if !test.preserveEmptyUploader && test.expected != nil && test.expected.Spec.UploaderType == "" {
+				test.expected.Spec.UploaderType = uploader.KopiaType
+			}
+
 			objs := []runtime.Object{daemonSet, node}
 
 			ctlObj := []client.Object{}
@@ -1006,6 +1032,7 @@ func TestPodVolumeRestoreReconcile(t *testing.T) {
 							ep.On("GetExposed", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 						} else if test.isPeekExposeErr {
 							ep.On("PeekExposed", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(errors.New("fake-peek-error"))
+							ep.On("DiagnoseExpose", mock.Anything, mock.Anything).Return("")
 						}
 
 						if !test.notMockCleanUp {
@@ -1078,6 +1105,128 @@ func TestPodVolumeRestoreReconcile(t *testing.T) {
 			} else if pvr.Status.Phase == velerov1api.PodVolumeRestorePhaseAccepted {
 				assert.Contains(t, pvr.Labels, exposer.ExposeOnGoingLabel)
 			}
+		})
+	}
+}
+
+func TestPodVolumeRestoreSetupExposeParam(t *testing.T) {
+	// common objects for all cases
+	node := builder.ForNode("worker-1").Labels(map[string]string{kube.NodeOSLabel: kube.NodeOSLinux}).Result()
+
+	basePVR := pvrBuilder().Result()
+	basePVR.Status.Node = "worker-1"
+	basePVR.Spec.Pod.Namespace = "app-ns"
+	basePVR.Spec.Pod.Name = "app-pod"
+	basePVR.Spec.Volume = "data-vol"
+
+	type args struct {
+		customLabels      map[string]string
+		customAnnotations map[string]string
+	}
+	type want struct {
+		labels      map[string]string
+		annotations map[string]string
+	}
+
+	tests := []struct {
+		name string
+		args args
+		want want
+	}{
+		{
+			name: "label has customize values",
+			args: args{
+				customLabels:      map[string]string{"custom-label": "label-value"},
+				customAnnotations: nil,
+			},
+			want: want{
+				labels: map[string]string{
+					velerov1api.PVRLabel: basePVR.Name,
+					"custom-label":       "label-value",
+				},
+				annotations: map[string]string{},
+			},
+		},
+		{
+			name: "label has no customize values",
+			args: args{
+				customLabels:      nil,
+				customAnnotations: nil,
+			},
+			want: want{
+				labels:      map[string]string{velerov1api.PVRLabel: basePVR.Name},
+				annotations: map[string]string{},
+			},
+		},
+		{
+			name: "annotation has customize values",
+			args: args{
+				customLabels:      nil,
+				customAnnotations: map[string]string{"custom-annotation": "annotation-value"},
+			},
+			want: want{
+				labels:      map[string]string{velerov1api.PVRLabel: basePVR.Name},
+				annotations: map[string]string{"custom-annotation": "annotation-value"},
+			},
+		},
+		{
+			name: "annotation has no customize values",
+			args: args{
+				customLabels:      map[string]string{"another-label": "lval"},
+				customAnnotations: nil,
+			},
+			want: want{
+				labels: map[string]string{
+					velerov1api.PVRLabel: basePVR.Name,
+					"another-label":      "lval",
+				},
+				annotations: map[string]string{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Fake clients per case
+			fakeCRClient := velerotest.NewFakeControllerRuntimeClient(t, node, basePVR.DeepCopy())
+			fakeKubeClient := clientgofake.NewSimpleClientset(node)
+
+			// Reconciler config per case
+			preparingTimeout := time.Minute * 3
+			resourceTimeout := time.Minute * 10
+			podRes := corev1api.ResourceRequirements{}
+			r := NewPodVolumeRestoreReconciler(
+				fakeCRClient,
+				nil,
+				fakeKubeClient,
+				datapath.NewManager(1),
+				nil,
+				"test-node",
+				preparingTimeout,
+				resourceTimeout,
+				nil, // backupRepoConfigs
+				nil, // cacheVolumeConfigs -> keep nil so CacheVolume is nil
+				podRes,
+				velerotest.NewLogger(),
+				"restore-priority",
+				true,
+				nil, // repoConfigMgr (unused when cacheVolumeConfigs is nil)
+				tt.args.customLabels,
+				tt.args.customAnnotations,
+			)
+
+			// Act
+			got := r.setupExposeParam(basePVR)
+
+			// Core fields
+			assert.Equal(t, exposer.PodVolumeExposeTypeRestore, got.Type)
+			assert.Equal(t, basePVR.Spec.Pod.Namespace, got.ClientNamespace)
+			assert.Equal(t, basePVR.Spec.Pod.Name, got.ClientPodName)
+			assert.Equal(t, basePVR.Spec.Volume, got.ClientPodVolume)
+
+			// Labels/Annotations
+			assert.Equal(t, tt.want.labels, got.HostingPodLabels)
+			assert.Equal(t, tt.want.annotations, got.HostingPodAnnotations)
 		})
 	}
 }
@@ -1255,7 +1404,7 @@ func TestFindPVBForRestorePod(t *testing.T) {
 	}{
 		{
 			name: "find pvr for pod",
-			pvr:  pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
+			pvr:  pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
 			pod:  builder.ForPod(velerov1api.DefaultNamespace, pvrName).Labels(map[string]string{velerov1api.PVRLabel: pvrName}).Status(corev1api.PodStatus{Phase: corev1api.PodRunning}).Result(),
 			checkFunc: func(pvr *velerov1api.PodVolumeRestore, requests []reconcile.Request) {
 				// Assert that the function returns a single request
@@ -1266,7 +1415,7 @@ func TestFindPVBForRestorePod(t *testing.T) {
 			},
 		}, {
 			name: "no selected label found for pod",
-			pvr:  pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
+			pvr:  pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
 			pod:  builder.ForPod(velerov1api.DefaultNamespace, pvrName).Result(),
 			checkFunc: func(pvr *velerov1api.PodVolumeRestore, requests []reconcile.Request) {
 				// Assert that the function returns a single request
@@ -1274,7 +1423,7 @@ func TestFindPVBForRestorePod(t *testing.T) {
 			},
 		}, {
 			name: "no matched pod",
-			pvr:  pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
+			pvr:  pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
 			pod:  builder.ForPod(velerov1api.DefaultNamespace, pvrName).Labels(map[string]string{velerov1api.PVRLabel: "non-existing-pvr"}).Result(),
 			checkFunc: func(pvr *velerov1api.PodVolumeRestore, requests []reconcile.Request) {
 				assert.Empty(t, requests)
@@ -1282,8 +1431,16 @@ func TestFindPVBForRestorePod(t *testing.T) {
 		},
 		{
 			name: "pvr not accept",
-			pvr:  pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseInProgress).Result(),
+			pvr:  pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseInProgress).Result(),
 			pod:  builder.ForPod(velerov1api.DefaultNamespace, pvrName).Labels(map[string]string{velerov1api.PVRLabel: pvrName}).Result(),
+			checkFunc: func(pvr *velerov1api.PodVolumeRestore, requests []reconcile.Request) {
+				assert.Empty(t, requests)
+			},
+		},
+		{
+			name: "invalid uploader type",
+			pvr:  pvrBuilder().UploaderType("restic").Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
+			pod:  builder.ForPod(velerov1api.DefaultNamespace, pvrName).Labels(map[string]string{velerov1api.PVRLabel: pvrName}).Status(corev1api.PodStatus{Phase: corev1api.PodRunning}).Result(),
 			checkFunc: func(pvr *velerov1api.PodVolumeRestore, requests []reconcile.Request) {
 				assert.Empty(t, requests)
 			},
@@ -1472,32 +1629,32 @@ func TestAttemptPVRResume(t *testing.T) {
 	}{
 		{
 			name: "Other pvr",
-			pvr:  pvrBuilder().Phase(velerov1api.PodVolumeRestorePhasePrepared).Result(),
+			pvr:  pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhasePrepared).Result(),
 		},
 		{
 			name: "Other pvr",
-			pvr:  pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
+			pvr:  pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseAccepted).Result(),
 		},
 		{
 			name:           "InProgress pvr, not the current node",
-			pvr:            pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseInProgress).Result(),
+			pvr:            pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseInProgress).Result(),
 			inProgressPvrs: []string{pvrName},
 		},
 		{
 			name:           "InProgress pvr, no resume error",
-			pvr:            pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseInProgress).Node("node-1").Result(),
+			pvr:            pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseInProgress).Node("node-1").Result(),
 			inProgressPvrs: []string{pvrName},
 		},
 		{
 			name:           "InProgress pvr, resume error, cancel error",
-			pvr:            pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseInProgress).Node("node-1").Result(),
+			pvr:            pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseInProgress).Node("node-1").Result(),
 			resumeErr:      errors.New("fake-resume-error"),
 			needErrs:       []bool{false, false, true, false, false, false},
 			inProgressPvrs: []string{pvrName},
 		},
 		{
 			name:           "InProgress pvr, resume error, cancel succeed",
-			pvr:            pvrBuilder().Phase(velerov1api.PodVolumeRestorePhaseInProgress).Node("node-1").Result(),
+			pvr:            pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhaseInProgress).Node("node-1").Result(),
 			resumeErr:      errors.New("fake-resume-error"),
 			cancelledPvrs:  []string{pvrName},
 			inProgressPvrs: []string{pvrName},
@@ -1505,7 +1662,7 @@ func TestAttemptPVRResume(t *testing.T) {
 		{
 			name:          "Error",
 			needErrs:      []bool{false, false, false, false, false, true},
-			pvr:           pvrBuilder().Phase(velerov1api.PodVolumeRestorePhasePrepared).Result(),
+			pvr:           pvrBuilder().UploaderType(uploader.KopiaType).Phase(velerov1api.PodVolumeRestorePhasePrepared).Result(),
 			expectedError: "error to list PVRs: List error",
 		},
 	}

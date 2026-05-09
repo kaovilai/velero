@@ -23,8 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vmware-tanzu/velero/pkg/uploader"
-
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -37,6 +35,8 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/flag"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/output"
 	"github.com/vmware-tanzu/velero/pkg/install"
+	velerotypes "github.com/vmware-tanzu/velero/pkg/types"
+	"github.com/vmware-tanzu/velero/pkg/uploader"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
@@ -89,8 +89,12 @@ type Options struct {
 	RepoMaintenanceJobConfigMap     string
 	NodeAgentConfigMap              string
 	ItemBlockWorkerCount            int
+	ConcurrentBackups               int
 	NodeAgentDisableHostPath        bool
 	kubeletRootDir                  string
+	Apply                           bool
+	ServerPriorityClassName         string
+	NodeAgentPriorityClassName      string
 }
 
 // BindFlags adds command line values to the options struct.
@@ -99,6 +103,7 @@ func (o *Options) BindFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.BucketName, "bucket", o.BucketName, "Name of the object storage bucket where backups should be stored")
 	flags.StringVar(&o.SecretFile, "secret-file", o.SecretFile, "File containing credentials for backup and volume provider. If not specified, --no-secret must be used for confirmation. Optional.")
 	flags.BoolVar(&o.NoSecret, "no-secret", o.NoSecret, "Flag indicating if a secret should be created. Must be used as confirmation if --secret-file is not provided. Optional.")
+	flags.BoolVar(&o.Apply, "apply", o.Apply, "Flag indicating if resources should be applied instead of created. This can be used for updating existing resources.")
 	flags.BoolVar(&o.NoDefaultBackupLocation, "no-default-backup-location", o.NoDefaultBackupLocation, "Flag indicating if a default backup location should be created. Must be used as confirmation if --bucket or --provider are not provided. Optional.")
 	flags.StringVar(&o.Image, "image", o.Image, "Image to use for the Velero and node agent pods. Optional.")
 	flags.StringVar(&o.Prefix, "prefix", o.Prefix, "Prefix under which all Velero data should be stored within the bucket. Optional.")
@@ -194,6 +199,24 @@ func (o *Options) BindFlags(flags *pflag.FlagSet) {
 		o.ItemBlockWorkerCount,
 		"Number of worker threads to process ItemBlocks. Default is one. Optional.",
 	)
+	flags.IntVar(
+		&o.ConcurrentBackups,
+		"concurrent-backups",
+		o.ConcurrentBackups,
+		"Number of backups to process concurrently. Default is one. Optional.",
+	)
+	flags.StringVar(
+		&o.ServerPriorityClassName,
+		"server-priority-class-name",
+		o.ServerPriorityClassName,
+		"Priority class name for the Velero server deployment. Optional.",
+	)
+	flags.StringVar(
+		&o.NodeAgentPriorityClassName,
+		"node-agent-priority-class-name",
+		o.NodeAgentPriorityClassName,
+		"Priority class name for the node agent daemonset. Optional.",
+	)
 }
 
 // NewInstallOptions instantiates a new, default InstallOptions struct.
@@ -252,11 +275,21 @@ func (o *Options) AsVeleroOptions() (*install.VeleroOptions, error) {
 			return nil, err
 		}
 	}
-	veleroPodResources, err := kubeutil.ParseResourceRequirements(o.VeleroPodCPURequest, o.VeleroPodMemRequest, o.VeleroPodCPULimit, o.VeleroPodMemLimit)
+	veleroPodResources, err := kubeutil.ParseCPUAndMemoryResources(
+		o.VeleroPodCPURequest,
+		o.VeleroPodMemRequest,
+		o.VeleroPodCPULimit,
+		o.VeleroPodMemLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
-	nodeAgentPodResources, err := kubeutil.ParseResourceRequirements(o.NodeAgentPodCPURequest, o.NodeAgentPodMemRequest, o.NodeAgentPodCPULimit, o.NodeAgentPodMemLimit)
+	nodeAgentPodResources, err := kubeutil.ParseCPUAndMemoryResources(
+		o.NodeAgentPodCPURequest,
+		o.NodeAgentPodMemRequest,
+		o.NodeAgentPodCPULimit,
+		o.NodeAgentPodMemLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -299,8 +332,11 @@ func (o *Options) AsVeleroOptions() (*install.VeleroOptions, error) {
 		RepoMaintenanceJobConfigMap:     o.RepoMaintenanceJobConfigMap,
 		NodeAgentConfigMap:              o.NodeAgentConfigMap,
 		ItemBlockWorkerCount:            o.ItemBlockWorkerCount,
+		ConcurrentBackups:               o.ConcurrentBackups,
 		KubeletRootDir:                  o.kubeletRootDir,
 		NodeAgentDisableHostPath:        o.NodeAgentDisableHostPath,
+		ServerPriorityClassName:         o.ServerPriorityClassName,
+		NodeAgentPriorityClassName:      o.NodeAgentPriorityClassName,
 	}, nil
 }
 
@@ -345,8 +381,8 @@ This is useful as a starting point for more customized installations.
 
   # velero install --provider azure --plugins velero/velero-plugin-for-microsoft-azure:v1.0.0 --bucket $BLOB_CONTAINER --secret-file ./credentials-velero --backup-location-config resourceGroup=$AZURE_BACKUP_RESOURCE_GROUP,storageAccount=$AZURE_STORAGE_ACCOUNT_ID[,subscriptionId=$AZURE_BACKUP_SUBSCRIPTION_ID] --snapshot-location-config apiTimeout=<YOUR_TIMEOUT>[,resourceGroup=$AZURE_BACKUP_RESOURCE_GROUP,subscriptionId=$AZURE_BACKUP_SUBSCRIPTION_ID]`,
 		Run: func(c *cobra.Command, args []string) {
-			cmd.CheckError(o.Validate(c, args, f))
 			cmd.CheckError(o.Complete(args, f))
+			cmd.CheckError(o.Validate(c, args, f))
 			cmd.CheckError(o.Run(c, f))
 		},
 	}
@@ -389,9 +425,10 @@ func (o *Options) Run(c *cobra.Command, f client.Factory) error {
 	if err != nil {
 		return err
 	}
+
 	errorMsg := fmt.Sprintf("\n\nError installing Velero. Use `kubectl logs deploy/velero -n %s` to check the deploy logs", o.Namespace)
 
-	err = install.Install(dynamicFactory, kbClient, resources, os.Stdout)
+	err = install.Install(dynamicFactory, kbClient, resources, os.Stdout, o.Apply)
 	if err != nil {
 		return errors.Wrap(err, errorMsg)
 	}
@@ -521,6 +558,30 @@ func (o *Options) Validate(c *cobra.Command, args []string, f client.Factory) er
 
 	if o.PodVolumeOperationTimeout < 0 {
 		return errors.New("--pod-volume-operation-timeout must be non-negative")
+	}
+
+	crClient, err := f.KubebuilderClient()
+	if err != nil {
+		return fmt.Errorf("fail to create go-client %w", err)
+	}
+
+	if len(o.NodeAgentConfigMap) > 0 {
+		if err := kubeutil.VerifyJSONConfigs(c.Context(), o.Namespace, crClient, o.NodeAgentConfigMap, &velerotypes.NodeAgentConfigs{}); err != nil {
+			return fmt.Errorf("--node-agent-configmap specified ConfigMap %s is invalid: %w", o.NodeAgentConfigMap, err)
+		}
+	}
+
+	if len(o.RepoMaintenanceJobConfigMap) > 0 {
+		if err := kubeutil.VerifyJSONConfigs(c.Context(), o.Namespace, crClient, o.RepoMaintenanceJobConfigMap, &velerotypes.JobConfigs{}); err != nil {
+			return fmt.Errorf("--repo-maintenance-job-configmap specified ConfigMap %s is invalid: %w", o.RepoMaintenanceJobConfigMap, err)
+		}
+	}
+
+	if len(o.BackupRepoConfigMap) > 0 {
+		config := make(map[string]any)
+		if err := kubeutil.VerifyJSONConfigs(c.Context(), o.Namespace, crClient, o.BackupRepoConfigMap, &config); err != nil {
+			return fmt.Errorf("--backup-repository-configmap specified ConfigMap %s is invalid: %w", o.BackupRepoConfigMap, err)
+		}
 	}
 
 	return nil

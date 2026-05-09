@@ -32,18 +32,33 @@ func TestGetRepositoryProvider(t *testing.T) {
 	repo := &velerov1.BackupRepository{}
 
 	// empty repository type
-	provider, err := mgr.getRepositoryProvider(repo)
-	require.NoError(t, err)
-	assert.NotNil(t, provider)
+	_, err := mgr.getRepositoryProvider(repo)
+	require.Error(t, err)
 
-	// valid repository type
-	repo.Spec.RepositoryType = velerov1.BackupRepositoryTypeRestic
-	provider, err = mgr.getRepositoryProvider(repo)
-	require.NoError(t, err)
-	assert.NotNil(t, provider)
+	// invalid repository type
+	repo.Spec.RepositoryType = "restic"
+	_, err = mgr.getRepositoryProvider(repo)
+	require.Error(t, err)
 
 	// invalid repository type
 	repo.Spec.RepositoryType = "unknown"
 	_, err = mgr.getRepositoryProvider(repo)
+	require.Error(t, err)
+}
+
+func TestGetRepositoryConfigProvider(t *testing.T) {
+	mgr := NewConfigManager(nil).(*configManager)
+
+	// empty repository type
+	_, err := mgr.getRepositoryProvider("")
+	require.Error(t, err)
+
+	// valid repository type
+	provider, err := mgr.getRepositoryProvider(velerov1.BackupRepositoryTypeKopia)
+	require.NoError(t, err)
+	assert.NotNil(t, provider)
+
+	// invalid repository type
+	_, err = mgr.getRepositoryProvider("restic")
 	require.Error(t, err)
 }

@@ -59,9 +59,11 @@ type podTemplateConfig struct {
 	repoMaintenanceJobConfigMap     string
 	nodeAgentConfigMap              string
 	itemBlockWorkerCount            int
+	concurrentBackups               int
 	forWindows                      bool
 	kubeletRootDir                  string
 	nodeAgentDisableHostPath        bool
+	priorityClassName               string
 }
 
 func WithImage(image string) podTemplateOption {
@@ -223,6 +225,18 @@ func WithItemBlockWorkerCount(itemBlockWorkerCount int) podTemplateOption {
 	}
 }
 
+func WithConcurrentBackups(concurrentBackups int) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.concurrentBackups = concurrentBackups
+	}
+}
+
+func WithPriorityClassName(priorityClassName string) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.priorityClassName = priorityClassName
+	}
+}
+
 func WithForWindows() podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.forWindows = true
@@ -330,6 +344,10 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 		args = append(args, fmt.Sprintf("--item-block-worker-count=%d", c.itemBlockWorkerCount))
 	}
 
+	if c.concurrentBackups > 0 {
+		args = append(args, fmt.Sprintf("--concurrent-backups=%d", c.concurrentBackups))
+	}
+
 	deployment := &appsv1api.Deployment{
 		ObjectMeta: objectMeta(namespace, "velero"),
 		TypeMeta: metav1.TypeMeta{
@@ -346,11 +364,25 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 				Spec: corev1api.PodSpec{
 					RestartPolicy:      corev1api.RestartPolicyAlways,
 					ServiceAccountName: c.serviceAccountName,
-					NodeSelector: map[string]string{
-						"kubernetes.io/os": "linux",
-					},
 					OS: &corev1api.PodOS{
 						Name: "linux",
+					},
+					Affinity: &corev1api.Affinity{
+						NodeAffinity: &corev1api.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &corev1api.NodeSelector{
+								NodeSelectorTerms: []corev1api.NodeSelectorTerm{
+									{
+										MatchExpressions: []corev1api.NodeSelectorRequirement{
+											{
+												Key:      "kubernetes.io/os",
+												Values:   []string{"windows"},
+												Operator: corev1api.NodeSelectorOpNotIn,
+											},
+										},
+									},
+								},
+							},
+						},
 					},
 					Containers: []corev1api.Container{
 						{
@@ -407,6 +439,7 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 							},
 						},
 					},
+					PriorityClassName: c.priorityClassName,
 				},
 			},
 		},
@@ -421,7 +454,8 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 					Secret: &corev1api.SecretVolumeSource{
 						// read-only for Owner, Group, Public
 						DefaultMode: ptr.To(int32(0444)),
-						SecretName:  "cloud-credentials",
+						// #nosec G101 -- This is a reference to a Secret resource name, not a credential
+						SecretName: "cloud-credentials",
 					},
 				},
 			},

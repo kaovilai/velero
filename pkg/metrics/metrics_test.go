@@ -259,6 +259,90 @@ func TestMultipleAdhocBackupsShareMetrics(t *testing.T) {
 	assert.Equal(t, float64(1), validationFailureMetric, "All adhoc validation failures should be counted together")
 }
 
+// TestSetScheduleExpectedIntervalSeconds verifies that the expected interval metric
+// is properly recorded for schedules.
+func TestSetScheduleExpectedIntervalSeconds(t *testing.T) {
+	tests := []struct {
+		name            string
+		scheduleName    string
+		intervalSeconds float64
+		description     string
+	}{
+		{
+			name:            "every 5 minutes schedule",
+			scheduleName:    "frequent-backup",
+			intervalSeconds: 300,
+			description:     "Expected interval should be 5m in seconds",
+		},
+		{
+			name:            "daily schedule",
+			scheduleName:    "daily-backup",
+			intervalSeconds: 86400,
+			description:     "Expected interval should be 24h in seconds",
+		},
+		{
+			name:            "monthly schedule",
+			scheduleName:    "monthly-backup",
+			intervalSeconds: 2678400, // 31 days in seconds
+			description:     "Expected interval should be 31 days in seconds",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewServerMetrics()
+			m.SetScheduleExpectedIntervalSeconds(tc.scheduleName, tc.intervalSeconds)
+
+			metric := getMetricValue(t, m.metrics[scheduleExpectedIntervalSeconds].(*prometheus.GaugeVec), tc.scheduleName)
+			assert.Equal(t, tc.intervalSeconds, metric, tc.description)
+		})
+	}
+}
+
+// TestScheduleExpectedIntervalNotInitializedByDefault verifies that the expected
+// interval metric is not initialized by InitSchedule, so it only appears for
+// schedules with a valid cron expression.
+func TestScheduleExpectedIntervalNotInitializedByDefault(t *testing.T) {
+	m := NewServerMetrics()
+	m.InitSchedule("test-schedule")
+
+	// The metric should not have any values after InitSchedule
+	ch := make(chan prometheus.Metric, 1)
+	m.metrics[scheduleExpectedIntervalSeconds].(*prometheus.GaugeVec).Collect(ch)
+	close(ch)
+
+	count := 0
+	for range ch {
+		count++
+	}
+	assert.Equal(t, 0, count, "scheduleExpectedIntervalSeconds should not be initialized by InitSchedule")
+}
+
+// TestRemoveScheduleCleansUpExpectedInterval verifies that RemoveSchedule
+// cleans up the expected interval metric.
+func TestRemoveScheduleCleansUpExpectedInterval(t *testing.T) {
+	m := NewServerMetrics()
+	m.InitSchedule("test-schedule")
+	m.SetScheduleExpectedIntervalSeconds("test-schedule", 3600)
+
+	// Verify metric exists
+	metric := getMetricValue(t, m.metrics[scheduleExpectedIntervalSeconds].(*prometheus.GaugeVec), "test-schedule")
+	assert.Equal(t, float64(3600), metric)
+
+	// Remove schedule and verify metric is cleaned up
+	m.RemoveSchedule("test-schedule")
+
+	ch := make(chan prometheus.Metric, 1)
+	m.metrics[scheduleExpectedIntervalSeconds].(*prometheus.GaugeVec).Collect(ch)
+	close(ch)
+
+	count := 0
+	for range ch {
+		count++
+	}
+	assert.Equal(t, 0, count, "scheduleExpectedIntervalSeconds should be removed after RemoveSchedule")
+}
+
 // TestInitScheduleWithEmptyName verifies that InitSchedule works correctly
 // with an empty schedule name (for adhoc backups).
 func TestInitScheduleWithEmptyName(t *testing.T) {
@@ -370,5 +454,150 @@ func getHistogramCount(t *testing.T, vec *prometheus.HistogramVec, scheduleLabel
 	}
 
 	t.Fatalf("Histogram with schedule label '%s' not found", scheduleLabel)
+	return 0
+}
+
+// TestRepoMaintenanceMetrics verifies that repo maintenance metrics are properly recorded.
+func TestRepoMaintenanceMetrics(t *testing.T) {
+	tests := []struct {
+		name           string
+		repositoryName string
+		description    string
+	}{
+		{
+			name:           "maintenance job metrics for repository",
+			repositoryName: "default-restic-abcd",
+			description:    "Metrics should be recorded with the repository name label",
+		},
+		{
+			name:           "maintenance job metrics for different repository",
+			repositoryName: "velero-backup-repo-xyz",
+			description:    "Metrics should be recorded with different repository name",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewServerMetrics()
+
+			// Test repo maintenance success metric
+			t.Run("RegisterRepoMaintenanceSuccess", func(t *testing.T) {
+				m.RegisterRepoMaintenanceSuccess(tc.repositoryName)
+
+				metric := getMaintenanceMetricValue(t, m.metrics[repoMaintenanceSuccessTotal].(*prometheus.CounterVec), tc.repositoryName)
+				assert.Equal(t, float64(1), metric, tc.description)
+			})
+
+			// Test repo maintenance failure metric
+			t.Run("RegisterRepoMaintenanceFailure", func(t *testing.T) {
+				m.RegisterRepoMaintenanceFailure(tc.repositoryName)
+
+				metric := getMaintenanceMetricValue(t, m.metrics[repoMaintenanceFailureTotal].(*prometheus.CounterVec), tc.repositoryName)
+				assert.Equal(t, float64(1), metric, tc.description)
+			})
+
+			// Test repo maintenance duration metric
+			t.Run("ObserveRepoMaintenanceDuration", func(t *testing.T) {
+				m.ObserveRepoMaintenanceDuration(tc.repositoryName, 300.5)
+
+				// For histogram, we check the count
+				metric := getMaintenanceHistogramCount(t, m.metrics[repoMaintenanceDurationSeconds].(*prometheus.HistogramVec), tc.repositoryName)
+				assert.Equal(t, uint64(1), metric, tc.description)
+			})
+		})
+	}
+}
+
+// TestMultipleRepoMaintenanceJobsAccumulate verifies that multiple repo maintenance jobs
+// accumulate metrics under the same repository label.
+func TestMultipleRepoMaintenanceJobsAccumulate(t *testing.T) {
+	m := NewServerMetrics()
+	repoName := "default-restic-test"
+
+	// Simulate multiple repo maintenance job executions
+	m.RegisterRepoMaintenanceSuccess(repoName)
+	m.RegisterRepoMaintenanceSuccess(repoName)
+	m.RegisterRepoMaintenanceSuccess(repoName)
+	m.RegisterRepoMaintenanceFailure(repoName)
+	m.RegisterRepoMaintenanceFailure(repoName)
+
+	// Record multiple durations
+	m.ObserveRepoMaintenanceDuration(repoName, 120.5)
+	m.ObserveRepoMaintenanceDuration(repoName, 180.3)
+	m.ObserveRepoMaintenanceDuration(repoName, 90.7)
+
+	// Verify accumulated metrics
+	successMetric := getMaintenanceMetricValue(t, m.metrics[repoMaintenanceSuccessTotal].(*prometheus.CounterVec), repoName)
+	assert.Equal(t, float64(3), successMetric, "All repo maintenance successes should be counted")
+
+	failureMetric := getMaintenanceMetricValue(t, m.metrics[repoMaintenanceFailureTotal].(*prometheus.CounterVec), repoName)
+	assert.Equal(t, float64(2), failureMetric, "All repo maintenance failures should be counted")
+
+	durationCount := getMaintenanceHistogramCount(t, m.metrics[repoMaintenanceDurationSeconds].(*prometheus.HistogramVec), repoName)
+	assert.Equal(t, uint64(3), durationCount, "All repo maintenance durations should be observed")
+}
+
+// Helper function to get metric value from a CounterVec with repository_name label
+func getMaintenanceMetricValue(t *testing.T, vec prometheus.Collector, repositoryName string) float64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 1)
+	vec.Collect(ch)
+	close(ch)
+
+	for metric := range ch {
+		dto := &dto.Metric{}
+		err := metric.Write(dto)
+		require.NoError(t, err)
+
+		// Check if this metric has the expected repository_name label
+		hasCorrectLabel := false
+		for _, label := range dto.Label {
+			if *label.Name == "repository_name" && *label.Value == repositoryName {
+				hasCorrectLabel = true
+				break
+			}
+		}
+
+		if hasCorrectLabel {
+			if dto.Counter != nil {
+				return *dto.Counter.Value
+			}
+			if dto.Gauge != nil {
+				return *dto.Gauge.Value
+			}
+		}
+	}
+
+	t.Fatalf("Metric with repository_name label '%s' not found", repositoryName)
+	return 0
+}
+
+// Helper function to get histogram count with repository_name label
+func getMaintenanceHistogramCount(t *testing.T, vec *prometheus.HistogramVec, repositoryName string) uint64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 1)
+	vec.Collect(ch)
+	close(ch)
+
+	for metric := range ch {
+		dto := &dto.Metric{}
+		err := metric.Write(dto)
+		require.NoError(t, err)
+
+		// Check if this metric has the expected repository_name label
+		hasCorrectLabel := false
+		for _, label := range dto.Label {
+			if *label.Name == "repository_name" && *label.Value == repositoryName {
+				hasCorrectLabel = true
+				break
+			}
+		}
+
+		if hasCorrectLabel && dto.Histogram != nil {
+			return *dto.Histogram.SampleCount
+		}
+	}
+
+	t.Fatalf("Histogram with repository_name label '%s' not found", repositoryName)
 	return 0
 }

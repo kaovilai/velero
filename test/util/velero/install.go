@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/install"
@@ -56,7 +58,17 @@ type installOptions struct {
 	WorkerOS                         string
 }
 
-func VeleroInstall(ctx context.Context, veleroCfg *test.VeleroConfig, isStandbyCluster bool) error {
+/*
+VeleroInstall is used to install Velero for E2E test
+
+params:
+
+	ctx:              The context
+	veleroCfg:        Velero E2E case configuration
+	isStandbyCluster: Whether Velero is installed on standby cluster
+	objects:          The objects are installed in Velero installed namespace, e.g. the ConfigMaps.
+*/
+func VeleroInstall(ctx context.Context, veleroCfg *test.VeleroConfig, isStandbyCluster bool, objects ...client.Object) error {
 	fmt.Printf("Velero install %s\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	// veleroCfg struct including a set of BSL params and a set of additional BSL params,
@@ -152,6 +164,15 @@ func VeleroInstall(ctx context.Context, veleroCfg *test.VeleroConfig, isStandbyC
 			veleroCfg.VeleroNamespace,
 		)
 	}
+	veleroCfg.BackupRepoConfigMap = test.BackupRepositoryConfigName
+
+	// Install the passed-in objects in Velero installed namespace
+	for _, obj := range objects {
+		if err := veleroCfg.ClientToInstallVelero.Kubebuilder.Create(ctx, obj); err != nil {
+			fmt.Printf("fail to create object %s in namespace %s: %s\n", obj.GetName(), obj.GetNamespace(), err.Error())
+			return fmt.Errorf("fail to create object %s in namespace %s: %w", obj.GetName(), obj.GetNamespace(), err)
+		}
+	}
 
 	// For AWS IRSA credential test, AWS IAM service account is required, so if ServiceAccountName and EKSPolicyARN
 	// are both provided, we assume IRSA test is running, otherwise skip this IAM service account creation part.
@@ -187,10 +208,15 @@ func VeleroInstall(ctx context.Context, veleroCfg *test.VeleroConfig, isStandbyC
 			WorkerOS:                         veleroCfg.WorkerOS,
 		},
 	); err != nil {
-		time.Sleep(1 * time.Minute)
-		RunDebug(context.Background(), veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace, "", "")
+		RunDebug(ctx, veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace, "", "")
 		return errors.WithMessagef(err, "Failed to install Velero in the cluster")
 	}
+
+	if err := CheckBSL(ctx, veleroCfg.VeleroNamespace, common.DefaultBSLName); err != nil {
+		RunDebug(ctx, veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace, "", "")
+		return fmt.Errorf("fail to wait BSL default till ready: %w", err)
+	}
+
 	fmt.Printf("Finish velero install %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	return nil
 }
@@ -286,6 +312,84 @@ func cleanVSpherePluginConfig(c clientset.Interface, ns, secretName, configMapNa
 	return nil
 }
 
+// ValidateVeleroVersion checks if the given version is valid
+// version can be in the format of 'main', 'release-x.y(-dev)', or 'vX.Y(.Z)'
+func ValidateVeleroVersion(version string) error {
+	mainRe := regexp.MustCompile(`^main$`)
+	releaseRe := regexp.MustCompile(`^release-(\d+)\.(\d+)(-dev)?$`)
+	tagRe := regexp.MustCompile(`^v(\d+)\.(\d+)(\.\d+)?$`)
+
+	if mainRe.MatchString(version) || releaseRe.MatchString(version) || tagRe.MatchString(version) {
+		return nil
+	}
+
+	fmt.Println("Invalid Velero version:", version)
+	return fmt.Errorf("invalid Velero version: %s, Velero version must be 'main', 'release-x.y(-dev)', or 'vX.Y.Z'", version)
+}
+
+// VersionNoOlderThan checks if the given version is no older than the targetVersion
+// version can be in the format of 'main', 'release-x.y(-dev)', or 'vX.Y(.Z)'
+// targetVersion must be in the format of 'main', or 'vX.Y.(Z)'
+// return true if version is no older than targetVersion
+func VersionNoOlderThan(version string, targetVersion string) (bool, error) {
+	mainRe := regexp.MustCompile(`^main$`)
+	releaseRe := regexp.MustCompile(`^release-(\d+)\.(\d+)(-dev)?$`)
+	tagRe := regexp.MustCompile(`^v(\d+)\.(\d+)(\.\d+)?$`)
+
+	if err := ValidateVeleroVersion(version); err != nil {
+		return false, err
+	}
+	if !tagRe.MatchString(targetVersion) && !mainRe.MatchString(targetVersion) {
+		fmt.Printf("targetVersion %s is invalid. it must be in the format of 'main', or 'vX.Y.(Z)'.\n", targetVersion)
+		return false, fmt.Errorf("targetVersion is invalid. it must be in the format of 'main', or 'vX.Y.(Z)'.")
+	}
+
+	fmt.Printf("version: %s, targetVersion: %s\n", version, targetVersion)
+
+	switch {
+	case mainRe.MatchString(version):
+		// main is always the latest
+		return true, nil
+
+	case releaseRe.MatchString(version):
+		// release-x.y(-dev) is treated as vX.Y.0
+		matches := releaseRe.FindStringSubmatch(version)
+		major := matches[1]
+		minor := matches[2]
+
+		switch {
+		case mainRe.MatchString(targetVersion):
+			return false, nil
+
+		default:
+			matches := tagRe.FindStringSubmatch(targetVersion)
+			targetMajor := matches[1]
+			targetMinor := matches[2]
+			if major >= targetMajor && minor >= targetMinor {
+				return true, nil
+			} else {
+				return false, nil
+			}
+		}
+
+	case tagRe.MatchString(version):
+		switch {
+		case mainRe.MatchString(targetVersion):
+			return false, nil
+
+		default:
+			if semver.Compare(version, targetVersion) >= 0 {
+				return true, nil
+			} else {
+				return false, nil
+			}
+		}
+	}
+
+	fmt.Printf("Unknown version %s in VersionNoOlderThan\n", version)
+	return false, fmt.Errorf("unknown version in VersionNoOlderThan: %s", version)
+}
+
 func installVeleroServer(
 	ctx context.Context,
 	cli string,
@@ -308,10 +412,12 @@ func installVeleroServer(
 	// TODO: need to consider align options.UseNodeAgentWindows usage
 	// with options.UseNodeAgent
 	// Only version after v1.16.0 support windows node agent.
-	if options.WorkerOS == common.WorkerOSWindows &&
-		(semver.Compare(version, "v1.16") >= 0 || version == "main") {
-		fmt.Println("Install node-agent-windows. The Velero version is ", version)
-		args = append(args, "--use-node-agent-windows")
+	if options.WorkerOS == common.WorkerOSWindows {
+		result, err := VersionNoOlderThan(version, "v1.16")
+		if err == nil && result {
+			fmt.Println("Install node-agent-windows. The Velero version is ", version)
+			args = append(args, "--use-node-agent-windows")
+		}
 	}
 
 	if options.DefaultVolumesToFsBackup {
@@ -418,11 +524,29 @@ func installVeleroServer(
 		args = append(args, "--sa-annotations", options.ServiceAccountAnnotations.String())
 	}
 
+	if options.ServerPriorityClassName != "" {
+		args = append(args, "--server-priority-class-name", options.ServerPriorityClassName)
+	}
+
+	if options.NodeAgentPriorityClassName != "" {
+		args = append(args, "--node-agent-priority-class-name", options.NodeAgentPriorityClassName)
+	}
+
 	// Only version no older than v1.15 support --backup-repository-configmap.
-	if options.BackupRepoConfigMap != "" &&
-		(semver.Compare(version, "v1.15") >= 0 || version == "main") {
-		fmt.Println("Associate backup repository ConfigMap. The Velero version is ", version)
-		args = append(args, fmt.Sprintf("--backup-repository-configmap=%s", options.BackupRepoConfigMap))
+	if options.BackupRepoConfigMap != "" {
+		result, err := VersionNoOlderThan(version, "v1.15")
+		if err == nil && result {
+			fmt.Println("Associate backup repository ConfigMap. The Velero version is ", version)
+			args = append(args, fmt.Sprintf("--backup-repository-configmap=%s", options.BackupRepoConfigMap))
+		}
+	}
+
+	if options.RepoMaintenanceJobConfigMap != "" {
+		args = append(args, fmt.Sprintf("--repo-maintenance-job-configmap=%s", options.RepoMaintenanceJobConfigMap))
+	}
+
+	if options.NodeAgentConfigMap != "" {
+		args = append(args, fmt.Sprintf("--node-agent-configmap=%s", options.NodeAgentConfigMap))
 	}
 
 	if err := createVeleroResources(ctx, cli, namespace, args, options); err != nil {
@@ -614,7 +738,7 @@ func patchResources(resources *unstructured.UnstructuredList, namespace string, 
 				APIVersion: corev1api.SchemeGroupVersion.String(),
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "restic-restore-action-config",
+				Name:      "fs-restore-action-config",
 				Namespace: namespace,
 				Labels: map[string]string{
 					"velero.io/plugin-config":      "",
@@ -631,7 +755,7 @@ func patchResources(resources *unstructured.UnstructuredList, namespace string, 
 			return errors.Wrapf(err, "failed to convert restore action config to unstructure")
 		}
 		resources.Items = append(resources.Items, un)
-		fmt.Printf("the restic restore helper image is set by the configmap %q \n", "restic-restore-action-config")
+		fmt.Printf("the restic restore helper image is set by the configmap %q \n", "fs-restore-action-config")
 	}
 
 	return nil
@@ -738,35 +862,38 @@ func IsVeleroReady(ctx context.Context, veleroCfg *test.VeleroConfig) (bool, err
 		}
 	}
 
-	// Check BSL with poll
-	err = wait.PollUntilContextTimeout(ctx, k8s.PollInterval, time.Minute, true, func(ctx context.Context) (bool, error) {
-		return checkBSL(ctx, veleroCfg) == nil, nil
-	})
-	if err != nil {
-		return false, errors.Wrap(err, "failed to check the bsl")
+	if err := CheckBSL(ctx, namespace, common.DefaultBSLName); err != nil {
+		return false, err
 	}
+
 	return true, nil
 }
 
-func checkBSL(ctx context.Context, veleroCfg *test.VeleroConfig) error {
-	namespace := veleroCfg.VeleroNamespace
-	stdout, stderr, err := velerexec.RunCommand(exec.CommandContext(ctx, "kubectl", "get", "bsl", "default",
-		"-o", "json", "-n", namespace))
-	if err != nil {
-		return errors.Wrapf(err, "failed to get bsl %s stdout=%s, stderr=%s", veleroCfg.BSLBucket, stdout, stderr)
-	} else {
-		bsl := &velerov1api.BackupStorageLocation{}
-		if err = json.Unmarshal([]byte(stdout), bsl); err != nil {
-			return errors.Wrapf(err, "failed to unmarshal the velero bsl")
+func CheckBSL(ctx context.Context, ns string, bslName string) error {
+	// Check BSL with poll
+	err := wait.PollUntilContextTimeout(ctx, k8s.PollInterval, time.Minute, true, func(ctx context.Context) (bool, error) {
+		stdout, stderr, err := velerexec.RunCommand(exec.CommandContext(ctx, "kubectl", "get", "bsl", bslName,
+			"-o", "json", "-n", ns))
+		if err != nil {
+			return false, errors.Wrapf(err, "failed to get bsl %s stdout=%s, stderr=%s", bslName, stdout, stderr)
+		} else {
+			bsl := &velerov1api.BackupStorageLocation{}
+			if err = json.Unmarshal([]byte(stdout), bsl); err != nil {
+				return false, errors.Wrapf(err, "failed to unmarshal the velero bsl")
+			}
+			if bsl.Status.Phase != velerov1api.BackupStorageLocationPhaseAvailable {
+				// BSL is not ready. Continue polling till timeout.
+				return false, nil
+			}
 		}
-		if bsl.Status.Phase != velerov1api.BackupStorageLocationPhaseAvailable {
-			return fmt.Errorf("current bsl %s is not available", veleroCfg.BSLBucket)
-		}
-	}
-	return nil
+
+		return true, nil
+	})
+
+	return err
 }
 
-func PrepareVelero(ctx context.Context, caseName string, veleroCfg test.VeleroConfig) error {
+func PrepareVelero(ctx context.Context, caseName string, veleroCfg test.VeleroConfig, objects ...client.Object) error {
 	ready, err := IsVeleroReady(context.Background(), &veleroCfg)
 	if err != nil {
 		fmt.Printf("error in checking velero status with %v", err)
@@ -780,7 +907,7 @@ func PrepareVelero(ctx context.Context, caseName string, veleroCfg test.VeleroCo
 		return nil
 	}
 	fmt.Printf("need to install velero for case %s \n", caseName)
-	return VeleroInstall(context.Background(), &veleroCfg, false)
+	return VeleroInstall(context.Background(), &veleroCfg, false, objects...)
 }
 
 func VeleroUninstall(ctx context.Context, veleroCfg test.VeleroConfig) error {

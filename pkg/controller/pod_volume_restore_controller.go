@@ -48,46 +48,78 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/datapath"
 	"github.com/vmware-tanzu/velero/pkg/exposer"
 	"github.com/vmware-tanzu/velero/pkg/nodeagent"
+	repository "github.com/vmware-tanzu/velero/pkg/repository/manager"
 	"github.com/vmware-tanzu/velero/pkg/restorehelper"
+	velerotypes "github.com/vmware-tanzu/velero/pkg/types"
 	"github.com/vmware-tanzu/velero/pkg/uploader"
 	"github.com/vmware-tanzu/velero/pkg/util"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
-func NewPodVolumeRestoreReconciler(client client.Client, mgr manager.Manager, kubeClient kubernetes.Interface, dataPathMgr *datapath.Manager,
-	counter *exposer.VgdpCounter, nodeName string, preparingTimeout time.Duration, resourceTimeout time.Duration, podResources corev1api.ResourceRequirements,
-	logger logrus.FieldLogger) *PodVolumeRestoreReconciler {
+func NewPodVolumeRestoreReconciler(
+	client client.Client,
+	mgr manager.Manager,
+	kubeClient kubernetes.Interface,
+	dataPathMgr *datapath.Manager,
+	counter *exposer.VgdpCounter,
+	nodeName string,
+	preparingTimeout time.Duration,
+	resourceTimeout time.Duration,
+	backupRepoConfigs map[string]string,
+	cacheVolumeConfigs *velerotypes.CachePVC,
+	podResources corev1api.ResourceRequirements,
+	logger logrus.FieldLogger,
+	dataMovePriorityClass string,
+	privileged bool,
+	repoConfigMgr repository.ConfigManager,
+	podLabels map[string]string,
+	podAnnotations map[string]string,
+) *PodVolumeRestoreReconciler {
 	return &PodVolumeRestoreReconciler{
-		client:           client,
-		mgr:              mgr,
-		kubeClient:       kubeClient,
-		logger:           logger.WithField("controller", "PodVolumeRestore"),
-		nodeName:         nodeName,
-		clock:            &clocks.RealClock{},
-		podResources:     podResources,
-		dataPathMgr:      dataPathMgr,
-		vgdpCounter:      counter,
-		preparingTimeout: preparingTimeout,
-		resourceTimeout:  resourceTimeout,
-		exposer:          exposer.NewPodVolumeExposer(kubeClient, logger),
-		cancelledPVR:     make(map[string]time.Time),
+		client:                client,
+		mgr:                   mgr,
+		kubeClient:            kubeClient,
+		logger:                logger.WithField("controller", "PodVolumeRestore"),
+		nodeName:              nodeName,
+		clock:                 &clocks.RealClock{},
+		podResources:          podResources,
+		backupRepoConfigs:     backupRepoConfigs,
+		cacheVolumeConfigs:    cacheVolumeConfigs,
+		dataPathMgr:           dataPathMgr,
+		vgdpCounter:           counter,
+		preparingTimeout:      preparingTimeout,
+		resourceTimeout:       resourceTimeout,
+		exposer:               exposer.NewPodVolumeExposer(kubeClient, logger),
+		cancelledPVR:          make(map[string]time.Time),
+		dataMovePriorityClass: dataMovePriorityClass,
+		privileged:            privileged,
+		repoConfigMgr:         repoConfigMgr,
+		podLabels:             podLabels,
+		podAnnotations:        podAnnotations,
 	}
 }
 
 type PodVolumeRestoreReconciler struct {
-	client           client.Client
-	mgr              manager.Manager
-	kubeClient       kubernetes.Interface
-	logger           logrus.FieldLogger
-	nodeName         string
-	clock            clocks.WithTickerAndDelayedExecution
-	podResources     corev1api.ResourceRequirements
-	exposer          exposer.PodVolumeExposer
-	dataPathMgr      *datapath.Manager
-	vgdpCounter      *exposer.VgdpCounter
-	preparingTimeout time.Duration
-	resourceTimeout  time.Duration
-	cancelledPVR     map[string]time.Time
+	client                client.Client
+	mgr                   manager.Manager
+	kubeClient            kubernetes.Interface
+	logger                logrus.FieldLogger
+	nodeName              string
+	clock                 clocks.WithTickerAndDelayedExecution
+	podResources          corev1api.ResourceRequirements
+	backupRepoConfigs     map[string]string
+	cacheVolumeConfigs    *velerotypes.CachePVC
+	exposer               exposer.PodVolumeExposer
+	dataPathMgr           *datapath.Manager
+	vgdpCounter           *exposer.VgdpCounter
+	preparingTimeout      time.Duration
+	resourceTimeout       time.Duration
+	cancelledPVR          map[string]time.Time
+	dataMovePriorityClass string
+	privileged            bool
+	repoConfigMgr         repository.ConfigManager
+	podLabels             map[string]string
+	podAnnotations        map[string]string
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=podvolumerestores,verbs=get;list;watch;create;update;patch;delete
@@ -242,6 +274,12 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	} else if pvr.Status.Phase == velerov1api.PodVolumeRestorePhaseAccepted {
 		if peekErr := r.exposer.PeekExposed(ctx, getPVROwnerObject(pvr)); peekErr != nil {
 			log.Errorf("Cancel PVR %s/%s because of expose error %s", pvr.Namespace, pvr.Name, peekErr)
+
+			diags := strings.Split(r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr)), "\n")
+			for _, diag := range diags {
+				log.Warnf("[Diagnose PVR expose]%s", diag)
+			}
+
 			_ = r.tryCancelPodVolumeRestore(ctx, pvr, fmt.Sprintf("found a PVR %s/%s with expose error: %s. mark it as cancel", pvr.Namespace, pvr.Name, peekErr))
 		} else if pvr.Status.AcceptedTimestamp != nil {
 			if time.Since(pvr.Status.AcceptedTimestamp.Time) >= r.preparingTimeout {
@@ -565,7 +603,7 @@ func (r *PodVolumeRestoreReconciler) closeDataPath(ctx context.Context, pvrName 
 func (r *PodVolumeRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	gp := kube.NewGenericEventPredicate(func(object client.Object) bool {
 		pvr := object.(*velerov1api.PodVolumeRestore)
-		if IsLegacyPVR(pvr) {
+		if _, err := uploader.ValidateUploaderType(pvr.Spec.UploaderType); err != nil {
 			return false
 		}
 
@@ -590,7 +628,8 @@ func (r *PodVolumeRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	pred := kube.NewAllEventPredicate(func(obj client.Object) bool {
 		pvr := obj.(*velerov1api.PodVolumeRestore)
-		return !IsLegacyPVR(pvr)
+		_, err := uploader.ValidateUploaderType(pvr.Spec.UploaderType)
+		return err == nil
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -640,7 +679,7 @@ func (r *PodVolumeRestoreReconciler) findPVRForTargetPod(ctx context.Context, po
 
 	requests := []reconcile.Request{}
 	for _, item := range list.Items {
-		if IsLegacyPVR(&item) {
+		if _, err := uploader.ValidateUploaderType(item.Spec.UploaderType); err != nil {
 			continue
 		}
 
@@ -669,6 +708,11 @@ func (r *PodVolumeRestoreReconciler) findPVRForRestorePod(ctx context.Context, p
 	log = log.WithFields(logrus.Fields{
 		"PVR": pvr.Name,
 	})
+
+	if _, err := uploader.ValidateUploaderType(pvr.Spec.UploaderType); err != nil {
+		log.WithField("uploaderType", pvr.Spec.UploaderType).Debug("skip PVR with invalid uploader type")
+		return []reconcile.Request{}
+	}
 
 	if pvr.Status.Phase != velerov1api.PodVolumeRestorePhaseAccepted {
 		return []reconcile.Request{}
@@ -850,24 +894,36 @@ func (r *PodVolumeRestoreReconciler) setupExposeParam(pvr *velerov1api.PodVolume
 	}
 
 	hostingPodLabels := map[string]string{velerov1api.PVRLabel: pvr.Name}
-	for _, k := range util.ThirdPartyLabels {
-		if v, err := nodeagent.GetLabelValue(context.Background(), r.kubeClient, pvr.Namespace, k, nodeOS); err != nil {
-			if err != nodeagent.ErrNodeAgentLabelNotFound {
-				log.WithError(err).Warnf("Failed to check node-agent label, skip adding host pod label %s", k)
-			}
-		} else {
+	if len(r.podLabels) > 0 {
+		for k, v := range r.podLabels {
 			hostingPodLabels[k] = v
+		}
+	} else {
+		for _, k := range util.ThirdPartyLabels {
+			if v, err := nodeagent.GetLabelValue(context.Background(), r.kubeClient, pvr.Namespace, k, nodeOS); err != nil {
+				if err != nodeagent.ErrNodeAgentLabelNotFound {
+					log.WithError(err).Warnf("Failed to check node-agent label, skip adding host pod label %s", k)
+				}
+			} else {
+				hostingPodLabels[k] = v
+			}
 		}
 	}
 
 	hostingPodAnnotation := map[string]string{}
-	for _, k := range util.ThirdPartyAnnotations {
-		if v, err := nodeagent.GetAnnotationValue(context.Background(), r.kubeClient, pvr.Namespace, k, nodeOS); err != nil {
-			if err != nodeagent.ErrNodeAgentAnnotationNotFound {
-				log.WithError(err).Warnf("Failed to check node-agent annotation, skip adding host pod annotation %s", k)
-			}
-		} else {
+	if len(r.podAnnotations) > 0 {
+		for k, v := range r.podAnnotations {
 			hostingPodAnnotation[k] = v
+		}
+	} else {
+		for _, k := range util.ThirdPartyAnnotations {
+			if v, err := nodeagent.GetAnnotationValue(context.Background(), r.kubeClient, pvr.Namespace, k, nodeOS); err != nil {
+				if err != nodeagent.ErrNodeAgentAnnotationNotFound {
+					log.WithError(err).Warnf("Failed to check node-agent annotation, skip adding host pod annotation %s", k)
+				}
+			} else {
+				hostingPodAnnotation[k] = v
+			}
 		}
 	}
 
@@ -882,6 +938,19 @@ func (r *PodVolumeRestoreReconciler) setupExposeParam(pvr *velerov1api.PodVolume
 		}
 	}
 
+	var cacheVolume *exposer.CacheConfigs
+	if r.cacheVolumeConfigs != nil {
+		if limit, err := r.repoConfigMgr.ClientSideCacheLimit(velerov1api.BackupRepositoryTypeKopia, r.backupRepoConfigs); err != nil {
+			log.WithError(err).Warnf("Failed to get client side cache limit for repo type %s from configs %v", velerov1api.BackupRepositoryTypeKopia, r.backupRepoConfigs)
+		} else {
+			cacheVolume = &exposer.CacheConfigs{
+				Limit:             limit,
+				StorageClass:      r.cacheVolumeConfigs.StorageClass,
+				ResidentThreshold: r.cacheVolumeConfigs.ResidentThresholdInMB << 20,
+			}
+		}
+	}
+
 	return exposer.PodVolumeExposeParam{
 		Type:                  exposer.PodVolumeExposeTypeRestore,
 		ClientNamespace:       pvr.Spec.Pod.Namespace,
@@ -892,6 +961,11 @@ func (r *PodVolumeRestoreReconciler) setupExposeParam(pvr *velerov1api.PodVolume
 		HostingPodTolerations: hostingPodTolerations,
 		OperationTimeout:      r.resourceTimeout,
 		Resources:             r.podResources,
+		RestoreSize:           pvr.Spec.SnapshotSize,
+		CacheVolume:           cacheVolume,
+		// Priority class name for the data mover pod, retrieved from node-agent-configmap
+		PriorityClassName: r.dataMovePriorityClass,
+		Privileged:        r.privileged,
 	}
 }
 
@@ -961,7 +1035,7 @@ func (r *PodVolumeRestoreReconciler) AttemptPVRResume(ctx context.Context, logge
 
 	for i := range pvrs.Items {
 		pvr := &pvrs.Items[i]
-		if IsLegacyPVR(pvr) {
+		if _, err := uploader.ValidateUploaderType(pvr.Spec.UploaderType); err != nil {
 			continue
 		}
 

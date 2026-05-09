@@ -16,7 +16,6 @@ import (
 	podvolumeconfigs "github.com/vmware-tanzu/velero/pkg/podvolume/configs"
 	"github.com/vmware-tanzu/velero/pkg/types"
 	"github.com/vmware-tanzu/velero/pkg/uploader"
-	"github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/logging"
 )
 
@@ -47,18 +46,14 @@ const (
 	defaultMaxConcurrentK8SConnections = 30
 	defaultDisableInformerCache        = false
 
-	DefaultKeepLatestMaintenanceJobs = 3
-	DefaultMaintenanceJobCPURequest  = "0"
-	DefaultMaintenanceJobCPULimit    = "0"
-	DefaultMaintenanceJobMemRequest  = "0"
-	DefaultMaintenanceJobMemLimit    = "0"
-
 	DefaultItemBlockWorkerCount = 1
+	DefaultConcurrentBackups    = 1
 )
 
 var (
 	// DisableableControllers is a list of controllers that can be disabled
 	DisableableControllers = []string{
+		constant.ControllerBackupQueue,
 		constant.ControllerBackup,
 		constant.ControllerBackupOperations,
 		constant.ControllerBackupDeletion,
@@ -120,10 +115,15 @@ var (
 			"datauploads.velero.io",
 			"persistentvolumes",
 			"persistentvolumeclaims",
+			"clusterroles",
+			"roles",
 			"serviceaccounts",
+			"clusterrolebindings",
+			"rolebindings",
 			"secrets",
 			"configmaps",
 			"limitranges",
+			"priorityclasses",
 			"pods",
 			// we fully qualify replicasets.apps because prior to Kubernetes 1.16, replicasets also
 			// existed in the extensions API group, but we back up replicasets from "apps" so we want
@@ -179,9 +179,8 @@ type Config struct {
 	CredentialsDirectory           string
 	BackupRepoConfig               string
 	RepoMaintenanceJobConfig       string
-	PodResources                   kube.PodResources
-	KeepLatestMaintenanceJobs      int
 	ItemBlockWorkerCount           int
+	ConcurrentBackups              int
 }
 
 func GetDefaultConfig() *Config {
@@ -213,14 +212,8 @@ func GetDefaultConfig() *Config {
 		DisableInformerCache:           defaultDisableInformerCache,
 		ScheduleSkipImmediately:        false,
 		CredentialsDirectory:           credentials.DefaultStoreDirectory(),
-		PodResources: kube.PodResources{
-			CPURequest:    DefaultMaintenanceJobCPULimit,
-			CPULimit:      DefaultMaintenanceJobCPURequest,
-			MemoryRequest: DefaultMaintenanceJobMemRequest,
-			MemoryLimit:   DefaultMaintenanceJobMemLimit,
-		},
-		KeepLatestMaintenanceJobs: DefaultKeepLatestMaintenanceJobs,
-		ItemBlockWorkerCount:      DefaultItemBlockWorkerCount,
+		ItemBlockWorkerCount:           DefaultItemBlockWorkerCount,
+		ConcurrentBackups:              DefaultConcurrentBackups,
 	}
 
 	return config
@@ -258,36 +251,6 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&c.ScheduleSkipImmediately, "schedule-skip-immediately", c.ScheduleSkipImmediately, "Skip the first scheduled backup immediately after creating a schedule. Default is false (don't skip).")
 	flags.Var(&c.DefaultVolumeSnapshotLocations, "default-volume-snapshot-locations", "List of unique volume providers and default volume snapshot location (provider1:location-01,provider2:location-02,...)")
 
-	flags.IntVar(
-		&c.KeepLatestMaintenanceJobs,
-		"keep-latest-maintenance-jobs",
-		c.KeepLatestMaintenanceJobs,
-		"Number of latest maintenance jobs to keep each repository. Optional.",
-	)
-	flags.StringVar(
-		&c.PodResources.CPURequest,
-		"maintenance-job-cpu-request",
-		c.PodResources.CPURequest,
-		"CPU request for maintenance job. Default is no limit.",
-	)
-	flags.StringVar(
-		&c.PodResources.MemoryRequest,
-		"maintenance-job-mem-request",
-		c.PodResources.MemoryRequest,
-		"Memory request for maintenance job. Default is no limit.",
-	)
-	flags.StringVar(
-		&c.PodResources.CPULimit,
-		"maintenance-job-cpu-limit",
-		c.PodResources.CPULimit,
-		"CPU limit for maintenance job. Default is no limit.",
-	)
-	flags.StringVar(
-		&c.PodResources.MemoryLimit,
-		"maintenance-job-mem-limit",
-		c.PodResources.MemoryLimit,
-		"Memory limit for maintenance job. Default is no limit.",
-	)
 	flags.StringVar(
 		&c.BackupRepoConfig,
 		"backup-repository-configmap",
@@ -305,5 +268,11 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 		"item-block-worker-count",
 		c.ItemBlockWorkerCount,
 		"Number of worker threads to process ItemBlocks. Default is one. Optional.",
+	)
+	flags.IntVar(
+		&c.ConcurrentBackups,
+		"concurrent-backups",
+		c.ConcurrentBackups,
+		"Number of backups to process concurrently. Default is one. Optional.",
 	)
 }

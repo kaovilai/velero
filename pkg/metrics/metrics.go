@@ -27,6 +27,11 @@ type ServerMetrics struct {
 	metrics map[string]prometheus.Collector
 }
 
+// Metrics returns the metrics map for testing purposes.
+func (m *ServerMetrics) Metrics() map[string]prometheus.Collector {
+	return m.metrics
+}
+
 const (
 	metricNamespace           = "velero"
 	podVolumeMetricsNamespace = "podVolume"
@@ -75,6 +80,17 @@ const (
 	DataDownloadFailureTotal = "data_download_failure_total"
 	DataDownloadCancelTotal  = "data_download_cancel_total"
 
+	// schedule metrics
+	scheduleExpectedIntervalSeconds = "schedule_expected_interval_seconds"
+
+	// repo maintenance metrics
+	repoMaintenanceSuccessTotal = "repo_maintenance_success_total"
+	repoMaintenanceFailureTotal = "repo_maintenance_failure_total"
+	// repoMaintenanceDurationSeconds tracks the distribution of maintenance job durations.
+	// Each completed job's duration is recorded in the appropriate bucket, allowing
+	// analysis of individual job performance and trending over time.
+	repoMaintenanceDurationSeconds = "repo_maintenance_duration_seconds"
+
 	// Labels
 	nodeMetricLabel         = "node"
 	podVolumeOperationLabel = "operation"
@@ -82,6 +98,7 @@ const (
 	pvbNameLabel            = "pod_volume_backup"
 	scheduleLabel           = "schedule"
 	backupNameLabel         = "backupName"
+	repositoryNameLabel     = "repository_name"
 
 	// metrics values
 	BackupLastStatusSucc    int64 = 1
@@ -332,6 +349,49 @@ func NewServerMetrics() *ServerMetrics {
 					Help:      "Total number of CSI failed volume snapshots",
 				},
 				[]string{scheduleLabel, backupNameLabel},
+			),
+			scheduleExpectedIntervalSeconds: prometheus.NewGaugeVec(
+				prometheus.GaugeOpts{
+					Namespace: metricNamespace,
+					Name:      scheduleExpectedIntervalSeconds,
+					Help:      "Expected interval between consecutive scheduled backups, in seconds",
+				},
+				[]string{scheduleLabel},
+			),
+			repoMaintenanceSuccessTotal: prometheus.NewCounterVec(
+				prometheus.CounterOpts{
+					Namespace: metricNamespace,
+					Name:      repoMaintenanceSuccessTotal,
+					Help:      "Total number of successful repo maintenance jobs",
+				},
+				[]string{repositoryNameLabel},
+			),
+			repoMaintenanceFailureTotal: prometheus.NewCounterVec(
+				prometheus.CounterOpts{
+					Namespace: metricNamespace,
+					Name:      repoMaintenanceFailureTotal,
+					Help:      "Total number of failed repo maintenance jobs",
+				},
+				[]string{repositoryNameLabel},
+			),
+			repoMaintenanceDurationSeconds: prometheus.NewHistogramVec(
+				prometheus.HistogramOpts{
+					Namespace: metricNamespace,
+					Name:      repoMaintenanceDurationSeconds,
+					Help:      "Time taken to complete repo maintenance jobs, in seconds",
+					Buckets: []float64{
+						toSeconds(1 * time.Minute),
+						toSeconds(5 * time.Minute),
+						toSeconds(10 * time.Minute),
+						toSeconds(15 * time.Minute),
+						toSeconds(30 * time.Minute),
+						toSeconds(1 * time.Hour),
+						toSeconds(2 * time.Hour),
+						toSeconds(3 * time.Hour),
+						toSeconds(4 * time.Hour),
+					},
+				},
+				[]string{repositoryNameLabel},
 			),
 		},
 	}
@@ -595,6 +655,9 @@ func (m *ServerMetrics) RemoveSchedule(scheduleName string) {
 	if c, ok := m.metrics[csiSnapshotFailureTotal].(*prometheus.CounterVec); ok {
 		c.DeleteLabelValues(scheduleName, "")
 	}
+	if g, ok := m.metrics[scheduleExpectedIntervalSeconds].(*prometheus.GaugeVec); ok {
+		g.DeleteLabelValues(scheduleName)
+	}
 }
 
 // InitMetricsForNode initializes counter metrics for a node.
@@ -706,6 +769,14 @@ func (m *ServerMetrics) SetBackupTarballSizeBytesGauge(backupSchedule string, si
 func (m *ServerMetrics) SetBackupLastSuccessfulTimestamp(backupSchedule string, time time.Time) {
 	if g, ok := m.metrics[backupLastSuccessfulTimestamp].(*prometheus.GaugeVec); ok {
 		g.WithLabelValues(backupSchedule).Set(float64(time.Unix()))
+	}
+}
+
+// SetScheduleExpectedIntervalSeconds records the expected interval in seconds,
+// between consecutive backups for a schedule.
+func (m *ServerMetrics) SetScheduleExpectedIntervalSeconds(scheduleName string, seconds float64) {
+	if g, ok := m.metrics[scheduleExpectedIntervalSeconds].(*prometheus.GaugeVec); ok {
+		g.WithLabelValues(scheduleName).Set(seconds)
 	}
 }
 
@@ -910,5 +981,26 @@ func (m *ServerMetrics) RegisterBackupLocationAvailable(backupLocationName strin
 func (m *ServerMetrics) RegisterBackupLocationUnavailable(backupLocationName string) {
 	if g, ok := m.metrics[backupLocationStatus].(*prometheus.GaugeVec); ok {
 		g.WithLabelValues(backupLocationName).Set(float64(0))
+	}
+}
+
+// RegisterRepoMaintenanceSuccess records a successful repo maintenance job.
+func (m *ServerMetrics) RegisterRepoMaintenanceSuccess(repositoryName string) {
+	if c, ok := m.metrics[repoMaintenanceSuccessTotal].(*prometheus.CounterVec); ok {
+		c.WithLabelValues(repositoryName).Inc()
+	}
+}
+
+// RegisterRepoMaintenanceFailure records a failed repo maintenance job.
+func (m *ServerMetrics) RegisterRepoMaintenanceFailure(repositoryName string) {
+	if c, ok := m.metrics[repoMaintenanceFailureTotal].(*prometheus.CounterVec); ok {
+		c.WithLabelValues(repositoryName).Inc()
+	}
+}
+
+// ObserveRepoMaintenanceDuration records the number of seconds a repo maintenance job took.
+func (m *ServerMetrics) ObserveRepoMaintenanceDuration(repositoryName string, seconds float64) {
+	if h, ok := m.metrics[repoMaintenanceDurationSeconds].(*prometheus.HistogramVec); ok {
+		h.WithLabelValues(repositoryName).Observe(seconds)
 	}
 }

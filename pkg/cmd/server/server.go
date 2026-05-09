@@ -26,9 +26,8 @@ import (
 	"strings"
 	"time"
 
-	volumegroupsnapshotv1beta1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1beta1"
-
 	logrusr "github.com/bombsimon/logrusr/v3"
+	volumegroupsnapshotv1beta2 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1beta2"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -83,6 +82,7 @@ import (
 	repokey "github.com/vmware-tanzu/velero/pkg/repository/keys"
 	repomanager "github.com/vmware-tanzu/velero/pkg/repository/manager"
 	"github.com/vmware-tanzu/velero/pkg/restore"
+	velerotypes "github.com/vmware-tanzu/velero/pkg/types"
 	"github.com/vmware-tanzu/velero/pkg/uploader"
 	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
@@ -209,6 +209,21 @@ func newServer(f client.Factory, config *config.Config, logger *logrus.Logger) (
 	// Therefore, we must explicitly call it on the error paths in this function.
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
+	if len(config.BackupRepoConfig) > 0 {
+		repoConfig := make(map[string]any)
+		if err := kube.VerifyJSONConfigs(ctx, f.Namespace(), crClient, config.BackupRepoConfig, &repoConfig); err != nil {
+			cancelFunc()
+			return nil, err
+		}
+	}
+
+	if len(config.RepoMaintenanceJobConfig) > 0 {
+		if err := kube.VerifyJSONConfigs(ctx, f.Namespace(), crClient, config.RepoMaintenanceJobConfig, &velerotypes.JobConfigs{}); err != nil {
+			cancelFunc()
+			return nil, err
+		}
+	}
+
 	clientConfig, err := f.ClientConfig()
 	if err != nil {
 		cancelFunc()
@@ -232,7 +247,7 @@ func newServer(f client.Factory, config *config.Config, logger *logrus.Logger) (
 		cancelFunc()
 		return nil, err
 	}
-	if err := volumegroupsnapshotv1beta1.AddToScheme(scheme); err != nil {
+	if err := volumegroupsnapshotv1beta2.AddToScheme(scheme); err != nil {
 		cancelFunc()
 		return nil, err
 	}
@@ -543,7 +558,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		return clientmgmt.NewManager(logger, s.logLevel, s.pluginRegistry)
 	}
 
-	backupStoreGetter := persistence.NewObjectBackupStoreGetter(s.credentialFileStore)
+	backupStoreGetter := persistence.NewObjectBackupStoreGetterWithSecretStore(s.credentialFileStore, s.credentialSecretStore)
 
 	backupTracker := controller.NewBackupTracker()
 
@@ -566,6 +581,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		constant.ControllerSchedule:            {},
 		constant.ControllerServerStatusRequest: {},
 		constant.ControllerRestoreFinalizer:    {},
+		constant.ControllerBackupQueue:         {},
 	}
 
 	if s.config.RestoreOnly {
@@ -653,6 +669,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.config.MaxConcurrentK8SConnections,
 			s.config.DefaultSnapshotMoveData,
 			s.config.ItemBlockWorkerCount,
+			s.config.ConcurrentBackups,
 			s.crClient,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackup)
@@ -738,11 +755,10 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.repoManager,
 			s.config.RepoMaintenanceFrequency,
 			s.config.BackupRepoConfig,
-			s.config.KeepLatestMaintenanceJobs,
 			s.config.RepoMaintenanceJobConfig,
-			s.config.PodResources,
 			s.logLevel,
 			s.config.LogFormat,
+			s.metrics,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackupRepo)
 		}
@@ -893,6 +909,18 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.config.ResourceTimeout,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerRestoreFinalizer)
+		}
+	}
+
+	if _, ok := enabledRuntimeControllers[constant.ControllerBackupQueue]; ok {
+		if err := controller.NewBackupQueueReconciler(
+			s.mgr.GetClient(),
+			s.mgr.GetScheme(),
+			s.logger,
+			s.config.ConcurrentBackups,
+			backupTracker,
+		).SetupWithManager(s.mgr); err != nil {
+			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackupQueue)
 		}
 	}
 
@@ -1136,8 +1164,8 @@ func markPodVolumeRestoresCancel(ctx context.Context, client ctrlclient.Client, 
 
 	for i := range pvrs.Items {
 		pvr := pvrs.Items[i]
-		if controller.IsLegacyPVR(&pvr) {
-			log.WithField("PVR", pvr.GetName()).Warn("Found a legacy PVR during velero server restart, cannot stop it")
+		if _, err := uploader.ValidateUploaderType(pvr.Spec.UploaderType); err != nil {
+			log.WithField("PVR", pvr.Name).Warnf("invalid uploader type %s, skip marking cancel for this PVR", pvr.Spec.UploaderType)
 			continue
 		}
 

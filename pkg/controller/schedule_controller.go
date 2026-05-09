@@ -129,6 +129,13 @@ func (c *scheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	} else {
 		schedule.Status.Phase = velerov1.SchedulePhaseEnabled
 		schedule.Status.ValidationErrors = nil
+
+		// Compute expected interval between consecutive scheduled backup runs.
+		// Only meaningful when the cron expression is valid.
+		now := c.clock.Now()
+		nextRun := cronSchedule.Next(now)
+		nextNextRun := cronSchedule.Next(nextRun)
+		c.metrics.SetScheduleExpectedIntervalSeconds(schedule.Name, nextNextRun.Sub(nextRun).Seconds())
 	}
 
 	scheduleNeedsPatch := false
@@ -229,7 +236,7 @@ func (c *scheduleReconciler) checkIfBackupInNewOrProgress(schedule *velerov1.Sch
 	}
 
 	for _, backup := range backupList.Items {
-		if backup.Status.Phase == velerov1.BackupPhaseNew || backup.Status.Phase == velerov1.BackupPhaseInProgress {
+		if backup.Status.Phase == "" || backup.Status.Phase == velerov1.BackupPhaseNew || backup.Status.Phase == velerov1.BackupPhaseInProgress {
 			log.Debugf("%s/%s still has backups that are in InProgress or New...", schedule.Namespace, schedule.Name)
 			return true
 		}
