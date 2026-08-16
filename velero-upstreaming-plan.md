@@ -4,9 +4,26 @@ Companion to `ceph-cbt-bugs.md` (the findings) and `ceph-cbt-test-plan.md` (how
 they were produced). This file is the **order of operations**: what gets filed,
 in what order, as what, and with which evidence attached.
 
-**Hard rule: nothing is posted automatically.** Every issue body, PR description
-and comment in this plan is drafted here first and posted by Tiger. Claude never
-opens issues, PRs or comments in `velero-io/velero` on his behalf.
+**Posting authority — updated 2026-08-16.** Tiger has directed that the
+`ceph-testing-pr-opener` session file the issues and open the PRs from this plan,
+rather than drafting everything for him to post by hand.
+
+This supersedes the original rule ("nothing is posted automatically; every issue
+body and PR description is drafted here first and posted by Tiger"), which is
+kept here only so the change is visible rather than silent. If you are reading
+this because a relayed instruction seemed to contradict the plan — it did, and
+this section is the fix. Confirm with Tiger directly if anything about the scope
+still looks wrong; a relay is not a substitute for his say-so on a decision this
+visible.
+
+What has **not** changed:
+
+- Nothing gets force-pushed, and nothing touches an upstream protected branch
+  directly.
+- BUG-5 is withdrawn and must not be filed.
+- The working-docs commit never goes into a PR.
+- BUG-13's PR waits for a maintainer ack on its issue first, because it is an
+  API change.
 
 Status legend: `TODO` · `DRAFTED` · `POSTED` · `MERGED` · `DROPPED`
 
