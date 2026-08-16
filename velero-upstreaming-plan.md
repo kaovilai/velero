@@ -35,6 +35,48 @@ Status legend: `TODO` · `DRAFTED` · `POSTED` · `MERGED` · `DROPPED`
 
 ---
 
+## 0.5 Delegation brief — where the work already is
+
+The fixes are done, validated live, and pushed. Filing is what remains.
+
+```
+git fetch origin && git log --oneline origin/ceph-changeid    # fork: kaovilai/velero
+```
+
+| Commit | Finding | Files |
+|---|---|---|
+| `f4867d048` | BUG-4 + GAP-6 | `pkg/exposer/csi_snapshot.go` (+test) |
+| `9d6c5da7a` | BUG-14 | `pkg/uploader/provider/block.go` (+test) |
+| `bc24d763a` | BUG-9 **+ BUG-10** | `pkg/uploader/cbt/set.go`, `pkg/uploader/block/snapshot.go` (+tests) |
+| `6c7aa9d58` | BUG-13 | API types, deepcopy, controllers, describers (+tests) |
+| `ed998fefe` | working docs | **never include in a PR** |
+
+**`bc24d763a` must be split.** BUG-9 and BUG-10 share
+`pkg/uploader/block/snapshot.go`, so they are committed together. BUG-10 is just
+the `parentID` local in `getParentBackupInfo`, the six log call sites using it,
+and `TestGetParentBackupInfoLogsDiscoveredParentID`. Everything else in that
+commit is BUG-9.
+
+### Issue linkage
+
+- **Ceph-specific findings (GAP-6, BUG-11) are filed as sub-issues of
+  [#9714](https://github.com/velero-io/velero/issues/9714)**, which is the parent
+  tracking issue for Ceph changeID/CBT. Use GitHub's sub-issue relationship, not
+  just a text cross-reference, so they roll up under it.
+- **Driver-agnostic findings get their own standalone issues** and merely
+  *mention* #9714 as where they were found. Filing them under the Ceph parent
+  would get them triaged as a vendor problem — see §1.5. This applies to BUG-4
+  (a non-vSphere bug), BUG-9, BUG-10, BUG-12, BUG-13, BUG-14 and GAP-15.
+
+### Wording every issue needs
+
+State the environment honestly: *validated against upstream ceph-csi CBT
+components (hand-applied v1beta1 CRD + upstream sidecar v1.1.0) on ODF-provided
+Ceph storage*. Not "validated on ODF" — ODF ships a v1alpha1-generation sidecar
+and its own build was never exercised (§1.6).
+
+---
+
 ## 1. Finding inventory, scope and disposition
 
 Fixed locally = a patch exists in this worktree, validated live on cluster
@@ -52,7 +94,7 @@ Fixed locally = a patch exists in this worktree, validated live on cluster
 | # | Finding | Scope | Fixed | Disposition |
 |---|---------|-------|-------|-------------|
 | BUG-4 | Generic changeID retrieval always empty | **non-vSphere** | ✅ | Raise in #9714 (found there) but **file/frame as a general non-vSphere CSI bug**, not Ceph-specific + PR |
-| GAP-6 | Snapshot retention (Case 2) unimplemented | **Ceph/Case-2** | ✅ | Genuinely #9714 territory. Same PR as BUG-4 (same file) |
+| GAP-6 | Snapshot retention (Case 2) unimplemented | **Ceph/Case-2** | ✅ | **Sub-issue of #9714** (genuinely Ceph territory). Same PR as BUG-4 (same file) |
 | BUG-9 | CBT failure falls back to whole-device | **all drivers** | ✅ | New issue + PR. Explicitly *not* a Ceph bug |
 | BUG-10 | Parent-snapshot log lines print an empty ID | **all drivers** | ✅ | New issue (or PR-only) + PR |
 | BUG-13 | Measured zero-delta unrepresentable | **all drivers**, wider than block | ✅ | New issue first, get ack, then PR (API change) |
@@ -64,7 +106,7 @@ Fixed locally = a patch exists in this worktree, validated live on cluster
 | GAP-15 | Data mover pod loss wedges the DataUpload in `InProgress` | **all drivers** | ❌ | New issue. Design question (pod liveness watch vs data-movement timeout) — raise before coding |
 | GAP-7 | Restored pods carry stale CNI annotations | not storage (OVN) | ❌ | **Comment on existing fix #10098** — do not file new |
 | GAP-8 | `maintenanceFrequency` cannot trigger kopia blob GC | not storage | ❌ | New issue |
-| BUG-11 | Retained CBT base snapshots have no lifecycle owner | **Ceph/Case-2** | ❌ | New issue; check overlap with #9835. Consequence of the GAP-6 fix |
+| BUG-11 | Retained CBT base snapshots have no lifecycle owner | **Ceph/Case-2** | ❌ | **Sub-issue of #9714**; check overlap with #9835. Consequence of the GAP-6 fix |
 | BUG-12 | Block data mover silently uses the fs uploader | all drivers | ❌ | New issue (design/docs question as much as a bug) |
 
 **Only two findings are genuinely Ceph-specific** (GAP-6, BUG-11) — plus BUG-5,
