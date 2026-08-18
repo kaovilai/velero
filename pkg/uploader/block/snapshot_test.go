@@ -327,7 +327,7 @@ func TestSnapshotSource(t *testing.T) {
 				true, "",
 				cbtSrc, cbtSvc,
 				snapshotTags, map[string]string{},
-				testLog(),
+				testLog(), "Block Uploader",
 			)
 
 			if tc.expectedErrStr != "" {
@@ -394,7 +394,7 @@ func TestSnapshotSourceKeepsParentOnCBTFailure(t *testing.T) {
 		false, "snap-parent",
 		cbtservice.SourceInfo{Snapshot: "snap-cbt", ChangeID: "cid-new", VolumeID: volumeID}, svcMock,
 		snapshotTags, map[string]string{},
-		testLog(),
+		testLog(), "Block Uploader",
 	)
 
 	require.NoError(t, err)
@@ -453,7 +453,7 @@ func TestSnapshotSourceDropsParentOnAllocatedTier(t *testing.T) {
 		false, "snap-parent",
 		cbtservice.SourceInfo{Snapshot: "snap-cbt", ChangeID: "cid-new", VolumeID: volumeID}, svcMock,
 		snapshotTags, map[string]string{},
-		testLog(),
+		testLog(), "Block Uploader",
 	)
 	require.NoError(t, err)
 
