@@ -372,14 +372,14 @@ func TestBlockProviderRunBackup(t *testing.T) {
 	}
 }
 
-// TestBlockProviderCancelThroughWrappedError pins that cancellation is recognised
+// TestBlockProviderCancelThroughWrappedError pins that cancellation is recognized
 // after the sentinel has been wrapped, which is the only way it ever arrives in
 // production: block/uploader.go wraps it with "error backing up bdev %s" and
 // block/snapshot.go wraps that with "Failed to run uploader backup for si %v".
 //
 // Asserting on the message is useless here — provider.ErrorCanceled and
 // block.ErrCanceled carry the *same* text ("uploader is canceled"), so a substring
-// check passes whether or not the sentinel was actually recognised. The assertion
+// check passes whether or not the sentinel was actually recognized. The assertion
 // has to be on identity.
 func TestBlockProviderCancelThroughWrappedError(t *testing.T) {
 	t.Run("backup", func(t *testing.T) {
