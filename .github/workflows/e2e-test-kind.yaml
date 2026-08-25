@@ -36,32 +36,33 @@ jobs:
         with:
           go-version: ${{ needs.get-go-version.outputs.version }}
 
-      # Look for a CLI that's made for this PR
-      - name: Fetch built CLI
-        id: cli-cache
-        uses: actions/cache@v6
-        with:
-          path: ./_output/bin/linux/amd64/velero
-          # The cache key a combination of the current PR number and the commit SHA
-          key: velero-cli-${{ github.event.pull_request.number }}-${{ github.sha }}
-      - name: Fetch built image
-        id: image-cache
-        uses: actions/cache@v6
-        with:
-          path: ./velero.tar
-          # The cache key a combination of the current PR number and the commit SHA
-          key: velero-image-${{ github.event.pull_request.number }}-${{ github.sha }}
-      # If no binaries were built for this PR, build it now.
       - name: Build Velero CLI
-        if: steps.cli-cache.outputs.cache-hit != 'true'
         run: |
           make local
-      # If no image were built for this PR, build it now.
       - name: Build Velero Image
-        if: steps.image-cache.outputs.cache-hit != 'true'
         run: |
           IMAGE=velero VERSION=pr-test BUILD_OUTPUT_TYPE=docker make container
           docker save velero:pr-test-linux-amd64 -o ./velero.tar
+      # actions/cache is eventually-consistent and unsuited to same-run,
+      # guaranteed-fresh handoffs: its save happens in a post-job hook after
+      # this job reports success, but the cache service can lag before a
+      # dependent job's restore sees it -- deterministic on every fresh
+      # sha (e.g. after a force-push), see #9927. actions/upload-artifact /
+      # download-artifact are the right tool for passing a same-run build
+      # output to dependent jobs: the download step blocks until the
+      # artifact is actually available, no race.
+      - name: Upload Velero CLI
+        uses: actions/upload-artifact@v7
+        with:
+          name: velero-cli
+          path: ./_output/bin/linux/amd64/velero
+          retention-days: 1
+      - name: Upload Velero Image
+        uses: actions/upload-artifact@v7
+        with:
+          name: velero-image
+          path: ./velero.tar
+          retention-days: 1
       # Build the MinIO image once for all e2e tests, from the reviewed bitnami/containers commit.
       - name: Cache MinIO Image
         uses: actions/cache@v6
@@ -148,17 +149,17 @@ jobs:
           version: "v0.32.0"
           node_image: "kindest/node:v${{ matrix.k8s }}"
       - name: Fetch built CLI
-        id: cli-cache
-        uses: actions/cache@v6
+        uses: actions/download-artifact@v7
         with:
-          path: ./_output/bin/linux/amd64/velero
-          key: velero-cli-${{ github.event.pull_request.number }}-${{ github.sha }}
+          name: velero-cli
+          path: ./_output/bin/linux/amd64
       - name: Fetch built Image
-        id: image-cache
-        uses: actions/cache@v6
+        uses: actions/download-artifact@v7
         with:
-          path: ./velero.tar
-          key: velero-image-${{ github.event.pull_request.number }}-${{ github.sha }}
+          name: velero-image
+          path: .
+      - name: Make CLI executable
+        run: chmod +x ./_output/bin/linux/amd64/velero
       - name: Load Velero Image
         run:
           kind load image-archive velero.tar
