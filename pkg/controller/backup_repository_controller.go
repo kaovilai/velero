@@ -116,43 +116,24 @@ func (r *BackupRepoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&velerov1api.BackupRepository{}, builder.WithPredicates(kube.SpecChangePredicate{})).
 		WatchesRawSource(s).
 		Watches(
-			// mark BackupRepository as invalid when BSL is updated or deleted.
-			// BSL may be recreated after deleting, so Create events are handled
-			// by the dedicated watch below.
-			&velerov1api.BackupStorageLocation{},
-			kube.EnqueueRequestsFromMapUpdateFunc(r.invalidateBackupReposForBSL),
-			builder.WithPredicates(
-				// Combine three predicates together to guarantee
-				// only BSL's Delete Event and Update Event can enqueue.
-				// We don't care about BSL's Generic Event and Create Event,
-				// because BSL's periodical enqueue triggers Generic Event,
-				// and the BackupRepository controller restart will triggers BSL create event.
-				kube.NewUpdateEventPredicate(
-					r.needInvalidBackupRepo,
-				),
-				kube.NewGenericEventPredicate(
-					func(client.Object) bool { return false },
-				),
-				kube.NewCreateEventPredicate(
-					func(client.Object) bool { return false },
-				),
-			),
-		).
-		Watches(
-			// BSL Create events fire for every existing BSL when the controller
-			// (re)starts, so they are the hook to detect a BSL that was modified or
-			// recreated while the server was not running: repositories whose recorded
-			// BSL config hash no longer matches the BSL are invalidated. Only Ready
-			// repositories with a recorded hash are considered, so a restart with an
-			// unchanged BSL invalidates nothing.
+			// Invalidate stale BackupRepositories on BSL Update events (runtime config
+			// change) and Create events (the BSL was recreated, or the controller
+			// restarted and the BSL was modified while it was down). Both paths funnel
+			// through invalidateStaleReposForBSLOnCreate, which only touches Ready
+			// repositories whose recorded BSL config hash no longer matches the BSL, so
+			// an update/restart with an unchanged BSL invalidates nothing. Delete events
+			// don't need handling: a recreated BackupRepository goes through
+			// initializeRepo against the current BSL, so it's correct by construction.
+			// We don't care about BSL's Generic Event, since BSL's periodical enqueue
+			// triggers Generic Event.
 			&velerov1api.BackupStorageLocation{},
 			kube.EnqueueRequestsFromMapUpdateFunc(r.invalidateStaleReposForBSLOnCreate),
 			builder.WithPredicates(
-				kube.NewCreateEventPredicate(
-					func(client.Object) bool { return true },
-				),
 				kube.NewUpdateEventPredicate(
-					func(client.Object, client.Object) bool { return false },
+					r.needInvalidBackupRepo,
+				),
+				kube.NewCreateEventPredicate(
+					r.needInvalidBackupRepoOnCreate,
 				),
 				kube.NewGenericEventPredicate(
 					func(client.Object) bool { return false },
@@ -179,45 +160,21 @@ func (r *BackupRepoReconciler) backupReposForBSL(ctx context.Context, bslName st
 	return list, nil
 }
 
-func (r *BackupRepoReconciler) invalidateBackupReposForBSL(ctx context.Context, bslObj client.Object) []reconcile.Request {
-	bsl := bslObj.(*velerov1api.BackupStorageLocation)
-
+// staleReposForBSL returns the BackupRepositories for the given BSL that are Ready
+// but whose recorded BSL config hash no longer matches the BSL, i.e. the BSL was
+// modified or recreated without the BSL watch observing it (e.g. while the server
+// was not running, or via a live update). Repositories in other phases or without a
+// recorded hash are left untouched, so they are neither reported nor invalidated
+// until they naturally transition through Ready and get a hash recorded.
+func (r *BackupRepoReconciler) staleReposForBSL(ctx context.Context, bsl *velerov1api.BackupStorageLocation) ([]*velerov1api.BackupRepository, error) {
 	list, err := r.backupReposForBSL(ctx, bsl.Name)
 	if err != nil {
-		r.logger.WithField("BSL", bsl.Name).WithError(err).Error("unable to list BackupRepositories")
-		return []reconcile.Request{}
-	}
-
-	requests := []reconcile.Request{}
-	for i := range list.Items {
-		r.logger.WithField("BSL", bsl.Name).Infof("Invalidating Backup Repository %s", list.Items[i].Name)
-		if err := r.patchBackupRepository(context.Background(), &list.Items[i], repoNotReady("re-establish on BSL change, create or delete")); err != nil {
-			r.logger.WithField("BSL", bsl.Name).WithError(err).Errorf("fail to patch BackupRepository %s", list.Items[i].Name)
-			continue
-		}
-		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: list.Items[i].Namespace, Name: list.Items[i].Name}})
-	}
-
-	return requests
-}
-
-// invalidateStaleReposForBSLOnCreate handles BSL Create events, which fire for every
-// existing BSL when the controller (re)starts. It invalidates Ready BackupRepositories
-// whose recorded BSL config hash no longer matches the BSL, i.e. the BSL was modified
-// or recreated without the BSL watch observing it (e.g. while the server was not
-// running). Repositories in other phases or without a recorded hash are left untouched.
-func (r *BackupRepoReconciler) invalidateStaleReposForBSLOnCreate(ctx context.Context, bslObj client.Object) []reconcile.Request {
-	bsl := bslObj.(*velerov1api.BackupStorageLocation)
-
-	list, err := r.backupReposForBSL(ctx, bsl.Name)
-	if err != nil {
-		r.logger.WithField("BSL", bsl.Name).WithError(err).Error("unable to list BackupRepositories")
-		return []reconcile.Request{}
+		return nil, err
 	}
 
 	currentHash := bslConfigHash(bsl)
 
-	requests := []reconcile.Request{}
+	var stale []*velerov1api.BackupRepository
 	for i := range list.Items {
 		repo := &list.Items[i]
 		if repo.Status.Phase != velerov1api.BackupRepositoryPhaseReady {
@@ -229,6 +186,41 @@ func (r *BackupRepoReconciler) invalidateStaleReposForBSLOnCreate(ctx context.Co
 			continue
 		}
 
+		stale = append(stale, repo)
+	}
+
+	return stale, nil
+}
+
+// needInvalidBackupRepoOnCreate gates the BSL Create-event watch: a Create event fires
+// for every existing BSL when the controller (re)starts, so it only needs to enqueue
+// when the restarted controller finds a BSL with actually-stale repositories.
+func (r *BackupRepoReconciler) needInvalidBackupRepoOnCreate(bslObj client.Object) bool {
+	bsl := bslObj.(*velerov1api.BackupStorageLocation)
+
+	stale, err := r.staleReposForBSL(context.Background(), bsl)
+	if err != nil {
+		r.logger.WithField("BSL", bsl.Name).WithError(err).Error("unable to list BackupRepositories")
+		return false
+	}
+
+	return len(stale) > 0
+}
+
+// invalidateStaleReposForBSLOnCreate invalidates the stale BackupRepositories for the
+// given BSL. It backs both the BSL Update-event watch (runtime config change) and the
+// BSL Create-event watch (BSL recreated, or modified while the server was down).
+func (r *BackupRepoReconciler) invalidateStaleReposForBSLOnCreate(ctx context.Context, bslObj client.Object) []reconcile.Request {
+	bsl := bslObj.(*velerov1api.BackupStorageLocation)
+
+	stale, err := r.staleReposForBSL(ctx, bsl)
+	if err != nil {
+		r.logger.WithField("BSL", bsl.Name).WithError(err).Error("unable to list BackupRepositories")
+		return []reconcile.Request{}
+	}
+
+	requests := []reconcile.Request{}
+	for _, repo := range stale {
 		r.logger.WithField("BSL", bsl.Name).Infof("BSL config has changed since Backup Repository %s became ready, invalidating it", repo.Name)
 		if err := r.patchBackupRepository(ctx, repo, repoNotReady(msgBSLConfigChanged)); err != nil {
 			r.logger.WithField("BSL", bsl.Name).WithError(err).Errorf("fail to patch BackupRepository %s", repo.Name)
