@@ -948,10 +948,11 @@ func TestGetTolerations(t *testing.T) {
 			values, err := GetTolerations(t.Context(), fakeKubeClient, test.namespace, kube.NodeOSLinux, test.configuredTolerations)
 			if test.expectErr == "" {
 				require.NoError(t, err)
+				assert.Equal(t, test.expectedValues, values)
 			} else {
-				assert.EqualError(t, err, test.expectErr)
+				require.EqualError(t, err, test.expectErr)
+				assert.Equal(t, test.expectedValues, values)
 			}
-			assert.Equal(t, test.expectedValues, values)
 		})
 	}
 }
