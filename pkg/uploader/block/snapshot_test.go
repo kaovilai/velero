@@ -914,6 +914,8 @@ func TestRestore(t *testing.T) {
 				m := cbtservicemocks.NewService(t)
 				m.On("GetChangedBlocks", mock.Anything, "snap-cbt", "cid-1", mock.Anything).
 					Return(errors.New("CBT error"))
+				m.On("GetAllocatedBlocks", mock.Anything, "snap-cbt", mock.Anything).
+					Return(errors.New("CBT error"))
 				return m
 			},
 			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {

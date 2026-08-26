@@ -253,8 +253,8 @@ func Restore(ctx context.Context, blkUp Uploader, rep udmrepo.BackupRepo, snapsh
 
 	bitmap := cbt.NewBitmap(blockSize, uint64(snapshot.TotalSize), volumeSnapshot, changeID, volumeID)
 	if incremental {
-		if err = cbt.SetBitmapOrFull(ctx, cbtService, bitmap); err != nil {
-			log.WithError(err).Warnf("Failed to create CBT with source %v, fallback to full restore", cbtSource)
+		if tier, err := cbt.SetBitmapOrFull(ctx, cbtService, bitmap); err != nil {
+			log.WithError(err).Warnf("Failed to create CBT with source %v (tier %v), fallback to full restore", cbtSource, tier)
 		}
 	} else {
 		bitmap.SetFull()
