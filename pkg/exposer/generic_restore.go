@@ -834,7 +834,7 @@ func (e *genericRestoreExposer) createRestorePod(
 			Operator: metav1.LabelSelectorOpIn,
 		})
 
-		toleration = deduplicateTolerations(append(toleration, []corev1api.Toleration{
+		toleration = kube.DeduplicateTolerations(append(toleration, []corev1api.Toleration{
 			{
 				Key:      "os",
 				Operator: "Equal",

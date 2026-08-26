@@ -848,30 +848,34 @@ func TestGetTolerations(t *testing.T) {
 		},
 	}
 
+	configuredToleration := corev1api.Toleration{
+		Key:      "dedicated",
+		Operator: "Equal",
+		Value:    "backup",
+		Effect:   "NoSchedule",
+	}
+
 	tests := []struct {
-		name           string
-		kubeClientObj  []runtime.Object
-		namespace      string
-		expectedValues []corev1api.Toleration
-		expectErr      string
+		name                  string
+		kubeClientObj         []runtime.Object
+		namespace             string
+		configuredTolerations []corev1api.Toleration
+		expectedValues        []corev1api.Toleration
+		expectErr             string
 	}{
 		{
 			name:           "no tolerations",
 			namespace:      "fake-ns",
 			kubeClientObj:  []runtime.Object{daemonSet},
-			expectedValues: nil,
+			expectedValues: []corev1api.Toleration{},
 		},
 		{
-			name:      "all tolerations returned",
+			name:      "only non-allowlisted daemonset tolerations are dropped",
 			namespace: "fake-ns",
 			kubeClientObj: []runtime.Object{
 				daemonSetWithTolerations,
 			},
 			expectedValues: []corev1api.Toleration{
-				{
-					Key:   "custom-taint",
-					Value: "true",
-				},
 				{
 					Key:      "kubernetes.azure.com/scalesetpriority",
 					Operator: "Equal",
@@ -880,19 +884,74 @@ func TestGetTolerations(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:                  "configured tolerations only",
+			namespace:             "fake-ns",
+			kubeClientObj:         []runtime.Object{daemonSet},
+			configuredTolerations: []corev1api.Toleration{configuredToleration},
+			expectedValues:        []corev1api.Toleration{configuredToleration},
+		},
+		{
+			name:      "configured and allowlisted daemonset tolerations are merged",
+			namespace: "fake-ns",
+			kubeClientObj: []runtime.Object{
+				daemonSetWithTolerations,
+			},
+			configuredTolerations: []corev1api.Toleration{configuredToleration},
+			expectedValues: []corev1api.Toleration{
+				configuredToleration,
+				{
+					Key:      "kubernetes.azure.com/scalesetpriority",
+					Operator: "Equal",
+					Value:    "spot",
+					Effect:   "NoSchedule",
+				},
+			},
+		},
+		{
+			name:      "duplicate between configured and daemonset tolerations is deduplicated",
+			namespace: "fake-ns",
+			kubeClientObj: []runtime.Object{
+				daemonSetWithTolerations,
+			},
+			configuredTolerations: []corev1api.Toleration{
+				{
+					Key:      "kubernetes.azure.com/scalesetpriority",
+					Operator: "Equal",
+					Value:    "spot",
+					Effect:   "NoSchedule",
+				},
+			},
+			expectedValues: []corev1api.Toleration{
+				{
+					Key:      "kubernetes.azure.com/scalesetpriority",
+					Operator: "Equal",
+					Value:    "spot",
+					Effect:   "NoSchedule",
+				},
+			},
+		},
+		{
+			name:                  "daemonset get error still returns configured tolerations",
+			namespace:             "fake-ns",
+			kubeClientObj:         []runtime.Object{},
+			configuredTolerations: []corev1api.Toleration{configuredToleration},
+			expectedValues:        []corev1api.Toleration{configuredToleration},
+			expectErr:             "error getting node-agent daemonset: daemonsets.apps \"node-agent\" not found",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fakeKubeClient := fake.NewSimpleClientset(test.kubeClientObj...)
 
-			values, err := GetTolerations(t.Context(), fakeKubeClient, test.namespace, kube.NodeOSLinux)
+			values, err := GetTolerations(t.Context(), fakeKubeClient, test.namespace, kube.NodeOSLinux, test.configuredTolerations)
 			if test.expectErr == "" {
 				require.NoError(t, err)
-				assert.Equal(t, test.expectedValues, values)
 			} else {
 				assert.EqualError(t, err, test.expectErr)
 			}
+			assert.Equal(t, test.expectedValues, values)
 		})
 	}
 }

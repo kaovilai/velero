@@ -31,6 +31,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerotypes "github.com/vmware-tanzu/velero/pkg/types"
+	"github.com/vmware-tanzu/velero/pkg/util"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
@@ -240,8 +241,14 @@ func GetAnnotationValue(ctx context.Context, kubeClient kubernetes.Interface, na
 	return val, nil
 }
 
-// GetTolerations returns all tolerations from the node-agent daemonset.
-func GetTolerations(ctx context.Context, kubeClient kubernetes.Interface, namespace string, osType string) ([]corev1api.Toleration, error) {
+// GetTolerations returns the tolerations that should be applied to a node-agent-driven
+// hosting pod: the explicitly configured tolerations (typically sourced from the
+// node-agent-configmap), plus any toleration on the node-agent daemonset (linux or
+// windows, based on osType) whose key is in util.ThirdPartyTolerations. The combined
+// list is deduplicated by kube.DeduplicateTolerations. On a daemonset lookup error,
+// configuredTolerations is still returned alongside the error so callers don't lose
+// explicitly configured tolerations to a transient lookup failure.
+func GetTolerations(ctx context.Context, kubeClient kubernetes.Interface, namespace string, osType string, configuredTolerations []corev1api.Toleration) ([]corev1api.Toleration, error) {
 	dsName := daemonSet
 	if osType == kube.NodeOSWindows {
 		dsName = daemonsetWindows
@@ -249,10 +256,21 @@ func GetTolerations(ctx context.Context, kubeClient kubernetes.Interface, namesp
 
 	ds, err := kubeClient.AppsV1().DaemonSets(namespace).Get(ctx, dsName, metav1.GetOptions{})
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting %s daemonset", dsName)
+		return configuredTolerations, errors.Wrapf(err, "error getting %s daemonset", dsName)
 	}
 
-	return ds.Spec.Template.Spec.Tolerations, nil
+	merged := make([]corev1api.Toleration, 0, len(configuredTolerations)+len(ds.Spec.Template.Spec.Tolerations))
+	merged = append(merged, configuredTolerations...)
+	for _, t := range ds.Spec.Template.Spec.Tolerations {
+		for _, allowed := range util.ThirdPartyTolerations {
+			if t.Key == allowed {
+				merged = append(merged, t)
+				break
+			}
+		}
+	}
+
+	return kube.DeduplicateTolerations(merged), nil
 }
 
 func GetHostPodPath(ctx context.Context, kubeClient kubernetes.Interface, namespace string, osType string) (string, error) {

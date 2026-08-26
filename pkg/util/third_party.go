@@ -24,6 +24,11 @@ var ThirdPartyAnnotations = []string{
 	"iam.amazonaws.com/role",
 }
 
+var ThirdPartyTolerations = []string{
+	"kubernetes.azure.com/scalesetpriority",
+	"CriticalAddonsOnly",
+}
+
 const (
 	VSphereCNSFastCloneAnno = "csi.vsphere.volume/fast-provisioning"
 	VSphereCNSSnapshotAnno  = "csi.vsphere.volume/snapshot"

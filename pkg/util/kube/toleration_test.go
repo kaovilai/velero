@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package exposer
+package kube
 
 import (
 	"testing"
@@ -79,7 +79,7 @@ func TestDeduplicateTolerations(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			result := deduplicateTolerations(test.input)
+			result := DeduplicateTolerations(test.input)
 			assert.Equal(t, test.expected, result)
 		})
 	}

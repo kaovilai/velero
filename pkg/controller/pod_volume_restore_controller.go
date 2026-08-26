@@ -75,6 +75,7 @@ func NewPodVolumeRestoreReconciler(
 	repoConfigMgr repository.ConfigManager,
 	podLabels map[string]string,
 	podAnnotations map[string]string,
+	tolerations []corev1api.Toleration,
 ) *PodVolumeRestoreReconciler {
 	return &PodVolumeRestoreReconciler{
 		client:                client,
@@ -96,6 +97,7 @@ func NewPodVolumeRestoreReconciler(
 		repoConfigMgr:         repoConfigMgr,
 		podLabels:             podLabels,
 		podAnnotations:        podAnnotations,
+		tolerations:           tolerations,
 	}
 }
 
@@ -120,6 +122,7 @@ type PodVolumeRestoreReconciler struct {
 	repoConfigMgr         repository.ConfigManager
 	podLabels             map[string]string
 	podAnnotations        map[string]string
+	tolerations           []corev1api.Toleration
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=podvolumerestores,verbs=get;list;watch;create;update;patch;delete
@@ -952,9 +955,9 @@ func (r *PodVolumeRestoreReconciler) setupExposeParam(pvr *velerov1api.PodVolume
 		}
 	}
 
-	hostingPodTolerations, err := nodeagent.GetTolerations(context.Background(), r.kubeClient, pvr.Namespace, nodeOS)
+	hostingPodTolerations, err := nodeagent.GetTolerations(context.Background(), r.kubeClient, pvr.Namespace, nodeOS, r.tolerations)
 	if err != nil {
-		log.WithError(err).Warn("Failed to get node-agent tolerations, hosting pod will have no tolerations")
+		log.WithError(err).Warn("Failed to get node-agent daemonset tolerations, hosting pod will only get configured tolerations")
 	}
 
 	var cacheVolume *exposer.CacheConfigs
