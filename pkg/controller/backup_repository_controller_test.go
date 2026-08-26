@@ -597,6 +597,88 @@ func TestInvalidateStaleReposForBSLOnCreate(t *testing.T) {
 	})
 }
 
+func TestNeedInvalidBackupRepoOnCreate(t *testing.T) {
+	bsl := mockBackupStorageLocationCR()
+
+	repoForBSL := func(name string, phase velerov1api.BackupRepositoryPhase, hash string) *velerov1api.BackupRepository {
+		repo := &velerov1api.BackupRepository{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: velerov1api.DefaultNamespace,
+				Name:      name,
+				Labels: map[string]string{
+					velerov1api.StorageLocationLabel: label.GetValidName(bsl.Name),
+				},
+			},
+			Spec: velerov1api.BackupRepositorySpec{
+				BackupStorageLocation: bsl.Name,
+			},
+			Status: velerov1api.BackupRepositoryStatus{
+				Phase: phase,
+			},
+		}
+		if hash != "" {
+			repo.Annotations = map[string]string{velerov1api.BSLConfigHashAnnotation: hash}
+		}
+		return repo
+	}
+
+	tests := []struct {
+		name   string
+		repo   *velerov1api.BackupRepository
+		expect bool
+	}{
+		{
+			name:   "ready repo with mismatched hash needs invalidation",
+			repo:   repoForBSL("repo", velerov1api.BackupRepositoryPhaseReady, "stale-hash"),
+			expect: true,
+		},
+		{
+			name:   "ready repo with matching hash does not need invalidation",
+			repo:   repoForBSL("repo", velerov1api.BackupRepositoryPhaseReady, bslConfigHash(bsl)),
+			expect: false,
+		},
+		{
+			name:   "ready repo without hash does not need invalidation",
+			repo:   repoForBSL("repo", velerov1api.BackupRepositoryPhaseReady, ""),
+			expect: false,
+		},
+		{
+			name:   "not-ready repo does not need invalidation",
+			repo:   repoForBSL("repo", velerov1api.BackupRepositoryPhaseNotReady, "stale-hash"),
+			expect: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reconciler := mockBackupRepoReconciler(t, "", nil, nil)
+			require.NoError(t, reconciler.Client.Create(t.Context(), test.repo))
+
+			assert.Equal(t, test.expect, reconciler.needInvalidBackupRepoOnCreate(bsl))
+		})
+	}
+
+	t.Run("no repos for BSL does not need invalidation", func(t *testing.T) {
+		reconciler := mockBackupRepoReconciler(t, "", nil, nil)
+		assert.False(t, reconciler.needInvalidBackupRepoOnCreate(bsl))
+	})
+
+	t.Run("list error does not need invalidation", func(t *testing.T) {
+		reconciler := NewBackupRepoReconciler(
+			velerov1api.DefaultNamespace,
+			velerotest.NewLogger(),
+			clientFake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build(),
+			nil,
+			testMaintenanceFrequency,
+			"",
+			"",
+			logrus.InfoLevel,
+			nil,
+			nil,
+		)
+		assert.False(t, reconciler.needInvalidBackupRepoOnCreate(bsl))
+	})
+}
+
 func TestBackupRepoReconcile(t *testing.T) {
 	tests := []struct {
 		name      string
