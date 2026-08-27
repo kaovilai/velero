@@ -113,13 +113,13 @@ var ImagesMatrix = map[string]map[string][]string{
 		"velero-restore-helper": {"gcr.io/velero-gcp/velero-restore-helper:v1.15.0"},
 	},
 	"main": {
-		"aws":                   {"gcr.io/velero-gcp/velero-plugin-for-aws:main"},
-		"azure":                 {"gcr.io/velero-gcp/velero-plugin-for-microsoft-azure:main"},
-		"vsphere":               {"gcr.io/velero-gcp/velero-plugin-for-vsphere:v1.5.2"},
-		"gcp":                   {"gcr.io/velero-gcp/velero-plugin-for-gcp:main"},
-		"datamover":             {"gcr.io/velero-gcp/velero-plugin-for-aws:main"},
-		"velero":                {"gcr.io/velero-gcp/velero:main"},
-		"velero-restore-helper": {"gcr.io/velero-gcp/velero-restore-helper:main"},
+		"aws":                   {"velero/velero-plugin-for-aws:main"},
+		"azure":                 {"velero/velero-plugin-for-microsoft-azure:main"},
+		"vsphere":               {"vsphereveleroplugin/velero-plugin-for-vsphere:v1.5.2"},
+		"gcp":                   {"velero/velero-plugin-for-gcp:main"},
+		"datamover":             {"velero/velero-plugin-for-aws:main"},
+		"velero":                {"velero/velero:main"},
+		"velero-restore-helper": {"velero/velero-restore-helper:main"},
 	},
 }
 
