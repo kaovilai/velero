@@ -219,6 +219,15 @@ func DescribeRestore(
 			DescribeResourceModifier(d, restore.Spec.ResourceModifier)
 		}
 
+		if boolptr.IsSetToTrue(restore.Spec.SkipDefaultResourceModifier) {
+			d.Printf("Skip Default Resource Modifier:\ttrue\n")
+		}
+
+		if restore.Spec.ResourcePolicy != nil {
+			d.Println()
+			DescribeResourcePolicies(d, restore.Spec.ResourcePolicy)
+		}
+
 		describeUploaderConfigForRestore(d, restore.Spec)
 
 		d.Println()
@@ -408,7 +417,7 @@ func describePodVolumeRestores(d *Describer, restores []velerov1api.PodVolumeRes
 		restoresByPod := new(volumesByPod)
 
 		for _, restore := range restoresByPhase[phase] {
-			restoresByPod.Add(restore.Spec.Pod.Namespace, restore.Spec.Pod.Name, restore.Spec.Volume, phase, restore.Status.Progress, 0)
+			restoresByPod.Add(restore.Spec.Pod.Namespace, restore.Spec.Pod.Name, restore.Spec.Volume, phase, restore.Status.Progress, nil)
 		}
 
 		d.Printf("\t%s:\n", phase)

@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -65,6 +66,34 @@ func TestDescribeResourcePolicies(t *testing.T) {
 	expect := `Resource policies:
   Type:  configmap
   Name:  test-resource-policy
+`
+	assert.Equal(t, expect, d.buf.String())
+}
+
+func TestDescribeGlobalVolumePolicy(t *testing.T) {
+	newDescriber := func() *Describer {
+		d := &Describer{out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
+		d.out.Init(d.buf, 0, 8, 2, ' ', 0)
+		return d
+	}
+
+	// No annotation: nothing is printed.
+	d := newDescriber()
+	DescribeGlobalVolumePolicy(d, builder.ForBackup("velero", "b").Result())
+	d.out.Flush()
+	assert.Empty(t, d.buf.String())
+
+	// Annotation present: ConfigMap name is surfaced.
+	d = newDescriber()
+	backup := builder.ForBackup("velero", "b").
+		ObjectMeta(builder.WithAnnotations(velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation, "global-volume-policy")).
+		Result()
+	DescribeGlobalVolumePolicy(d, backup)
+	d.out.Flush()
+	expect := `
+Global volume policies:
+  Type:  configmap
+  Name:  global-volume-policy
 `
 	assert.Equal(t, expect, d.buf.String())
 }
@@ -601,7 +630,7 @@ func TestCSISnapshots(t *testing.T) {
 						SnapshotHandle:  "fake-repo-id-5",
 						OperationID:     "fake-operation-5",
 						Size:            100,
-						IncrementalSize: 50,
+						IncrementalSize: ptr.To(int64(50)),
 						Phase:           velerov2alpha1.DataUploadPhaseFailed,
 					},
 				},
