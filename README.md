@@ -45,6 +45,10 @@ See the [community page](https://velero.io/community/) for the full schedule and
 
 If you are ready to jump in and test, add code, or help with documentation, follow the instructions on our [Start contributing][31] documentation for guidance on how to setup Velero for development.
 
+## Governance
+
+Velero's [governance][32] describes how the project is run, including the decision-making process, the roles and responsibilities of maintainers, and how to become a maintainer. Governance applies across the Velero org and is maintained at [velero-io/.github][32].
+
 ## Changelog
 
 See [the list of releases][6] to find out about feature changes.
@@ -98,4 +102,5 @@ For website terms of use, trademark policy and other project policies please see
 [29]: https://velero.io/docs/
 [30]: https://velero.io/docs/troubleshooting
 [31]: https://velero.io/docs/start-contributing
+[32]: https://github.com/velero-io/.github/blob/main/GOVERNANCE.md
 [100]: https://velero.io/docs/main/img/velero.png
