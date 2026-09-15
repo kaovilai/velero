@@ -19,16 +19,21 @@ Known failing paths (tracked in [issue #8815](https://github.com/vmware-tanzu/ve
   Kubernetes appends a 5-character random suffix; if the prefix exceeds 248 characters the creation is rejected.
 - `DataDownload` uses `GenerateName: restore.Name + "-"` with the same failure mode.
 
-A broader audit of the codebase found twelve distinct locations across five categories with this class of bug.
-An additional audit found three `GenerateName` sites that bypass the existing `CreateRetryGenerateName` wrapper, leaving them vulnerable to spurious `AlreadyExists` failures on name collision.
+A broader audit of the codebase found twenty-two distinct locations across five categories with this class of bug.
+An additional audit found four `GenerateName` sites that bypass the existing `CreateRetryGenerateName` wrapper, leaving them vulnerable to spurious `AlreadyExists` failures on name collision.
+
+A design review by @blackpiglet identified a critical flaw in the original proposal: four of the Category D label values are used by `find*ByPod` helper functions to look up their owning object by exact name (`client.Get(..., Name: label)`).
+Truncating those label values with a hash (the original Category D approach) would break these lookups for any name long enough to require truncation, because the truncated label no longer matches the object's real name.
+Category D below is split into a safe subset (label values used only for selector-based filtering, where hashing both the write and the read side is sufficient) and a subset that requires an additional annotation-based fallback so the full name remains recoverable.
 
 ## Goals
 
 - Prevent object creation failures caused by name or label value length exceeding Kubernetes limits.
 - Produce deterministic, unique, stable names when truncation is necessary.
 - Introduce a minimal, reusable set of helper functions so future code is easy to write correctly.
-- Fix all twelve known name-length locations identified in the audit.
-- Make all seven `GenerateName` sites consistent by using `CreateRetryGenerateName`, aligning with the KEP 4420 intent for collision-safe generated names.
+- Fix all twenty-two known name-length locations identified in the audit.
+- Make all nine `GenerateName` sites consistent by using `CreateRetryGenerateName`, aligning with the KEP 4420 intent for collision-safe generated names.
+- Preserve correct `find*ByPod` lookup behavior for hosting pods whose owning object's label value was truncated, by recovering the full name from a pod annotation.
 
 ## Non Goals
 
@@ -51,7 +56,9 @@ When truncation is needed the last 6 characters of the prefix are replaced with 
 **`GetValidObjectName(name string) string`**
 Truncates a deterministic object name to at most 253 characters using the same hash-suffix strategy.
 
-All twelve affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
+All twenty-two affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
+
+For the four Category D locations whose label value is used to look up the owning object by exact name (`find*ByPod` helpers), truncation alone is insufficient: the design additionally introduces a per-object annotation on the hosting pod that stores the full, untruncated name, and updates the lookup helpers to read the annotation first, falling back to the (possibly truncated) label for pods created before this change. See Category D (D.2) below for details.
 
 ## Detailed Design
 
@@ -102,9 +109,9 @@ func GetValidObjectName(name string) string {
 
 `validation.DNS1035LabelMaxLength` (63) and `validation.DNS1123SubdomainMaxLength` (253) are both from `k8s.io/apimachinery/pkg/util/validation`, which is already imported by the package.
 
-### Category A — `GenerateName` prefix > 248 characters (7 locations)
+### Category A — `GenerateName` prefix > 248 characters (9 locations)
 
-All seven locations replace the raw string with `label.GetValidGenerateName(...)`:
+All nine locations replace the raw string with `label.GetValidGenerateName(...)`:
 
 | File | Object | Before | After |
 | --- | --- | --- | --- |
@@ -112,11 +119,15 @@ All seven locations replace the raw string with `label.GetValidGenerateName(...)
 | `pkg/restore/actions/csi/pvc_action.go:410` | DataDownload | `restore.Name + "-"` | `label.GetValidGenerateName(restore.Name + "-")` |
 | `pkg/podvolume/backupper.go:494` | PodVolumeBackup | `backup.Name + "-"` | `label.GetValidGenerateName(backup.Name + "-")` |
 | `pkg/podvolume/restorer.go:260` | PodVolumeRestore | `restore.Name + "-"` | `label.GetValidGenerateName(restore.Name + "-")` |
-| `pkg/cmd/cli/backup/delete.go:126` | BackupDeleteRequest | `b.Name + "-"` | `label.GetValidGenerateName(b.Name + "-")` |
+| `pkg/cmd/cli/backup/delete.go:126` | BackupDeleteRequest (CLI) | `b.Name + "-"` | `label.GetValidGenerateName(b.Name + "-")` |
+| `pkg/backup/delete_helpers.go:32` | DeleteBackupRequest (GC controller) | `name + "-"` | `label.GetValidGenerateName(name + "-")` |
 | `pkg/restore/actions/dataupload_retrieve_action.go:97` | ConfigMap | `dataUpload.Name + "-"` | `label.GetValidGenerateName(dataUpload.Name + "-")` |
 | `pkg/backup/actions/csi/pvc_action.go:252` | VolumeSnapshot | `"velero-" + pvc.Name + "-"` | `label.GetValidGenerateName("velero-" + pvc.Name + "-")` |
+| `pkg/restore/actions/csi/pvc_action.go:685` | VolumeSnapshot (restore-side rehydration) | `"velero-" + pvc.Name + "-"` | `label.GetValidGenerateName("velero-" + pvc.Name + "-")` |
 
-The VolumeSnapshot case deserves attention: `"velero-"` (7 chars) + pvc.Name (up to 253) + `"-"` (1 char) = up to 261 characters, exceeding the 248-character prefix limit when pvc.Name exceeds 240 characters.
+The VolumeSnapshot cases deserve attention: `"velero-"` (7 chars) + pvc.Name (up to 253) + `"-"` (1 char) = up to 261 characters, exceeding the 248-character prefix limit when pvc.Name exceeds 240 characters. This applies identically to both the backup-side (`pkg/backup/actions/csi/pvc_action.go:252`) and restore-side (`pkg/restore/actions/csi/pvc_action.go:685`) VolumeSnapshot creation, which were previously missed as two independent sites.
+
+`pkg/backup/delete_helpers.go:32`'s `NewDeleteBackupRequest` is a second, independent `DeleteBackupRequest` constructor used by the GC controller (`pkg/controller/gc_controller.go:204`), distinct from the CLI's `pkg/cmd/cli/backup/delete.go:126`. Both construct the same object with the same `GenerateName` pattern but were previously two separate audit misses; both need the fix. The GC controller call site already uses `veleroclient.CreateRetryGenerateName`, so no Category F change is needed there.
 
 ### Category B — Deterministic `Name:` > 253 characters (1 location)
 
@@ -135,7 +146,7 @@ Name: label.GetValidObjectName(
 The `BackupRepository` is already looked up exclusively by label selector (not by name) as documented by the comment at `pkg/repository/ensurer.go:73`.
 The name change for pathologically long combinations is therefore safe.
 
-### Category C — Derived name with suffix > 253 characters (1 location)
+### Category C — Derived name with suffix > 253 characters (2 locations)
 
 `pkg/exposer/cache_volume.go:83`, function `getCachePVCName`:
 
@@ -155,23 +166,121 @@ func getCachePVCName(ownerObject corev1api.ObjectReference) string {
 Appending `"-cache"` (6 characters) produces a string of up to 259 characters.
 Because `getCachePVCName` is called consistently for both creation and all subsequent lookups, applying the same truncation function everywhere preserves correctness.
 
-### Category D — Label value without `GetValidName` (2 locations)
+`pkg/datamover/dataupload_delete_action.go:118`:
+
+```go
+// Before
+Name: fmt.Sprintf("%s-info", du.Name),
+
+// After
+Name: label.GetValidObjectName(fmt.Sprintf("%s-info", du.Name)),
+```
+
+This ConfigMap's name is `du.Name` (a DataUpload name, up to 253 characters) plus a `"-info"` suffix (5 characters), up to 258 characters.
+The ConfigMap is looked up elsewhere by label selector (`DataUploadSnapshotInfoLabel`), not by name, so applying the same helper at the single construction site is sufficient for consistency.
+
+### Category D — Label value without `GetValidName` (9 locations)
 
 Label values are limited to 63 characters.
-Two locations set `BackupNameLabel` or `ScheduleNameLabel` using a raw name that could exceed this limit:
+Nine locations set a label from a raw object name that could exceed this limit.
+They split into two groups depending on how the label value is consumed downstream.
+
+#### D.1 — Selector-only label values (5 locations, safe to hash directly)
+
+These label values are only ever consumed via `MatchingLabels` selectors or informational comparison, never as the `Name` of a direct `client.Get`.
+Hashing both the write side (here) and any read side (selector construction) keeps them consistent, exactly like the existing `GetValidName` usage elsewhere in the codebase.
 
 | File | Label | Before | After |
 | --- | --- | --- | --- |
 | `pkg/backup/actions/csi/pvc_action.go:1076` | `BackupNameLabel` | `backup.Name` | `label.GetValidName(backup.Name)` |
 | `pkg/builder/backup_builder.go:107` | `ScheduleNameLabel` | `schedule.Name` | `label.GetValidName(schedule.Name)` |
+| `pkg/backup/actions/csi/pvc_action.go:388` | `VolumeSnapshotLabel` | `vs.Name` | `label.GetValidName(vs.Name)` |
+| `pkg/backup/actions/csi/pvc_action.go:389` | `BackupNameLabel` | `backup.Name` | `label.GetValidName(backup.Name)` |
+| `pkg/datamover/dataupload_delete_action.go:120` | `BackupNameLabel` | `bak.Name` | `label.GetValidName(bak.Name)` |
 
-### Category E — Label selector inconsistency (1 location, 2 call sites)
+The last row is worth calling out: `pkg/datamover/dataupload_delete_action.go:68` already compares an *existing* DataUpload's `BackupNameLabel` against `label.GetValidName(input.Backup.Name)`, i.e. it already assumes the label was written as a hash.
+Line 120 is a different code path (constructing the snapshot-info ConfigMap for a new DataUpload) that was still writing the raw name — an inconsistency within the same file that this fix resolves.
 
-`pkg/controller/restore_finalizer_controller.go` lines 464 and 496 query objects using `RestoreNameLabel: ctx.restore.Name` as a raw string.
-However, when those label values are written (in `pkg/restore/restore.go:2146`), they are stored via `label.GetValidName(restoreName)`.
-When `restore.Name` exceeds 63 characters, the stored value is a hash but the query uses the raw name, producing zero results.
+#### D.2 — Labels used for exact-name lookup by `find*ByPod` helpers (4 locations, requires annotation fallback)
 
-Fix both call sites:
+These four label values are read back with `client.Get(..., Name: <label value>)` inside a `find*ByPod` helper, to locate the CR that owns a given hosting pod:
+
+| File | Label | Owning object | `find*ByPod` helper |
+| --- | --- | --- | --- |
+| `pkg/controller/pod_volume_backup_controller.go:822` | `PVBLabel: pvb.Name` | PodVolumeBackup | `findPVBByPod` (`pkg/controller/pod_volume_backup_controller.go:893`) |
+| `pkg/controller/pod_volume_restore_controller.go:921` | `PVRLabel: pvr.Name` | PodVolumeRestore | `findPVRByRestorePod` (`pkg/controller/pod_volume_restore_controller.go:1007`) |
+| `pkg/controller/data_upload_controller.go:963` | `DataUploadLabel: du.Name` | DataUpload | `findDataUploadByPod` (`pkg/controller/data_upload_controller.go:1054`) |
+| `pkg/controller/data_download_controller.go:893` | `DataDownloadLabel: dd.Name` | DataDownload | `findDataDownloadByPod` (`pkg/controller/data_download_controller.go:985`) |
+
+**This is the critical design flaw identified in review (credit: @blackpiglet).**
+Simply hashing these four label values with `GetValidName` — as originally proposed — would break the corresponding `find*ByPod` lookup whenever the owning object's name is long enough to require truncation: the label would hold a hash, but `client.Get` needs the object's *real* name, and the hash and the real name are different strings.
+For example, today:
+
+```go
+// pkg/controller/pod_volume_backup_controller.go
+func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolumeBackup, error) {
+    if label, exist := pod.Labels[velerov1api.PVBLabel]; exist {
+        pvb := &velerov1api.PodVolumeBackup{}
+        err := client.Get(context.Background(), types.NamespacedName{
+            Namespace: pod.Namespace,
+            Name:      label, // must be the PVB's real name, not a hash
+        }, pvb)
+        ...
+    }
+}
+```
+
+**Fix: recover the full name from a pod annotation, with label fallback.**
+Four new annotation constants are added to `pkg/apis/velero/v1/labels_annotations.go`, one per object type, storing the full untruncated name:
+
+```go
+PVBFullNameAnnotation          = "velero.io/pvb-full-name"
+PVRFullNameAnnotation          = "velero.io/pvr-full-name"
+DataUploadFullNameAnnotation   = "velero.io/data-upload-full-name"
+DataDownloadFullNameAnnotation = "velero.io/data-download-full-name"
+```
+
+At each of the four write sites, the hosting pod gets both the (possibly truncated) label — for selector-based listing and human-readable `kubectl get -l` filtering — and the full-name annotation:
+
+```go
+// pkg/controller/pod_volume_backup_controller.go
+hostingPodLabels := map[string]string{velerov1api.PVBLabel: label.GetValidName(pvb.Name)}
+hostingPodAnnotations := map[string]string{velerov1api.PVBFullNameAnnotation: pvb.Name}
+```
+
+Each `find*ByPod` helper is updated to prefer the annotation and fall back to the label, so pods created by an older Velero version (before this annotation existed) continue to resolve correctly:
+
+```go
+func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolumeBackup, error) {
+    name, exist := pod.Annotations[velerov1api.PVBFullNameAnnotation]
+    if !exist {
+        name, exist = pod.Labels[velerov1api.PVBLabel]
+    }
+    if !exist {
+        return nil, nil
+    }
+    pvb := &velerov1api.PodVolumeBackup{}
+    err := client.Get(context.Background(), types.NamespacedName{
+        Namespace: pod.Namespace,
+        Name:      name,
+    }, pvb)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error to find PVB by pod %s/%s", pod.Namespace, pod.Name)
+    }
+    return pvb, nil
+}
+```
+
+The other three helpers (`findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod`) follow the same pattern with their respective annotation constant.
+Because names within current limits are unaffected by truncation, the annotation and the label hold the same value in the common case; the fallback only matters for pods whose owning object's name previously exceeded 63 characters, and only until they are replaced (hosting pods are short-lived, created fresh per backup/restore run).
+
+### Category E — Label selector inconsistency (2 write sites, 2 query call sites)
+
+`pkg/controller/restore_finalizer_controller.go` lines 486 and 518 query objects using `RestoreNameLabel: ctx.restore.Name` as a raw string (against `VolumeGroupSnapshotContentList` and `VolumeSnapshotContentList` respectively).
+However, most `RestoreNameLabel` values are written via the shared `addRestoreLabels` helper (`pkg/restore/restore.go:2525`), which already applies `label.GetValidName(restoreName)`.
+When `restore.Name` exceeds 63 characters, that stored value is a hash but the query above uses the raw name, producing zero results.
+
+Fix both query call sites:
 
 ```go
 // Before
@@ -181,30 +290,42 @@ client.MatchingLabels{velerov1api.RestoreNameLabel: ctx.restore.Name}
 client.MatchingLabels{velerov1api.RestoreNameLabel: label.GetValidName(ctx.restore.Name)}
 ```
 
-### Category F — `GenerateName` without conflict retry (3 locations)
+**Additional missed write site**: `pkg/restore/actions/csi/volumesnapshot_action.go:145` creates a stub `VolumeGroupSnapshotContent` — the exact object type the first query above lists — but sets `RestoreNameLabel: restore.Name` directly, bypassing `addRestoreLabels`.
+Fixing only the query side is not sufficient for VGSC objects: this write site must also change to `label.GetValidName(restore.Name)`, otherwise long restore names produce a VGSC labeled with the raw (over-length) name, which Kubernetes would reject at admission, or — worse — a value the fixed query would never match anyway.
+
+```go
+// Before
+velerov1api.RestoreNameLabel: restore.Name,
+
+// After
+velerov1api.RestoreNameLabel: label.GetValidName(restore.Name),
+```
+
+### Category F — `GenerateName` without conflict retry (4 locations)
 
 Velero's `veleroclient.CreateRetryGenerateName` wraps object creation with a retry loop on `AlreadyExists` errors, handling the rare but possible collision when Kubernetes generates the same random suffix for two objects with the same prefix.
 This mirrors the intent of KEP 4420 (server-side `GenerateName` retry in Kubernetes 1.32+).
 
-Three `GenerateName` sites bypass this wrapper and call `crClient.Create` directly:
+Four `GenerateName` sites bypass this wrapper and call `crClient.Create` directly:
 
 | File | Object | Change |
 | --- | --- | --- |
 | `pkg/backup/actions/csi/pvc_action.go:264` | VolumeSnapshot | `p.crClient.Create` → `veleroclient.CreateRetryGenerateName` |
 | `pkg/backup/actions/csi/pvc_action.go:597` | DataUpload | `crClient.Create` → `veleroclient.CreateRetryGenerateName` |
 | `pkg/restore/actions/csi/pvc_action.go:478` | DataDownload | `crClient.Create` → `veleroclient.CreateRetryGenerateName` |
+| `pkg/restore/actions/csi/pvc_action.go:697` | VolumeSnapshot (restore-side rehydration) | `p.crClient.Create` → `veleroclient.CreateRetryGenerateName` |
 
-For completeness, the five sites that already use `CreateRetryGenerateName` are:
+For completeness, the four sites that already use `CreateRetryGenerateName` are:
 
 | File | Object |
 | --- | --- |
 | `pkg/podvolume/backupper.go:376` | PodVolumeBackup |
 | `pkg/podvolume/restorer.go:184` | PodVolumeRestore |
-| `pkg/cmd/cli/backup/delete.go:128` | BackupDeleteRequest |
+| `pkg/cmd/cli/backup/delete.go:128` | BackupDeleteRequest (CLI) |
+| `pkg/backup/delete_helpers.go` caller, `pkg/controller/gc_controller.go:206` | DeleteBackupRequest (GC controller) |
 | `pkg/restore/actions/dataupload_retrieve_action.go:110` | DataUploadResult ConfigMap |
-| `pkg/client/retry.go` | (the implementation itself) |
 
-After this fix all seven `GenerateName` sites will be consistent.
+After this fix all nine `GenerateName` sites will be consistent.
 Deployments running on Kubernetes 1.32+ additionally benefit from server-side retry (KEP 4420); the client-side wrapper remains harmless in that case because a server-retried success will never return `AlreadyExists` to the client.
 
 ### Locations confirmed safe (no change needed)
@@ -244,13 +365,19 @@ For `DataDownload.Name` ≤ 247 characters the cache PVC name is unchanged.
 For `DataDownload.Name` > 247 characters (only possible if `restore.Name` exceeded 241 characters, at which point the DataDownload creation previously failed) the cache PVC name is truncated with a hash.
 Because all code paths that reference the cache PVC call the same `getCachePVCName` function, the name is consistent between creation and lookup regardless of truncation.
 
-### Label values for BackupNameLabel and ScheduleNameLabel
+### Label values for Category D.1 (selector-only)
 
-The two Category D fixes change label value assignment from a raw name to `GetValidName(name)`.
+The five Category D.1 fixes change label value assignment from a raw name to `GetValidName(name)`.
 For names ≤ 63 characters `GetValidName` returns the input unchanged.
 For names > 63 characters the previous code produced a label value that Kubernetes would reject, causing the update to fail.
 After this fix, long names are stored as a hash.
 No existing object could carry a raw label value longer than 63 characters because Kubernetes would have rejected its creation or update.
+
+### Annotation fallback for Category D.2 (`find*ByPod` lookups)
+
+The four Category D.2 fixes add a new full-name annotation alongside the (now hashed) label on the hosting pod, and update the corresponding `find*ByPod` helper to read the annotation first.
+Pods created by a Velero version prior to this change carry only the label, never the new annotation; the helper's fallback path (`pod.Labels[...]` when the annotation is absent) handles those pods identically to today, so a rolling upgrade does not lose in-flight PodVolumeBackup/PodVolumeRestore/DataUpload/DataDownload operations.
+Because these hosting pods are short-lived and recreated on every new operation, the fallback path is only ever exercised transiently during the upgrade window, not indefinitely.
 
 ### Label selector fix for RestoreNameLabel
 
@@ -311,15 +438,16 @@ SHA-256 is appropriate for this purpose and is already used by the existing `Get
 ## Implementation
 
 1. Add `GetValidGenerateName` and `GetValidObjectName` to `pkg/label/label.go` with unit tests covering short, boundary, and long inputs.
-2. Apply Category A fixes (7 `GenerateName` sites) — straightforward one-line changes each.
+2. Apply Category A fixes (9 `GenerateName` sites) — straightforward one-line changes each.
 3. Apply Category B fix (`BackupRepository` deterministic name).
-4. Apply Category C fix (`getCachePVCName`).
-5. Apply Category D fixes (2 label value assignments).
-6. Apply Category E fixes (2 `MatchingLabels` selectors).
-7. Apply Category F fixes (3 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
-8. Add or update unit tests for each fixed function to cover the truncation path.
+4. Apply Category C fixes (`getCachePVCName` and the DataUpload snapshot-info ConfigMap name).
+5. Apply Category D.1 fixes (5 selector-only label value assignments).
+6. Add the four full-name pod annotation constants and apply Category D.2 fixes: write the annotation alongside the (hashed) label at each of the four hosting-pod creation sites, and update `findPVBByPod`, `findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod` to prefer the annotation with label fallback.
+7. Apply Category E fixes (2 `MatchingLabels` selectors, plus the VGSC write-side fix in `pkg/restore/actions/csi/volumesnapshot_action.go`).
+8. Apply Category F fixes (4 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
+9. Add or update unit tests for each fixed function to cover the truncation path, including a `find*ByPod` test that verifies both the annotation path and the label-fallback path.
 
-All changes are confined to existing functions and introduce no new CRDs, API fields, or controller reconciliation loops.
+All changes are confined to existing functions plus four new annotation constants, and introduce no new CRDs, API fields, or controller reconciliation loops.
 
 ## Open Issues
 
