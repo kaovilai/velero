@@ -119,7 +119,7 @@ func (r *BackupRepoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			// Invalidate stale BackupRepositories on BSL Update events (runtime config
 			// change) and Create events (the BSL was recreated, or the controller
 			// restarted and the BSL was modified while it was down). Both paths funnel
-			// through invalidateStaleReposForBSLOnCreate, which only touches Ready
+			// through invalidateBackupReposForBSL, which only touches Ready
 			// repositories whose recorded BSL config hash no longer matches the BSL, so
 			// an update/restart with an unchanged BSL invalidates nothing. Delete events
 			// don't need handling: a recreated BackupRepository goes through
@@ -127,13 +127,13 @@ func (r *BackupRepoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			// We don't care about BSL's Generic Event, since BSL's periodical enqueue
 			// triggers Generic Event.
 			&velerov1api.BackupStorageLocation{},
-			kube.EnqueueRequestsFromMapUpdateFunc(r.invalidateStaleReposForBSLOnCreate),
+			kube.EnqueueRequestsFromMapUpdateFunc(r.invalidateBackupReposForBSL),
 			builder.WithPredicates(
 				kube.NewUpdateEventPredicate(
 					r.needInvalidBackupRepo,
 				),
 				kube.NewCreateEventPredicate(
-					r.needInvalidBackupRepoOnCreate,
+					r.needInvalidBackupRepoForBSL,
 				),
 				kube.NewGenericEventPredicate(
 					func(client.Object) bool { return false },
@@ -192,10 +192,10 @@ func (r *BackupRepoReconciler) staleReposForBSL(ctx context.Context, bsl *velero
 	return stale, nil
 }
 
-// needInvalidBackupRepoOnCreate gates the BSL Create-event watch: a Create event fires
+// needInvalidBackupRepoForBSL gates the BSL Create-event watch: a Create event fires
 // for every existing BSL when the controller (re)starts, so it only needs to enqueue
 // when the restarted controller finds a BSL with actually-stale repositories.
-func (r *BackupRepoReconciler) needInvalidBackupRepoOnCreate(bslObj client.Object) bool {
+func (r *BackupRepoReconciler) needInvalidBackupRepoForBSL(bslObj client.Object) bool {
 	bsl := bslObj.(*velerov1api.BackupStorageLocation)
 
 	stale, err := r.staleReposForBSL(context.Background(), bsl)
@@ -207,10 +207,10 @@ func (r *BackupRepoReconciler) needInvalidBackupRepoOnCreate(bslObj client.Objec
 	return len(stale) > 0
 }
 
-// invalidateStaleReposForBSLOnCreate invalidates the stale BackupRepositories for the
+// invalidateBackupReposForBSL invalidates the stale BackupRepositories for the
 // given BSL. It backs both the BSL Update-event watch (runtime config change) and the
 // BSL Create-event watch (BSL recreated, or modified while the server was down).
-func (r *BackupRepoReconciler) invalidateStaleReposForBSLOnCreate(ctx context.Context, bslObj client.Object) []reconcile.Request {
+func (r *BackupRepoReconciler) invalidateBackupReposForBSL(ctx context.Context, bslObj client.Object) []reconcile.Request {
 	bsl := bslObj.(*velerov1api.BackupStorageLocation)
 
 	stale, err := r.staleReposForBSL(ctx, bsl)

@@ -501,7 +501,7 @@ func TestBSLConfigHash(t *testing.T) {
 	})
 }
 
-func TestInvalidateStaleReposForBSLOnCreate(t *testing.T) {
+func TestInvalidateBackupReposForBSL(t *testing.T) {
 	bsl := mockBackupStorageLocationCR()
 
 	repoForBSL := func(name string, phase velerov1api.BackupRepositoryPhase, hash string) *velerov1api.BackupRepository {
@@ -563,7 +563,7 @@ func TestInvalidateStaleReposForBSLOnCreate(t *testing.T) {
 			require.NoError(t, reconciler.Client.Create(t.Context(), test.repo))
 
 			originalPhase := test.repo.Status.Phase
-			requests := reconciler.invalidateStaleReposForBSLOnCreate(t.Context(), bsl)
+			requests := reconciler.invalidateBackupReposForBSL(t.Context(), bsl)
 
 			after := &velerov1api.BackupRepository{}
 			require.NoError(t, reconciler.Client.Get(t.Context(), types.NamespacedName{Namespace: test.repo.Namespace, Name: test.repo.Name}, after))
@@ -593,11 +593,11 @@ func TestInvalidateStaleReposForBSLOnCreate(t *testing.T) {
 			nil,
 			nil,
 		)
-		assert.Empty(t, reconciler.invalidateStaleReposForBSLOnCreate(t.Context(), bsl))
+		assert.Empty(t, reconciler.invalidateBackupReposForBSL(t.Context(), bsl))
 	})
 }
 
-func TestNeedInvalidBackupRepoOnCreate(t *testing.T) {
+func TestNeedInvalidBackupRepoForBSL(t *testing.T) {
 	bsl := mockBackupStorageLocationCR()
 
 	repoForBSL := func(name string, phase velerov1api.BackupRepositoryPhase, hash string) *velerov1api.BackupRepository {
@@ -653,13 +653,13 @@ func TestNeedInvalidBackupRepoOnCreate(t *testing.T) {
 			reconciler := mockBackupRepoReconciler(t, "", nil, nil)
 			require.NoError(t, reconciler.Client.Create(t.Context(), test.repo))
 
-			assert.Equal(t, test.expect, reconciler.needInvalidBackupRepoOnCreate(bsl))
+			assert.Equal(t, test.expect, reconciler.needInvalidBackupRepoForBSL(bsl))
 		})
 	}
 
 	t.Run("no repos for BSL does not need invalidation", func(t *testing.T) {
 		reconciler := mockBackupRepoReconciler(t, "", nil, nil)
-		assert.False(t, reconciler.needInvalidBackupRepoOnCreate(bsl))
+		assert.False(t, reconciler.needInvalidBackupRepoForBSL(bsl))
 	})
 
 	t.Run("list error does not need invalidation", func(t *testing.T) {
@@ -675,7 +675,7 @@ func TestNeedInvalidBackupRepoOnCreate(t *testing.T) {
 			nil,
 			nil,
 		)
-		assert.False(t, reconciler.needInvalidBackupRepoOnCreate(bsl))
+		assert.False(t, reconciler.needInvalidBackupRepoForBSL(bsl))
 	})
 }
 
