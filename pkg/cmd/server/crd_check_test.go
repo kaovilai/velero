@@ -28,6 +28,8 @@ import (
 	fakeapiext "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 )
 
 type TestBase struct {
@@ -121,6 +123,13 @@ func TestJsonFieldNames(t *testing.T) {
 		assert.True(t, result.Has("count"))
 		assert.True(t, result.Has("extra"))
 		assert.False(t, result.Has("base"), "\",inline\" tag has no name to nest under")
+	})
+
+	t.Run("real BackupStorageLocationSpec promotes inline-embedded StorageType", func(t *testing.T) {
+		result := jsonFieldNames(reflect.TypeFor[velerov1api.BackupStorageLocationSpec]())
+		assert.True(t, result.Has("objectStorage"),
+			"StorageType is embedded with `json:\",inline\"` and must be flattened, not dropped")
+		assert.True(t, result.Has("provider"))
 	})
 }
 
