@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -142,6 +142,42 @@ func (ib *itemBackupper) itemInclusionChecks(log logrus.FieldLogger, mustInclude
 			log.Info("Excluding item because resource is excluded")
 			return false
 		}
+
+		// Per-kind name filter from ResourcePolicy namespace filter.
+		if namespace != "" {
+			if nsFilter := ib.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
+				rf := nsFilter.ResourceFilterMap[groupResource.String()]
+				if rf == nil {
+					rf = nsFilter.CatchAllFilter
+				}
+				// When rf is still nil the item's kind is not listed in the namespace filter and
+				// there is no catch-all entry. This is an intentional permissive passthrough:
+				// plugin-injected additional items (returned by BackupItemAction) must be able
+				// to reach the archive even when their kind was not explicitly listed in
+				// namespacedFilterPolicies, because excluding them at Stage 2 would break backup
+				// completeness. For example, a CSI plugin may inject a VolumeSnapshotContent
+				// as an additional item that is required for a correct restore. Kind-level
+				// exclusion for the primary collection pass is enforced earlier in
+				// item_collector.go (Stage 1).
+				if rf != nil && rf.NameIE != nil {
+					if !rf.NameIE.ShouldInclude(metadata.GetName()) {
+						log.Infof("Excluding item: name does not match resource filter for kind %s",
+							groupResource)
+						return false
+					}
+				}
+			}
+		} else {
+			// Cluster-scoped resource name filter
+			if ib.backupRequest.ClusterScopedFilterMap != nil {
+				if rf, ok := ib.backupRequest.ClusterScopedFilterMap[groupResource.String()]; ok && rf.NameIE != nil {
+					if !rf.NameIE.ShouldInclude(metadata.GetName()) {
+						log.Infof("Excluding item: name does not match clusterScopedFilterPolicy for kind %s", groupResource)
+						return false
+					}
+				}
+			}
+		}
 	}
 
 	if metadata.GetDeletionTimestamp() != nil {
@@ -209,6 +245,7 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 			// where it's been backed up from another pod), since we don't need >1 backup per PVC.
 			for _, volume := range pod.Spec.Volumes {
 				shouldDoFSBackup, err := ib.volumeHelperImpl.ShouldPerformFSBackup(volume, *pod)
+
 				if err != nil {
 					backupErrs = append(backupErrs, errors.WithStack(err))
 				}
@@ -315,16 +352,28 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 	if versionPath == preferredGVR.Version {
 		// backing up preferred version backup without API Group version - for backward compatibility
 		log.Debugf("Resource %s/%s, version= %s, preferredVersion=%s", groupResource.String(), name, versionPath, preferredGVR.Version)
-		itemFiles = append(itemFiles, getFileForArchive(namespace, name, groupResource.String(), "", itemBytes))
+		fileForArchive, err := getFileForArchive(namespace, name, groupResource.String(), "", itemBytes)
+		if err != nil {
+			return false, itemFiles, err
+		}
+		itemFiles = append(itemFiles, fileForArchive)
 		versionPath = versionPath + velerov1api.PreferredVersionDir
 	}
 
-	itemFiles = append(itemFiles, getFileForArchive(namespace, name, groupResource.String(), versionPath, itemBytes))
+	fileForArchive, err := getFileForArchive(namespace, name, groupResource.String(), versionPath, itemBytes)
+	if err != nil {
+		return false, itemFiles, err
+	}
+	itemFiles = append(itemFiles, fileForArchive)
 	return true, itemFiles, nil
 }
 
-func getFileForArchive(namespace, name, groupResource, versionPath string, itemBytes []byte) FileForArchive {
-	filePath := archive.GetVersionedItemFilePath("", groupResource, namespace, name, versionPath)
+func getFileForArchive(namespace, name, groupResource, versionPath string, itemBytes []byte) (FileForArchive, error) {
+	filePath, err := archive.GetVersionedItemFilePath("", groupResource, namespace, name, versionPath)
+	if err != nil {
+		return FileForArchive{}, err
+	}
+
 	hdr := &tar.Header{
 		Name:     filePath,
 		Size:     int64(len(itemBytes)),
@@ -332,7 +381,7 @@ func getFileForArchive(namespace, name, groupResource, versionPath string, itemB
 		Mode:     0755,
 		ModTime:  time.Now(),
 	}
-	return FileForArchive{FilePath: filePath, Header: hdr, FileBytes: itemBytes}
+	return FileForArchive{FilePath: filePath, Header: hdr, FileBytes: itemBytes}, nil
 }
 
 // backupPodVolumes triggers pod volume backups of the specified pod volumes, and returns a list of PodVolumeBackups
@@ -432,6 +481,26 @@ func (ib *itemBackupper) executeActions(
 		delete(u.GetAnnotations(), velerov1api.MustIncludeAdditionalItemAnnotation)
 		obj = u
 
+		// If the BIA specifies that additional items must be included, we track any PVCs returned as additional items.
+		// This tracking is necessary because the FSB (File System Backup) evaluation for a Pod
+		// happens before its PVCs are processed. By tracking these explicitly included PVCs here,
+		// the FSB logic can correctly determine that the PVC will be backed up and therefore
+		// a PodVolumeBackup should be created.
+		// We track this unconditionally when mustInclude is true, because fine-grained backup filters
+		// might exclude a PVC even if it's globally included, but mustInclude overrides those filters.
+		if mustInclude && ib.backupRequest.MustIncludeAdditionalItemPVCs != nil {
+			for _, additionalItem := range additionalItemIdentifiers {
+				if additionalItem.GroupResource == kuberesource.PersistentVolumeClaims {
+					key := itemKey{
+						resource:  additionalItem.GroupResource.String(),
+						namespace: additionalItem.Namespace,
+						name:      additionalItem.Name,
+					}
+					ib.backupRequest.MustIncludeAdditionalItemPVCs.AddItem(key)
+				}
+			}
+		}
+
 		// If async plugin started async operation, add it to the ItemOperations list
 		// ignore during finalize phase
 		if operationID != "" {
@@ -521,9 +590,9 @@ func (ib *itemBackupper) executeActions(
 // zoneLabel is the label that stores availability-zone info
 // on PVs
 const (
-	zoneLabelDeprecated = "failure-domain.beta.kubernetes.io/zone"
+	zoneLabelDeprecated = corev1api.LabelFailureDomainBetaZone
 	// this is reused for nodeAffinity requirements
-	zoneLabel = "topology.kubernetes.io/zone"
+	zoneLabel = corev1api.LabelTopologyZone
 
 	awsEbsCsiZoneKey = "topology.ebs.csi.aws.com/zone"
 	azureCsiZoneKey  = "topology.disk.csi.azure.com/zone"

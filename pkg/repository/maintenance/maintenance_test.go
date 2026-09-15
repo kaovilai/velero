@@ -789,7 +789,7 @@ func TestWaitAllJobsComplete(t *testing.T) {
 				{
 					Result:         velerov1api.BackupRepositoryMaintenanceFailed,
 					StartTimestamp: &metav1.Time{Time: now.Add(time.Hour)},
-					Message:        "Repo maintenance failed but result is not retrieveable, err: no pod found for job job2",
+					Message:        "Repo maintenance failed but result is not retrievable, err: no pod found for job job2",
 				},
 			},
 		},
@@ -1224,6 +1224,274 @@ func TestBuildJob(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "Invalid label key is skipped",
+			m: &velerotypes.JobConfigs{
+				PodResources: &kube.PodResources{
+					CPURequest:    "100m",
+					MemoryRequest: "128Mi",
+					CPULimit:      "200m",
+					MemoryLimit:   "256Mi",
+				},
+				PodLabels: map[string]string{
+					"valid-label":   "valid-value",
+					"INVALID KEY!!": "some-value",
+				},
+			},
+			deploy:          deploy2,
+			logLevel:        logrus.InfoLevel,
+			logFormat:       logging.NewFormatFlag(),
+			expectedJobName: "test-123-maintain-job",
+			expectedError:   false,
+			expectedEnv: []corev1api.EnvVar{
+				{
+					Name:  "test-name",
+					Value: "test-value",
+				},
+			},
+			expectedEnvFrom: []corev1api.EnvFromSource{
+				{
+					ConfigMapRef: &corev1api.ConfigMapEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-configmap",
+						},
+					},
+				},
+				{
+					SecretRef: &corev1api.SecretEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-secret",
+						},
+					},
+				},
+			},
+			expectedPodLabel: map[string]string{
+				RepositoryNameLabel: "test-123",
+				"valid-label":       "valid-value",
+			},
+			expectedSecurityContext:    nil,
+			expectedPodSecurityContext: nil,
+			expectedImagePullSecrets: []corev1api.LocalObjectReference{
+				{
+					Name: "imagePullSecret1",
+				},
+			},
+		},
+		{
+			name: "Invalid label value is skipped",
+			m: &velerotypes.JobConfigs{
+				PodResources: &kube.PodResources{
+					CPURequest:    "100m",
+					MemoryRequest: "128Mi",
+					CPULimit:      "200m",
+					MemoryLimit:   "256Mi",
+				},
+				PodLabels: map[string]string{
+					"valid-label":   "valid-value",
+					"another-label": "this value has spaces and is invalid",
+				},
+			},
+			deploy:          deploy2,
+			logLevel:        logrus.InfoLevel,
+			logFormat:       logging.NewFormatFlag(),
+			expectedJobName: "test-123-maintain-job",
+			expectedError:   false,
+			expectedEnv: []corev1api.EnvVar{
+				{
+					Name:  "test-name",
+					Value: "test-value",
+				},
+			},
+			expectedEnvFrom: []corev1api.EnvFromSource{
+				{
+					ConfigMapRef: &corev1api.ConfigMapEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-configmap",
+						},
+					},
+				},
+				{
+					SecretRef: &corev1api.SecretEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-secret",
+						},
+					},
+				},
+			},
+			expectedPodLabel: map[string]string{
+				RepositoryNameLabel: "test-123",
+				"valid-label":       "valid-value",
+			},
+			expectedSecurityContext:    nil,
+			expectedPodSecurityContext: nil,
+			expectedImagePullSecrets: []corev1api.LocalObjectReference{
+				{
+					Name: "imagePullSecret1",
+				},
+			},
+		},
+		{
+			name: "Label value exceeding 63 characters is skipped",
+			m: &velerotypes.JobConfigs{
+				PodResources: &kube.PodResources{
+					CPURequest:    "100m",
+					MemoryRequest: "128Mi",
+					CPULimit:      "200m",
+					MemoryLimit:   "256Mi",
+				},
+				PodLabels: map[string]string{
+					"valid-label":      "valid-value",
+					"long-value-label": "this-value-is-way-too-long-for-a-kubernetes-label-value-and-exceeds-sixty-three-characters",
+				},
+			},
+			deploy:          deploy2,
+			logLevel:        logrus.InfoLevel,
+			logFormat:       logging.NewFormatFlag(),
+			expectedJobName: "test-123-maintain-job",
+			expectedError:   false,
+			expectedEnv: []corev1api.EnvVar{
+				{
+					Name:  "test-name",
+					Value: "test-value",
+				},
+			},
+			expectedEnvFrom: []corev1api.EnvFromSource{
+				{
+					ConfigMapRef: &corev1api.ConfigMapEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-configmap",
+						},
+					},
+				},
+				{
+					SecretRef: &corev1api.SecretEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-secret",
+						},
+					},
+				},
+			},
+			expectedPodLabel: map[string]string{
+				RepositoryNameLabel: "test-123",
+				"valid-label":       "valid-value",
+			},
+			expectedSecurityContext:    nil,
+			expectedPodSecurityContext: nil,
+			expectedImagePullSecrets: []corev1api.LocalObjectReference{
+				{
+					Name: "imagePullSecret1",
+				},
+			},
+		},
+		{
+			name: "User-provided label cannot overwrite RepositoryNameLabel",
+			m: &velerotypes.JobConfigs{
+				PodResources: &kube.PodResources{
+					CPURequest:    "100m",
+					MemoryRequest: "128Mi",
+					CPULimit:      "200m",
+					MemoryLimit:   "256Mi",
+				},
+				PodLabels: map[string]string{
+					RepositoryNameLabel: "user-override-attempt",
+					"valid-label":       "valid-value",
+				},
+			},
+			deploy:          deploy2,
+			logLevel:        logrus.InfoLevel,
+			logFormat:       logging.NewFormatFlag(),
+			expectedJobName: "test-123-maintain-job",
+			expectedError:   false,
+			expectedEnv: []corev1api.EnvVar{
+				{
+					Name:  "test-name",
+					Value: "test-value",
+				},
+			},
+			expectedEnvFrom: []corev1api.EnvFromSource{
+				{
+					ConfigMapRef: &corev1api.ConfigMapEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-configmap",
+						},
+					},
+				},
+				{
+					SecretRef: &corev1api.SecretEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-secret",
+						},
+					},
+				},
+			},
+			expectedPodLabel: map[string]string{
+				RepositoryNameLabel: "test-123",
+				"valid-label":       "valid-value",
+			},
+			expectedSecurityContext:    nil,
+			expectedPodSecurityContext: nil,
+			expectedImagePullSecrets: []corev1api.LocalObjectReference{
+				{
+					Name: "imagePullSecret1",
+				},
+			},
+		},
+		{
+			name: "Invalid annotation key is skipped",
+			m: &velerotypes.JobConfigs{
+				PodResources: &kube.PodResources{
+					CPURequest:    "100m",
+					MemoryRequest: "128Mi",
+					CPULimit:      "200m",
+					MemoryLimit:   "256Mi",
+				},
+				PodAnnotations: map[string]string{
+					"valid-annotation":  "any value is fine for annotations, even with spaces!",
+					"INVALID KEY ANNO!": "some-value",
+				},
+			},
+			deploy:          deploy2,
+			logLevel:        logrus.InfoLevel,
+			logFormat:       logging.NewFormatFlag(),
+			expectedJobName: "test-123-maintain-job",
+			expectedError:   false,
+			expectedEnv: []corev1api.EnvVar{
+				{
+					Name:  "test-name",
+					Value: "test-value",
+				},
+			},
+			expectedEnvFrom: []corev1api.EnvFromSource{
+				{
+					ConfigMapRef: &corev1api.ConfigMapEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-configmap",
+						},
+					},
+				},
+				{
+					SecretRef: &corev1api.SecretEnvSource{
+						LocalObjectReference: corev1api.LocalObjectReference{
+							Name: "test-secret",
+						},
+					},
+				},
+			},
+			expectedPodLabel: map[string]string{
+				RepositoryNameLabel:           "test-123",
+				"azure.workload.identity/use": "fake-label-value",
+			},
+			expectedPodAnnotation: map[string]string{
+				"valid-annotation": "any value is fine for annotations, even with spaces!",
+			},
+			expectedSecurityContext:    nil,
+			expectedPodSecurityContext: nil,
+			expectedImagePullSecrets: []corev1api.LocalObjectReference{
+				{
+					Name: "imagePullSecret1",
+				},
+			},
+		},
 	}
 
 	param := provider.RepoParam{
@@ -1245,10 +1513,14 @@ func TestBuildJob(t *testing.T) {
 		},
 	}
 
+	defaultBackupRepo := param.BackupRepo
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.backupRepository != nil {
 				param.BackupRepo = tc.backupRepository
+			} else {
+				param.BackupRepo = defaultBackupRepo
 			}
 
 			// Create a fake clientset with resources
@@ -1327,6 +1599,10 @@ func TestBuildJob(t *testing.T) {
 				assert.Equal(t, expectedArgs, container.Args)
 
 				assert.Equal(t, tc.expectedPodLabel, job.Spec.Template.Labels)
+
+				if tc.expectedPodAnnotation != nil {
+					assert.Equal(t, tc.expectedPodAnnotation, job.Spec.Template.Annotations)
+				}
 
 				assert.Equal(t, tc.expectedImagePullSecrets, job.Spec.Template.Spec.ImagePullSecrets)
 			}
@@ -1678,7 +1954,7 @@ func TestBuildTolerationsForMaintenanceJob(t *testing.T) {
 			},
 		},
 		{
-			name: "non-allowed toleration should not be inherited",
+			name: "all tolerations should be inherited",
 			deploymentTolerations: []corev1api.Toleration{
 				{
 					Key:      "vng-ondemand",
@@ -1686,88 +1962,36 @@ func TestBuildTolerationsForMaintenanceJob(t *testing.T) {
 					Effect:   "NoSchedule",
 					Value:    "amd64",
 				},
-			},
-			expectedTolerations: []corev1api.Toleration{
-				windowsToleration,
-			},
-		},
-		{
-			name: "allowed toleration should be inherited",
-			deploymentTolerations: []corev1api.Toleration{
 				{
-					Key:      "kubernetes.azure.com/scalesetpriority",
-					Operator: "Equal",
-					Effect:   "NoSchedule",
-					Value:    "spot",
-				},
-			},
-			expectedTolerations: []corev1api.Toleration{
-				windowsToleration,
-				{
-					Key:      "kubernetes.azure.com/scalesetpriority",
-					Operator: "Equal",
-					Effect:   "NoSchedule",
-					Value:    "spot",
-				},
-			},
-		},
-		{
-			name: "mixed allowed and non-allowed tolerations should only inherit allowed",
-			deploymentTolerations: []corev1api.Toleration{
-				{
-					Key:      "vng-ondemand", // not in allowlist
-					Operator: "Equal",
-					Effect:   "NoSchedule",
-					Value:    "amd64",
-				},
-				{
-					Key:      "CriticalAddonsOnly", // in allowlist
+					Key:      "CriticalAddonsOnly",
 					Operator: "Exists",
 					Effect:   "NoSchedule",
 				},
 				{
-					Key:      "custom-key", // not in allowlist
+					Key:      "custom-key",
 					Operator: "Equal",
-					Effect:   "NoSchedule",
+					Effect:   "NoExecute",
 					Value:    "custom-value",
 				},
 			},
 			expectedTolerations: []corev1api.Toleration{
 				windowsToleration,
 				{
-					Key:      "CriticalAddonsOnly",
-					Operator: "Exists",
-					Effect:   "NoSchedule",
-				},
-			},
-		},
-		{
-			name: "multiple allowed tolerations should all be inherited",
-			deploymentTolerations: []corev1api.Toleration{
-				{
-					Key:      "kubernetes.azure.com/scalesetpriority",
+					Key:      "vng-ondemand",
 					Operator: "Equal",
 					Effect:   "NoSchedule",
-					Value:    "spot",
+					Value:    "amd64",
 				},
 				{
 					Key:      "CriticalAddonsOnly",
 					Operator: "Exists",
 					Effect:   "NoSchedule",
 				},
-			},
-			expectedTolerations: []corev1api.Toleration{
-				windowsToleration,
 				{
-					Key:      "kubernetes.azure.com/scalesetpriority",
+					Key:      "custom-key",
 					Operator: "Equal",
-					Effect:   "NoSchedule",
-					Value:    "spot",
-				},
-				{
-					Key:      "CriticalAddonsOnly",
-					Operator: "Exists",
-					Effect:   "NoSchedule",
+					Effect:   "NoExecute",
+					Value:    "custom-value",
 				},
 			},
 		},
@@ -1793,36 +2017,6 @@ func TestBuildTolerationsForMaintenanceJob(t *testing.T) {
 }
 
 func TestBuildJobWithTolerationsInheritance(t *testing.T) {
-	// Define allowed tolerations that would be set on Velero deployment
-	allowedTolerations := []corev1api.Toleration{
-		{
-			Key:      "kubernetes.azure.com/scalesetpriority",
-			Operator: "Equal",
-			Effect:   "NoSchedule",
-			Value:    "spot",
-		},
-		{
-			Key:      "CriticalAddonsOnly",
-			Operator: "Exists",
-			Effect:   "NoSchedule",
-		},
-	}
-
-	// Mixed tolerations (allowed and non-allowed)
-	mixedTolerations := []corev1api.Toleration{
-		{
-			Key:      "vng-ondemand", // not in allowlist
-			Operator: "Equal",
-			Effect:   "NoSchedule",
-			Value:    "amd64",
-		},
-		{
-			Key:      "CriticalAddonsOnly", // in allowlist
-			Operator: "Exists",
-			Effect:   "NoSchedule",
-		},
-	}
-
 	// Windows toleration that should always be present
 	windowsToleration := corev1api.Toleration{
 		Key:      "os",
@@ -1844,8 +2038,21 @@ func TestBuildJobWithTolerationsInheritance(t *testing.T) {
 			},
 		},
 		{
-			name:                  "allowed tolerations should be inherited along with Windows toleration",
-			deploymentTolerations: allowedTolerations,
+			name: "all tolerations should be inherited along with Windows toleration",
+			deploymentTolerations: []corev1api.Toleration{
+				{
+					Key:      "kubernetes.azure.com/scalesetpriority",
+					Operator: "Equal",
+					Effect:   "NoSchedule",
+					Value:    "spot",
+				},
+				{
+					Key:      "custom-taint",
+					Operator: "Equal",
+					Effect:   "NoExecute",
+					Value:    "dedicated",
+				},
+			},
 			expectedTolerations: []corev1api.Toleration{
 				windowsToleration,
 				{
@@ -1855,21 +2062,10 @@ func TestBuildJobWithTolerationsInheritance(t *testing.T) {
 					Value:    "spot",
 				},
 				{
-					Key:      "CriticalAddonsOnly",
-					Operator: "Exists",
-					Effect:   "NoSchedule",
-				},
-			},
-		},
-		{
-			name:                  "mixed tolerations should only inherit allowed ones",
-			deploymentTolerations: mixedTolerations,
-			expectedTolerations: []corev1api.Toleration{
-				windowsToleration,
-				{
-					Key:      "CriticalAddonsOnly",
-					Operator: "Exists",
-					Effect:   "NoSchedule",
+					Key:      "custom-taint",
+					Operator: "Equal",
+					Effect:   "NoExecute",
+					Value:    "dedicated",
 				},
 			},
 		},

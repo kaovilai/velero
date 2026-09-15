@@ -26,8 +26,9 @@ import (
 	"time"
 
 	"github.com/bombsimon/logrusr/v3"
+	"github.com/cockroachdb/errors"
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapshotv1client "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -172,6 +173,10 @@ func newNodeAgentServer(logger logrus.FieldLogger, factory client.Factory, confi
 		return nil, err
 	}
 	if err := storagev1api.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := snapshotv1api.AddToScheme(scheme); err != nil {
 		cancelFunc()
 		return nil, err
 	}
@@ -379,10 +384,22 @@ func (s *nodeAgentServer) run() {
 		s.logger.Infof("Using customized pod annotations %+v", podAnnotations)
 	}
 
+	var tolerations []corev1api.Toleration
+	if s.dataPathConfigs != nil && len(s.dataPathConfigs.Tolerations) > 0 {
+		tolerations = s.dataPathConfigs.Tolerations
+		s.logger.Infof("Using customized tolerations %+v", tolerations)
+	}
+
 	if s.backupRepoConfigs != nil {
 		s.logger.Infof("Using backup repo config %v", s.backupRepoConfigs)
 	} else if cachePVCConfig != nil {
 		s.logger.Info("Backup repo config is not provided, using default values for cache volume configs")
+	}
+
+	var csiSnapshotMetadataServiceConfigs *velerotypes.CSISnapshotMetadataService
+	if s.dataPathConfigs != nil && s.dataPathConfigs.CSISnapshotMetadataServiceConfigs != nil {
+		csiSnapshotMetadataServiceConfigs = s.dataPathConfigs.CSISnapshotMetadataServiceConfigs
+		s.logger.Infof("Using CSI snapshot metadata service config %v", s.dataPathConfigs.CSISnapshotMetadataServiceConfigs)
 	}
 
 	pvbReconciler := controller.NewPodVolumeBackupReconciler(
@@ -401,6 +418,7 @@ func (s *nodeAgentServer) run() {
 		privilegedFsBackup,
 		podLabels,
 		podAnnotations,
+		tolerations,
 	)
 	if err := pvbReconciler.SetupWithManager(s.mgr); err != nil {
 		s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerPodVolumeBackup)
@@ -424,6 +442,7 @@ func (s *nodeAgentServer) run() {
 		s.repoConfigMgr,
 		podLabels,
 		podAnnotations,
+		tolerations,
 	)
 	if err := pvrReconciler.SetupWithManager(s.mgr); err != nil {
 		s.logger.WithError(err).Fatal("Unable to create the pod volume restore controller")
@@ -447,6 +466,8 @@ func (s *nodeAgentServer) run() {
 		dataMovePriorityClass,
 		podLabels,
 		podAnnotations,
+		csiSnapshotMetadataServiceConfigs,
+		tolerations,
 	)
 	if err := dataUploadReconciler.SetupWithManager(s.mgr); err != nil {
 		s.logger.WithError(err).Fatal("Unable to create the data upload controller")
@@ -477,6 +498,8 @@ func (s *nodeAgentServer) run() {
 		s.repoConfigMgr,
 		podLabels,
 		podAnnotations,
+		csiSnapshotMetadataServiceConfigs,
+		tolerations,
 	)
 
 	if err := dataDownloadReconciler.SetupWithManager(s.mgr); err != nil {

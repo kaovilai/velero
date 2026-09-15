@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 	appsv1api "k8s.io/api/apps/v1"
 	batchv1api "k8s.io/api/batch/v1"
@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -350,7 +351,7 @@ func WaitJobComplete(cli client.Client, ctx context.Context, jobName, ns string,
 	if maintenanceJob.Status.Failed > 0 {
 		if r, err := getResultFromJob(cli, maintenanceJob); err != nil {
 			log.WithError(err).Warn("Failed to get maintenance job result")
-			result = "Repo maintenance failed but result is not retrieveable"
+			result = "Repo maintenance failed but result is not retrievable"
 		} else {
 			result = r
 		}
@@ -413,7 +414,7 @@ func WaitAllJobsComplete(ctx context.Context, cli client.Client, repo *velerov1a
 		if job.Status.Failed > 0 {
 			if msg, err := getResultFromJob(cli, job); err != nil {
 				log.WithError(err).Warnf("Failed to get result of maintenance job %s", job.Name)
-				message = fmt.Sprintf("Repo maintenance failed but result is not retrieveable, err: %v", err)
+				message = fmt.Sprintf("Repo maintenance failed but result is not retrievable, err: %v", err)
 			} else {
 				message = msg
 			}
@@ -481,9 +482,8 @@ func StartNewJob(
 }
 
 // buildTolerationsForMaintenanceJob builds the tolerations for maintenance jobs.
-// It includes the required Windows toleration for backward compatibility and filters
-// tolerations from the Velero deployment to only include those with keys that are
-// in the ThirdPartyTolerations allowlist, following the same pattern as labels and annotations.
+// It includes the required Windows toleration for backward compatibility and
+// inherits all tolerations from the Velero deployment.
 func buildTolerationsForMaintenanceJob(deployment *appsv1api.Deployment) []corev1api.Toleration {
 	// Start with the Windows toleration for backward compatibility
 	windowsToleration := corev1api.Toleration{
@@ -494,17 +494,9 @@ func buildTolerationsForMaintenanceJob(deployment *appsv1api.Deployment) []corev
 	}
 	result := []corev1api.Toleration{windowsToleration}
 
-	// Filter tolerations from the Velero deployment to only include allowed ones
-	// Only tolerations that exist on the deployment AND have keys in the allowlist are inherited
+	// Inherit all tolerations from the Velero deployment
 	deploymentTolerations := veleroutil.GetTolerationsFromVeleroServer(deployment)
-	for _, k := range util.ThirdPartyTolerations {
-		for _, toleration := range deploymentTolerations {
-			if toleration.Key == k {
-				result = append(result, toleration)
-				break // Only add the first matching toleration for each allowed key
-			}
-		}
-	}
+	result = append(result, deploymentTolerations...)
 
 	return result
 }
@@ -610,6 +602,18 @@ func buildJob(
 	}
 	if config != nil && len(config.PodLabels) > 0 {
 		for k, v := range config.PodLabels {
+			if k == RepositoryNameLabel {
+				logger.Warnf("Skipping user-provided label with reserved key %q; this label is managed internally by Velero", k)
+				continue
+			}
+			if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+				logger.Warnf("Skipping user-provided label with invalid key %q: %s", k, strings.Join(errs, "; "))
+				continue
+			}
+			if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+				logger.Warnf("Skipping user-provided label %q with invalid value %q: %s", k, v, strings.Join(errs, "; "))
+				continue
+			}
 			podLabels[k] = v
 		}
 	} else {
@@ -623,6 +627,10 @@ func buildJob(
 	podAnnotations := map[string]string{}
 	if config != nil && len(config.PodAnnotations) > 0 {
 		for k, v := range config.PodAnnotations {
+			if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+				logger.Warnf("Skipping user-provided annotation with invalid key %q: %s", k, strings.Join(errs, "; "))
+				continue
+			}
 			podAnnotations[k] = v
 		}
 	} else {
