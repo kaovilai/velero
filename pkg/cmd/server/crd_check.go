@@ -100,19 +100,18 @@ func jsonFieldNames(t reflect.Type) sets.Set[string] {
 	fields := sets.New[string]()
 	for field := range t.Fields() {
 		tag := field.Tag.Get("json")
-		// An anonymous field with no JSON tag is promoted/flattened by encoding/json.
-		// One with an explicit tag name (e.g. `json:"metadata,omitempty"`) is instead
+		name, _, _ := strings.Cut(tag, ",")
+		// An anonymous field with no JSON tag, or tagged `json:",inline"` (the
+		// Kubernetes convention for structural-schema inlining), is promoted/
+		// flattened rather than nested under its own field name. One with an
+		// explicit tag name (e.g. `json:"metadata,omitempty"`) is instead
 		// marshaled as a regular named field, not inlined.
-		if field.Anonymous && tag == "" {
+		if field.Anonymous && name == "" && tag != "-" {
 			embedded := jsonFieldNames(field.Type)
 			fields = fields.Union(embedded)
 			continue
 		}
-		if tag == "" || tag == "-" {
-			continue
-		}
-		name, _, _ := strings.Cut(tag, ",")
-		if name == "" {
+		if tag == "" || tag == "-" || name == "" {
 			continue
 		}
 		fields.Insert(name)
