@@ -55,6 +55,15 @@ type testSpecWithNamedEmbedded struct {
 	Extra    string `json:"extra"`
 }
 
+// testSpecWithInlineEmbedded mirrors BackupStorageLocationSpec embedding
+// StorageType with `json:",inline"` — the Kubernetes structural-schema
+// convention for promoting an embedded struct's fields, distinct from both
+// the no-tag case and a named-tag nested object.
+type testSpecWithInlineEmbedded struct {
+	TestBase `json:",inline"`
+	Extra    string `json:"extra"`
+}
+
 func TestJsonFieldNames(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -104,6 +113,14 @@ func TestJsonFieldNames(t *testing.T) {
 		assert.True(t, result.Has("extra"))
 		assert.False(t, result.Has("name"), "embedded fields should nest under their tag name, not promote")
 		assert.False(t, result.Has("count"), "embedded fields should nest under their tag name, not promote")
+	})
+
+	t.Run("embedded field tagged json:,inline is promoted like an untagged one", func(t *testing.T) {
+		result := jsonFieldNames(reflect.TypeFor[testSpecWithInlineEmbedded]())
+		assert.True(t, result.Has("name"))
+		assert.True(t, result.Has("count"))
+		assert.True(t, result.Has("extra"))
+		assert.False(t, result.Has("base"), "\",inline\" tag has no name to nest under")
 	})
 }
 
