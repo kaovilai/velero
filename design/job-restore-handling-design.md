@@ -48,7 +48,7 @@ The current logic for handling Jobs during restore will be modified as follows:
    - Optional behavior: Skip restoration or restore with original configuration
 
 4. **Pending Jobs** (created but never started — no active Pods, no recorded failures, no start time, no completion/failure condition):
-   - Default behavior: Restore with original configuration (current behavior). A pending Job never ran, so restoring it as-is carries no risk of unintended re-execution.
+   - Default behavior: Restore with original configuration (current behavior). A pending Job never ran, so restoring it as-is carries no risk of unintended re-execution. Classification is based on the Job's backed-up `status`; if the Job actually started running after that snapshot was taken but before the backup completed, it is still classified as `pending` from Velero's point of view and restored as-is (i.e. not paused) — restoring at all is still correct here, so the default is unaffected.
    - Optional behavior: Skip restoration or restore with parallelism=0
 
 ### Implementation Details
@@ -98,7 +98,7 @@ jobRestorePolicies:
   2. `failed`: a `Failed` condition with `status: "True"` is present (retries exhausted) and no `Complete` condition with `status: "True"` is present (and `completionTime` is not set). A `Complete` condition that is merely present but not `"True"` (e.g., `status: "False"`) does not block this classification.
   3. `running`: neither `completed` nor `failed` above, and the Job has already started — `status.active > 0` (Pods currently running), OR `status.startTime` is set, OR `status.failed > 0` (retried at least once). This covers Jobs with currently-active Pods as well as Jobs that started, hit failures, and are between retries/backoff with zero active Pods at backup time.
   4. `pending`: none of the above — Job created but never started: no active Pods, no recorded failures, no `status.startTime`, and no completion/failure condition.
-- `jobLabels`: Simple key/value map for label matching (consistent with VolumePolicy's `pvcLabels`). Matching is by exact equality on all specified key/value pairs: every label defined here must exist on the Job with the same value; no partial, substring, or regex matching is performed.
+- `jobLabels`: Simple key/value map for label matching (consistent with VolumePolicy's `pvcLabels`). Matching is by exact equality on all specified key/value pairs: every label defined here must exist on the Job with the same value; no partial, substring, or regex matching is performed. `jobLabels` is optional; if it is omitted (or empty), it imposes no label constraint and matches Jobs regardless of their labels. This lets a rule act as a catch-all on `jobLabels` alone (matching every Job, or every Job of a given `jobPhase` if that condition is also set), so users can configure a default/catch-all policy for all Jobs entirely within ResourcePolicy, without needing a Restore annotation fallback. The same applies to `jobPhase`: if omitted, the rule is not restricted by phase. A rule with neither field set (as in the third example above) matches every Job.
 
 ##### Action Types
 
