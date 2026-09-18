@@ -16,23 +16,29 @@ Known failing paths (tracked in [issue #8815](https://github.com/vmware-tanzu/ve
 - `BackupRepository` name is `VolumeNamespace + "-" + BackupStorageLocation + "-" + RepositoryType`.
   A BSL or namespace name approaching the 253-character maximum causes the concatenated name to exceed the limit.
 - `DataUpload` uses `GenerateName: backup.Name + "-"`.
-  Kubernetes appends a 5-character random suffix; if the prefix exceeds 248 characters the creation is rejected.
+  If `backup.Name` is near the 253-character maximum, the resulting `GenerateName` value itself exceeds 253 characters and Kubernetes rejects the create outright (`metadata.generateName` is validated as a DNS1123 subdomain, independent of the random suffix appended later).
 - `DataDownload` uses `GenerateName: restore.Name + "-"` with the same failure mode.
 
-A broader audit of the codebase found twenty-two distinct locations across five categories with this class of bug.
-An additional audit found four `GenerateName` sites that bypass the existing `CreateRetryGenerateName` wrapper, leaving them vulnerable to spurious `AlreadyExists` failures on name collision.
+A broader audit of the codebase found twenty-three distinct locations across five categories with this class of bug.
+An additional audit found five `GenerateName` sites that bypass the existing `CreateRetryGenerateName` wrapper, leaving them vulnerable to spurious `AlreadyExists` failures on name collision.
 
 A design review by @blackpiglet identified a critical flaw in the original proposal: four of the Category D label values are used by `find*ByPod` helper functions to look up their owning object by exact name (`client.Get(..., Name: label)`).
 Truncating those label values with a hash (the original Category D approach) would break these lookups for any name long enough to require truncation, because the truncated label no longer matches the object's real name.
 Category D below is split into a safe subset (label values used only for selector-based filtering, where hashing both the write and the read side is sufficient) and a subset that requires an additional annotation-based fallback so the full name remains recoverable.
+
+A subsequent review caught a second, independent flaw in the `GetValidGenerateName` design: the 248-character target was derived from the wrong constraint.
+248 keeps the raw `GenerateName` *field* under the 253-character DNS1123 subdomain limit (avoiding the rejection above), but it ignores what Kubernetes' name generator actually does with that field once it is accepted.
+Every REST storage strategy — for CustomResourceDefinitions and built-in types alike — uses `k8s.io/apiserver/pkg/storage/names.SimpleNameGenerator` by default, which keeps only the **first 58 characters** of the submitted prefix and appends its own 5 random characters, for a fixed 63-character total, regardless of the resource's own maximum name length.
+This is true for every one of Velero's Category A objects (DataUpload, DataDownload, PodVolumeBackup, PodVolumeRestore, DeleteBackupRequest, ConfigMap, VolumeSnapshot) because none of them install a custom `NameGenerator`.
+A 248-character prefix with a hash placed at characters 243–248 has that hash silently discarded by Kubernetes before the object is ever created — it never reaches the real object name. `GetValidGenerateName` is corrected below to place the hash inside the 58 characters Kubernetes actually retains.
 
 ## Goals
 
 - Prevent object creation failures caused by name or label value length exceeding Kubernetes limits.
 - Produce deterministic, unique, stable names when truncation is necessary.
 - Introduce a minimal, reusable set of helper functions so future code is easy to write correctly.
-- Fix all twenty-two known name-length locations identified in the audit.
-- Make all nine `GenerateName` sites consistent by using `CreateRetryGenerateName`, aligning with the KEP 4420 intent for collision-safe generated names.
+- Fix all twenty-three known name-length locations identified in the audit.
+- Make all ten `GenerateName` sites consistent by using `CreateRetryGenerateName`, aligning with the KEP 4420 intent for collision-safe generated names.
 - Preserve correct `find*ByPod` lookup behavior for hosting pods whose owning object's label value was truncated, by recovering the full name from a pod annotation.
 
 ## Non Goals
@@ -42,21 +48,21 @@ Category D below is split into a safe subset (label values used only for selecto
   Duplicate client-side validation is not needed.
 - Changing the CRD schema or adding new API fields.
 - Migrating objects that were already created with names derived from the old code.
-  As explained in the Compatibility section, such objects could never have existed because Kubernetes itself rejects names > 253 characters at creation time.
+  As explained in the Compatibility section, this is unnecessary for two different reasons depending on category: for the admission-rejected cases, such objects could never have existed; for Category E's lookup inconsistency, the fix makes existing objects findable without any data change.
 
 ## High-Level Design
 
 Two new helper functions are added to `pkg/label/label.go`, following the same pattern as the existing `GetValidName` function which already handles the 63-character label limit:
 
 **`GetValidGenerateName(prefix string) string`**
-Truncates a `GenerateName` prefix to at most 248 characters.
-Kubernetes appends a 5-character random suffix, so the prefix must be ≤ 248 for the total to be ≤ 253.
-When truncation is needed the last 6 characters of the prefix are replaced with the first 6 characters of the SHA-256 of the original prefix, preserving uniqueness.
+Truncates a `GenerateName` prefix to at most 58 characters — the number of characters Kubernetes' default `names.SimpleNameGenerator` actually retains from a `GenerateName` value before appending its own 5-character random suffix, independent of the resource's own maximum name length.
+When truncation is needed the last 6 characters of the (58-character) result are replaced with the first 6 characters of the SHA-256 of the original prefix, so the retained portion still differs between distinct long inputs even though most of the input is discarded either way.
 
 **`GetValidObjectName(name string) string`**
 Truncates a deterministic object name to at most 253 characters using the same hash-suffix strategy.
+Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix meaningfully guarantees a distinct final name for distinct long inputs (not just a distinct prefix before a random suffix, as in the `GenerateName` case).
 
-All twenty-two affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
+All twenty-three affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
 
 For the four Category D locations whose label value is used to look up the owning object by exact name (`find*ByPod` helpers), truncation alone is insufficient: the design additionally introduces a per-object annotation on the hosting pod that stores the full, untruncated name, and updates the lookup helpers to read the annotation first, falling back to the (possibly truncated) label for pods created before this change. See Category D (D.2) below for details.
 
@@ -72,10 +78,24 @@ Rather than duplicating the logic, `GetValidName` is refactored to delegate to a
 // GenerateName prefix when creating an object.
 const randomSuffixLength = 5
 
+// kubernetesGeneratedNameTotalLength is the fixed total length (retained prefix +
+// random suffix) that Kubernetes' default names.SimpleNameGenerator
+// (k8s.io/apiserver/pkg/storage/names) produces for a GenerateName-based create.
+// Every REST storage strategy -- for CustomResourceDefinitions and built-in types
+// alike -- uses this generator unless it installs a custom NameGenerator, which
+// none of Velero's GenerateName sites do. The retained-prefix length (58) is NOT
+// derived from the per-resource DNS1123Subdomain limit (253); characters
+// submitted past that point -- including a hash suffix appended by Velero itself
+// -- are silently discarded before the object is created.
+const kubernetesGeneratedNameTotalLength = 63
+
 // getValidNameWithMaxLen is the shared implementation for all name-length helpers.
 // If name fits within maxLen it is returned unchanged.
 // Otherwise the last 6 characters are replaced with the first 6 hex characters of
-// SHA-256(name) so that distinct long names remain distinct after truncation.
+// SHA-256(name), reducing (not eliminating) the chance that two distinct long
+// names collide after truncation. See "Truncate without a hash suffix" in
+// Alternatives Considered for the actual collision bound and why it differs
+// between GetValidObjectName and GetValidGenerateName callers.
 func getValidNameWithMaxLen(name string, maxLen int) string {
     if len(name) <= maxLen {
         return name
@@ -94,24 +114,31 @@ func GetValidName(label string) string {
     return getValidNameWithMaxLen(label, validation.DNS1035LabelMaxLength)
 }
 
-// GetValidGenerateName truncates a GenerateName prefix so that the generated name
-// (prefix + 5-character random suffix) fits within the Kubernetes 253-character limit.
+// GetValidGenerateName truncates a GenerateName prefix to the number of
+// characters Kubernetes' SimpleNameGenerator actually retains (58) before
+// appending its own 5-character random suffix. This is independent of --
+// and much stricter than -- the 253-character DNS1123Subdomain limit that
+// merely keeps the raw GenerateName field itself from being rejected at
+// admission.
 func GetValidGenerateName(prefix string) string {
-    return getValidNameWithMaxLen(prefix, validation.DNS1123SubdomainMaxLength-randomSuffixLength)
+    return getValidNameWithMaxLen(prefix, kubernetesGeneratedNameTotalLength-randomSuffixLength) // 58
 }
 
 // GetValidObjectName truncates a deterministic object name to the Kubernetes
-// 253-character DNS subdomain limit.
+// 253-character DNS subdomain limit. Unlike GetValidGenerateName, this name
+// is never passed through SimpleNameGenerator, so the full DNS1123Subdomain
+// limit applies.
 func GetValidObjectName(name string) string {
     return getValidNameWithMaxLen(name, validation.DNS1123SubdomainMaxLength)
 }
 ```
 
 `validation.DNS1035LabelMaxLength` (63) and `validation.DNS1123SubdomainMaxLength` (253) are both from `k8s.io/apimachinery/pkg/util/validation`, which is already imported by the package.
+`kubernetesGeneratedNameTotalLength` (63) and `randomSuffixLength` (5) together document the fixed total that `names.SimpleNameGenerator` produces; Velero does not add `k8s.io/apiserver` as a dependency to obtain these as real constants (see "Import `k8s.io/apiserver/pkg/storage/names`" under Alternatives Considered) — they are re-declared locally with a comment citing the upstream behavior they mirror.
 
-### Category A — `GenerateName` prefix > 248 characters (9 locations)
+### Category A — `GenerateName` prefix exceeds what Kubernetes retains (10 locations)
 
-All nine locations replace the raw string with `label.GetValidGenerateName(...)`:
+All ten locations replace the raw string with `label.GetValidGenerateName(...)`:
 
 | File | Object | Before | After |
 | --- | --- | --- | --- |
@@ -124,8 +151,13 @@ All nine locations replace the raw string with `label.GetValidGenerateName(...)`
 | `pkg/restore/actions/dataupload_retrieve_action.go:97` | ConfigMap | `dataUpload.Name + "-"` | `label.GetValidGenerateName(dataUpload.Name + "-")` |
 | `pkg/backup/actions/csi/pvc_action.go:252` | VolumeSnapshot | `"velero-" + pvc.Name + "-"` | `label.GetValidGenerateName("velero-" + pvc.Name + "-")` |
 | `pkg/restore/actions/csi/pvc_action.go:685` | VolumeSnapshot (restore-side rehydration) | `"velero-" + pvc.Name + "-"` | `label.GetValidGenerateName("velero-" + pvc.Name + "-")` |
+| `pkg/backup/actions/csi/pvc_action.go:1007` | VolumeGroupSnapshot | `fmt.Sprintf("velero-%s-", vgsLabelValue)` | `label.GetValidGenerateName(fmt.Sprintf("velero-%s-", vgsLabelValue))` |
 
-The VolumeSnapshot cases deserve attention: `"velero-"` (7 chars) + pvc.Name (up to 253) + `"-"` (1 char) = up to 261 characters, exceeding the 248-character prefix limit when pvc.Name exceeds 240 characters. This applies identically to both the backup-side (`pkg/backup/actions/csi/pvc_action.go:252`) and restore-side (`pkg/restore/actions/csi/pvc_action.go:685`) VolumeSnapshot creation, which were previously missed as two independent sites.
+Kubernetes' name generator retains only the first 58 characters of whatever `GenerateName` value is submitted (see Background), so the effective budget for user-controlled content is `58 - <fixed literal characters>` for each pattern above — roughly 57 characters for the seven `<name> + "-"` sites, and roughly 50 characters for the three `"velero-" + <name> + "-"` sites.
+This is a much smaller budget than the 248/253-character figures the field-level admission check allows, so truncation is the common case for these sites, not a rare edge case: any backup, restore, or PVC name longer than ~50-57 characters — not just pathologically long ones — will have its `GenerateName` prefix hashed.
+That is expected and harmless: Kubernetes' own random 5-character suffix, appended after this helper runs, already guarantees the final object name is essentially always unique regardless of what the retained 58-character prefix looks like; correlation back to the owning backup/restore/PVC always goes through labels (`BackupNameLabel`, etc.), not through parsing the generated name's prefix.
+
+The VolumeSnapshot and VolumeGroupSnapshot cases deserve attention: `"velero-"` (7 chars) + a name up to 253 chars + `"-"` (1 char) can be up to 261 characters — far more than the 58 characters Kubernetes retains — so these three sites (`pkg/backup/actions/csi/pvc_action.go:252` and `:1007`, and `pkg/restore/actions/csi/pvc_action.go:685`) are truncated on nearly every real-world PVC name and VGS group-label value, not only unusually long ones. All three were previously missed as independent audit misses; `pkg/backup/actions/csi/pvc_action.go:1007` (VolumeGroupSnapshot) was previously listed under "Locations confirmed safe" using the (incorrect) 248-character figure — see the note in that section below.
 
 `pkg/backup/delete_helpers.go:32`'s `NewDeleteBackupRequest` is a second, independent `DeleteBackupRequest` constructor used by the GC controller (`pkg/controller/gc_controller.go:204`), distinct from the CLI's `pkg/cmd/cli/backup/delete.go:126`. Both construct the same object with the same `GenerateName` pattern but were previously two separate audit misses; both need the fix. The GC controller call site already uses `veleroclient.CreateRetryGenerateName`, so no Category F change is needed there.
 
@@ -162,9 +194,8 @@ func getCachePVCName(ownerObject corev1api.ObjectReference) string {
 }
 ```
 
-`ownerObject` is a DataDownload whose generated name can be up to 253 characters.
-Appending `"-cache"` (6 characters) produces a string of up to 259 characters.
-Because `getCachePVCName` is called consistently for both creation and all subsequent lookups, applying the same truncation function everywhere preserves correctness.
+`ownerObject` is a DataDownload. Its `Name` is produced by `GenerateName`, so — as established in Background and Category A — Kubernetes' own name generator already guarantees it is ≤ 63 characters, regardless of how long `restore.Name` was; appending `"-cache"` (6 characters) therefore produces at most 69 characters, well under the 253-character limit. This fix is kept for defense-in-depth (see Compatibility) rather than because it is reachable with today's Kubernetes name generator behavior.
+Because `getCachePVCName` is called consistently for both creation and all subsequent lookups, applying the same truncation function everywhere preserves correctness regardless.
 
 `pkg/datamover/dataupload_delete_action.go:118`:
 
@@ -240,13 +271,39 @@ DataUploadFullNameAnnotation   = "velero.io/data-upload-full-name"
 DataDownloadFullNameAnnotation = "velero.io/data-download-full-name"
 ```
 
-At each of the four write sites, the hosting pod gets both the (possibly truncated) label — for selector-based listing and human-readable `kubectl get -l` filtering — and the full-name annotation:
+At each of the four write sites, the hosting pod gets both the (possibly truncated) label — for selector-based listing and human-readable `kubectl get -l` filtering — and the full-name annotation.
+
+**Reserved-key precedence.** All four sites merge a user-configurable map (`r.podLabels`/`r.podAnnotations`, or third-party labels/annotations discovered from the node-agent's own config) on top of a map that is seeded with Velero's own reserved key. Today that is true only for `hostingPodLabels` (`PVBLabel`, etc.); if the new `PVBFullNameAnnotation`-style keys were added the same way — reserved key first, user config merged in after — a user (or a copy-pasted config) that happened to set an annotation using one of these reserved keys would silently overwrite the real owning-object name, and the corresponding `find*ByPod` lookup would then fetch the wrong object or return `NotFound`.
+To avoid this, both the pre-existing label map and the new annotation map must apply Velero's reserved key(s) *last*, after any user-configured or third-party-discovered entries, so user configuration can never replace them:
 
 ```go
 // pkg/controller/pod_volume_backup_controller.go
-hostingPodLabels := map[string]string{velerov1api.PVBLabel: label.GetValidName(pvb.Name)}
-hostingPodAnnotations := map[string]string{velerov1api.PVBFullNameAnnotation: pvb.Name}
+hostingPodLabels := map[string]string{}
+if len(r.podLabels) > 0 {
+    for k, v := range r.podLabels {
+        hostingPodLabels[k] = v
+    }
+} else {
+    for _, k := range util.ThirdPartyLabels {
+        // ... discover third-party labels as today ...
+    }
+}
+hostingPodLabels[velerov1api.PVBLabel] = label.GetValidName(pvb.Name) // reserved; applied last
+
+hostingPodAnnotations := map[string]string{}
+if len(r.podAnnotations) > 0 {
+    for k, v := range r.podAnnotations {
+        hostingPodAnnotations[k] = v
+    }
+} else {
+    for _, k := range util.ThirdPartyAnnotations {
+        // ... discover third-party annotations as today ...
+    }
+}
+hostingPodAnnotations[velerov1api.PVBFullNameAnnotation] = pvb.Name // reserved; applied last
 ```
+
+The other three write sites (`pkg/controller/pod_volume_restore_controller.go`, `pkg/controller/data_upload_controller.go`, `pkg/controller/data_download_controller.go`) follow the same ordering with their respective label/annotation constant.
 
 Each `find*ByPod` helper is updated to prefer the annotation and fall back to the label, so pods created by an older Velero version (before this annotation existed) continue to resolve correctly:
 
@@ -301,12 +358,12 @@ velerov1api.RestoreNameLabel: restore.Name,
 velerov1api.RestoreNameLabel: label.GetValidName(restore.Name),
 ```
 
-### Category F — `GenerateName` without conflict retry (4 locations)
+### Category F — `GenerateName` without conflict retry (5 locations)
 
 Velero's `veleroclient.CreateRetryGenerateName` wraps object creation with a retry loop on `AlreadyExists` errors, handling the rare but possible collision when Kubernetes generates the same random suffix for two objects with the same prefix.
 This mirrors the intent of KEP 4420 (server-side `GenerateName` retry in Kubernetes 1.32+).
 
-Four `GenerateName` sites bypass this wrapper and call `crClient.Create` directly:
+Five `GenerateName` sites bypass this wrapper and call `crClient.Create` directly:
 
 | File | Object | Change |
 | --- | --- | --- |
@@ -314,8 +371,9 @@ Four `GenerateName` sites bypass this wrapper and call `crClient.Create` directl
 | `pkg/backup/actions/csi/pvc_action.go:597` | DataUpload | `crClient.Create` → `veleroclient.CreateRetryGenerateName` |
 | `pkg/restore/actions/csi/pvc_action.go:478` | DataDownload | `crClient.Create` → `veleroclient.CreateRetryGenerateName` |
 | `pkg/restore/actions/csi/pvc_action.go:697` | VolumeSnapshot (restore-side rehydration) | `p.crClient.Create` → `veleroclient.CreateRetryGenerateName` |
+| `pkg/backup/actions/csi/pvc_action.go:1022` | VolumeGroupSnapshot | `p.crClient.Create` → `veleroclient.CreateRetryGenerateName` |
 
-For completeness, the four sites that already use `CreateRetryGenerateName` are:
+For completeness, the five sites that already use `CreateRetryGenerateName` are:
 
 | File | Object |
 | --- | --- |
@@ -325,30 +383,33 @@ For completeness, the four sites that already use `CreateRetryGenerateName` are:
 | `pkg/backup/delete_helpers.go` caller, `pkg/controller/gc_controller.go:206` | DeleteBackupRequest (GC controller) |
 | `pkg/restore/actions/dataupload_retrieve_action.go:110` | DataUploadResult ConfigMap |
 
-After this fix all nine `GenerateName` sites will be consistent.
+After this fix all ten `GenerateName` sites will be consistent.
 Deployments running on Kubernetes 1.32+ additionally benefit from server-side retry (KEP 4420); the client-side wrapper remains harmless in that case because a server-retried success will never return `AlreadyExists` to the client.
 
 ### Locations confirmed safe (no change needed)
 
 | Location | Reason |
 | --- | --- |
-| `pkg/backup/actions/csi/pvc_action.go:956` — VolumeGroupSnapshot `GenerateName` | `vgsLabelValue` is sourced from a Kubernetes label value and is therefore already ≤ 63 characters; `"velero-" + 63 + "-"` = 71 ≤ 248 |
 | Exposer Pod/PVC/VS/VSC names (`ownerObject.Name`) | `ownerObject` is a DataUpload or DataDownload whose name Kubernetes guarantees to be ≤ 253 characters |
 | `pkg/repository/maintenance/maintenance.go` — `RepositoryNameLabel` values | Already uses `velerolabel.ReturnNameOrHash(repo.Name)` which enforces ≤ 63 characters |
 | `pkg/repository/maintenance/maintenance.go:GenerateJobName` | Already caps at 63 characters with a millisecond-based fallback |
+
+`pkg/backup/actions/csi/pvc_action.go:1007` (VolumeGroupSnapshot `GenerateName`) was previously listed here as safe, reasoning that `vgsLabelValue` (a Kubernetes label value, ≤ 63 characters) keeps `"velero-" + 63 + "-"` = 71 characters under the (incorrect) 248-character figure.
+71 is in fact well over the 58 characters Kubernetes' name generator actually retains (see Background and Category A), so this location is not safe from silent truncation and has moved into Category A/F above.
 
 ## Compatibility
 
 ### No impact for names within current limits
 
-For backup names ≤ 247 characters, restore names ≤ 247 characters, PVC names ≤ 240 characters, and BackupRepository key concatenations ≤ 253 characters, the helper functions return the input unchanged.
-The behavior of all existing deployments operating within these limits is identical before and after this change.
+This split by helper, since `GetValidGenerateName` and `GetValidObjectName`/`GetValidName` now have very different effective budgets:
+
+- `GetValidObjectName` (Category B, C) and `GetValidName` (Category D.1, D.2, E): for BackupRepository key concatenations ≤ 253 characters, cache PVC / ConfigMap derived names ≤ 253 characters, and label values ≤ 63 characters, these helpers return the input unchanged. Behavior for all existing deployments operating within these limits is identical before and after this change.
+- `GetValidGenerateName` (Category A): the effective unchanged-behavior threshold is **much smaller** than a naive reading of the 253-character DNS limit would suggest, because Kubernetes' own name generator only retains the first 58 characters of whatever is submitted (see Background). For the seven `<name> + "-"` sites, names ≤ ~57 characters are unaffected; for the three `"velero-" + <name> + "-"` sites, names ≤ ~50 characters are unaffected. Names longer than that were *already* being silently truncated by Kubernetes before this change (with no hash, just a hard cut at character 58) — this design does not introduce new truncation, it makes existing, previously-silent truncation deterministic and hash-suffixed instead of an arbitrary byte cut, and does not change whether creation succeeds either way.
 
 ### Objects that previously failed to create
 
-Any Velero deployment that encountered these bugs received a Kubernetes API error at object creation time and the backup or restore operation failed.
-No such object was ever persisted in etcd because Kubernetes itself enforces name limits at admission.
-There are therefore no existing objects to migrate.
+For the cases where an object name, `GenerateName` field value, or raw label value itself exceeded its DNS1123 length limit (Category A/B/C's motivating bugs, and Category D.1's label-value case), Velero received a Kubernetes API error at object creation time and the backup or restore operation failed. No such object was ever persisted in etcd because Kubernetes itself enforces those limits at admission, so there are no existing objects to migrate for those cases.
+Category E is different: it is a lookup bug against objects that *were* successfully created (the VGSC/VSC's stored `RestoreNameLabel` value, or the label's write side generally, was already within limits, or the query never even reached the point of hitting the length limit) — the problem is that the query and the stored value disagree, not that creation failed. No migration is needed there either, but for a different reason: once both the write and read sides consistently use `label.GetValidName`, existing objects created by the write-side fix become findable by the query-side fix without any data change.
 
 ### BackupRepository name change for long BSL or namespace names
 
@@ -359,11 +420,10 @@ Any pre-existing BackupRepository with a concatenated name that would have excee
 
 ### Cache PVC name for very long DataDownload names
 
-After the Category A fixes, `DataDownload.Name` is bounded at 253 characters.
-`getCachePVCName` returns `GetValidObjectName(ownerObject.Name + "-cache")`.
-For `DataDownload.Name` ≤ 247 characters the cache PVC name is unchanged.
-For `DataDownload.Name` > 247 characters (only possible if `restore.Name` exceeded 241 characters, at which point the DataDownload creation previously failed) the cache PVC name is truncated with a hash.
-Because all code paths that reference the cache PVC call the same `getCachePVCName` function, the name is consistent between creation and lookup regardless of truncation.
+`DataDownload.Name` is generated via `GenerateName`, so — independent of any Category A fix — Kubernetes' own name generator guarantees it is always ≤ 63 characters (see Background).
+`getCachePVCName` returns `GetValidObjectName(ownerObject.Name + "-cache")`; `ownerObject.Name + "-cache"` is therefore at most 69 characters, well under `GetValidObjectName`'s 253-character limit, so in practice this Category C fix is defensive rather than reachable today.
+It is still worth keeping: it makes `getCachePVCName` correct in its own right rather than relying on a fact about a different code path (Category A / Kubernetes' generator) that could change if a future Kubernetes version or a differently-configured API server used a different `NameGenerator`.
+Because all code paths that reference the cache PVC call the same `getCachePVCName` function, the name stays consistent between creation and lookup regardless of whether truncation is ever actually exercised.
 
 ### Label values for Category D.1 (selector-only)
 
@@ -378,6 +438,8 @@ No existing object could carry a raw label value longer than 63 characters becau
 The four Category D.2 fixes add a new full-name annotation alongside the (now hashed) label on the hosting pod, and update the corresponding `find*ByPod` helper to read the annotation first.
 Pods created by a Velero version prior to this change carry only the label, never the new annotation; the helper's fallback path (`pod.Labels[...]` when the annotation is absent) handles those pods identically to today, so a rolling upgrade does not lose in-flight PodVolumeBackup/PodVolumeRestore/DataUpload/DataDownload operations.
 Because these hosting pods are short-lived and recreated on every new operation, the fallback path is only ever exercised transiently during the upgrade window, not indefinitely.
+
+**Reserved-key precedence is itself a small, deliberate behavior change.** Today, `hostingPodLabels` is seeded with the reserved label first and any user-configured `PodLabels`/third-party label sharing that exact key overwrites it. This fix reverses that ordering (reserved key applied last) for both the existing label and the new annotation, so a user configuration that happens to collide with a reserved key can no longer silently break the corresponding `find*ByPod` lookup. This only changes behavior for the narrow, previously-unsafe case of a user-supplied `PodLabels`/`PodAnnotations` entry colliding with one of Velero's own reserved keys; every other configuration is unaffected.
 
 ### Label selector fix for RestoreNameLabel
 
@@ -397,10 +459,10 @@ This is a user configuration concern and is noted as a follow-up; it is not addr
 ### Import `k8s.io/apiserver/pkg/storage/names`
 
 The upstream Kubernetes API server exposes a `SimpleNameGenerator` and `MaxGeneratedNameLength` constant in `k8s.io/apiserver/pkg/storage/names`.
-However, this package sets `maxNameLength = 63` — the DNS label limit used for core Kubernetes resources — and `MaxGeneratedNameLength = 58`.
-Velero's CRD objects follow the DNS subdomain rule (253 characters), so using `MaxGeneratedNameLength = 58` would needlessly truncate all generated names to 63 characters regardless of actual length.
-Additionally, `k8s.io/apiserver` is not currently a dependency of Velero; adding it would introduce significant transitive dependencies.
-The constants and logic needed are already available through the existing `k8s.io/apimachinery` dependency via `validation.DNS1123SubdomainMaxLength`.
+This is in fact the *correct* generator to model `GetValidGenerateName` on: as established in Background, every one of Velero's CRDs and built-in `GenerateName` targets use exactly this generator (`maxNameLength = 63`, `MaxGeneratedNameLength = 58`), regardless of the DNS1123Subdomain (253) limit those resources' own `metadata.name` would otherwise allow.
+An earlier version of this design incorrectly assumed Velero's CRD objects were exempt from this 58-character retention and used a 248-character target instead; that assumption did not hold (see Background and Category A).
+Velero still does not import `k8s.io/apiserver` as a dependency, not because its behavior differs, but because the two integer constants it would provide (`63`, `5`) are simple, stable, and already fully described by `kubernetesGeneratedNameTotalLength`/`randomSuffixLength` in `pkg/label/label.go` — adding a dependency with `apiserver`'s significant transitive footprint to obtain two constants that are unlikely to change is not worth it.
+`validation.DNS1123SubdomainMaxLength` remains the correct constant for `GetValidObjectName`, since that path sets `metadata.name` directly and is never passed through `SimpleNameGenerator`.
 
 ### Enforce maximum name length on Backup and Restore objects at admission
 
@@ -420,8 +482,10 @@ The hash-suffix-on-truncation approach preserves the readable prefix in the comm
 
 ### Truncate without a hash suffix (simple truncation)
 
-Simply slicing to the maximum length without appending a hash is simpler to implement but means that two distinct long names that share the same prefix would produce the same object name, causing creation conflicts or silent name collisions.
-The hash suffix makes this astronomically unlikely.
+Simply slicing to the maximum length without appending a hash is simpler to implement but means that two distinct long names that share the same retained prefix would produce the same truncated base.
+For `GetValidObjectName` (deterministic `metadata.name`, no Kubernetes-injected randomness) that is a real collision: the second create fails with `AlreadyExists`.
+The 6-hex-character hash suffix (24 bits, ~16.7 million values) makes that collision unlikely for a given pair, though — unlike a full SHA-256 suffix — it does not make it negligible at scale; a deployment naming many thousands of long, similarly-prefixed objects through `GetValidObjectName` should be aware the birthday bound on a 24-bit space is in the low thousands, not "astronomically" large. If this precision turns out to matter in practice, the implementation can revisit the suffix length for `GetValidObjectName` specifically (it does not affect `GetValidGenerateName`, see below).
+For `GetValidGenerateName`, Kubernetes always appends its own independent 5 random characters after truncation, so final-object-name uniqueness is already guaranteed by Kubernetes regardless of what Velero's hash contributes; the hash there only helps a human distinguish two long, truncated prefixes at a glance (e.g. in `kubectl get`), not correctness.
 
 ### Place helpers in a new `pkg/util/names` package
 
@@ -437,15 +501,15 @@ SHA-256 is appropriate for this purpose and is already used by the existing `Get
 
 ## Implementation
 
-1. Add `GetValidGenerateName` and `GetValidObjectName` to `pkg/label/label.go` with unit tests covering short, boundary, and long inputs.
-2. Apply Category A fixes (9 `GenerateName` sites) — straightforward one-line changes each.
+1. Add `GetValidGenerateName` (targeting the 58-character retained-prefix budget, not 248) and `GetValidObjectName` to `pkg/label/label.go` with unit tests covering short, boundary, and long inputs — including a `GetValidGenerateName` test that confirms the hash lands within the first 58 characters.
+2. Apply Category A fixes (10 `GenerateName` sites) — straightforward one-line changes each.
 3. Apply Category B fix (`BackupRepository` deterministic name).
 4. Apply Category C fixes (`getCachePVCName` and the DataUpload snapshot-info ConfigMap name).
 5. Apply Category D.1 fixes (5 selector-only label value assignments).
-6. Add the four full-name pod annotation constants and apply Category D.2 fixes: write the annotation alongside the (hashed) label at each of the four hosting-pod creation sites, and update `findPVBByPod`, `findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod` to prefer the annotation with label fallback.
+6. Add the four full-name pod annotation constants and apply Category D.2 fixes: at each of the four hosting-pod creation sites, change both the label map and the new annotation map to apply Velero's reserved key *last* (after user-configured/third-party entries are merged in), and update `findPVBByPod`, `findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod` to prefer the annotation with label fallback.
 7. Apply Category E fixes (2 `MatchingLabels` selectors, plus the VGSC write-side fix in `pkg/restore/actions/csi/volumesnapshot_action.go`).
-8. Apply Category F fixes (4 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
-9. Add or update unit tests for each fixed function to cover the truncation path, including a `find*ByPod` test that verifies both the annotation path and the label-fallback path.
+8. Apply Category F fixes (5 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
+9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it.
 
 All changes are confined to existing functions plus four new annotation constants, and introduce no new CRDs, API fields, or controller reconciliation loops.
 
