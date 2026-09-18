@@ -22,7 +22,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -158,10 +158,11 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	backupRequest := &pkgbackup.Request{
-		Backup:           backup,
-		StorageLocation:  location,
-		SkippedPVTracker: pkgbackup.NewSkipPVTracker(),
-		BackedUpItems:    pkgbackup.NewBackedUpItemsMap(),
+		Backup:                        backup,
+		StorageLocation:               location,
+		SkippedPVTracker:              pkgbackup.NewSkipPVTracker(),
+		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
+		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
 	}
 	var outBackupFile *os.File
 	if len(operations) > 0 {
