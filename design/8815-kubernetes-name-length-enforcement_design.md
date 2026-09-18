@@ -60,7 +60,7 @@ When truncation is needed the last 6 characters of the (58-character) result are
 
 **`GetValidObjectName(name string) string`**
 Truncates a deterministic object name to at most 253 characters using the same hash-suffix strategy.
-Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix meaningfully guarantees a distinct final name for distinct long inputs (not just a distinct prefix before a random suffix, as in the `GenerateName` case).
+Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix is what stands between two distinct long inputs and an `AlreadyExists` conflict (there is no Kubernetes-injected randomness backstopping it here, unlike the `GenerateName` case). It reduces that collision risk; see "Truncate without a hash suffix" under Alternatives Considered for the actual bound (24 bits, not an absolute guarantee).
 
 All twenty-three affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
 
@@ -305,15 +305,15 @@ hostingPodAnnotations[velerov1api.PVBFullNameAnnotation] = pvb.Name // reserved;
 
 The other three write sites (`pkg/controller/pod_volume_restore_controller.go`, `pkg/controller/data_upload_controller.go`, `pkg/controller/data_download_controller.go`) follow the same ordering with their respective label/annotation constant.
 
-Each `find*ByPod` helper is updated to prefer the annotation and fall back to the label, so pods created by an older Velero version (before this annotation existed) continue to resolve correctly:
+Each `find*ByPod` helper is updated to prefer the annotation and fall back to the label, so pods created by an older Velero version (before this annotation existed) continue to resolve correctly. The annotation is only trusted when non-empty — an empty string (which a `pod.Annotations[key]` lookup cannot distinguish from "absent" using the two-value form alone) falls back to the label rather than being used as a lookup name, as defense in depth alongside the reserved-key-last ordering above:
 
 ```go
 func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolumeBackup, error) {
-    name, exist := pod.Annotations[velerov1api.PVBFullNameAnnotation]
-    if !exist {
-        name, exist = pod.Labels[velerov1api.PVBLabel]
+    name := pod.Annotations[velerov1api.PVBFullNameAnnotation]
+    if name == "" {
+        name = pod.Labels[velerov1api.PVBLabel]
     }
-    if !exist {
+    if name == "" {
         return nil, nil
     }
     pvb := &velerov1api.PodVolumeBackup{}
@@ -404,7 +404,9 @@ Deployments running on Kubernetes 1.32+ additionally benefit from server-side re
 This split by helper, since `GetValidGenerateName` and `GetValidObjectName`/`GetValidName` now have very different effective budgets:
 
 - `GetValidObjectName` (Category B, C) and `GetValidName` (Category D.1, D.2, E): for BackupRepository key concatenations ≤ 253 characters, cache PVC / ConfigMap derived names ≤ 253 characters, and label values ≤ 63 characters, these helpers return the input unchanged. Behavior for all existing deployments operating within these limits is identical before and after this change.
-- `GetValidGenerateName` (Category A): the effective unchanged-behavior threshold is **much smaller** than a naive reading of the 253-character DNS limit would suggest, because Kubernetes' own name generator only retains the first 58 characters of whatever is submitted (see Background). For the seven `<name> + "-"` sites, names ≤ ~57 characters are unaffected; for the three `"velero-" + <name> + "-"` sites, names ≤ ~50 characters are unaffected. Names longer than that were *already* being silently truncated by Kubernetes before this change (with no hash, just a hard cut at character 58) — this design does not introduce new truncation, it makes existing, previously-silent truncation deterministic and hash-suffixed instead of an arbitrary byte cut, and does not change whether creation succeeds either way.
+- `GetValidGenerateName` (Category A): the effective unchanged-behavior threshold is **much smaller** than a naive reading of the 253-character DNS limit would suggest, because Kubernetes' own name generator only retains the first 58 characters of whatever is submitted (see Background). For the seven `<name> + "-"` sites, names ≤ ~57 characters are unaffected; for the three `"velero-" + <name> + "-"` sites, names ≤ ~50 characters are unaffected. This "unaffected" range only covers names that fit within the 58-character retained prefix; it is not the same range as "creation previously succeeded." Two distinct ranges of previously-affected names behave differently after this fix:
+  - Names from ~51/58 characters up to 253 characters (the raw `GenerateName` field is still valid): creation already succeeded today, with Kubernetes silently hard-cutting the submitted value at character 58 (no hash, no determinism). After this fix, creation still succeeds, but the retained 58 characters are Velero's deterministic hash-suffixed truncation instead of an arbitrary byte cut. This is the common case, not the rare one.
+  - Names long enough that the raw `GenerateName` field itself exceeds 253 characters: creation was previously **rejected outright** at admission (a real failure, matching Background's motivating bug). After this fix, the field is truncated by `GetValidGenerateName` before it ever reaches Kubernetes, so creation now succeeds.
 
 ### Objects that previously failed to create
 
