@@ -287,11 +287,16 @@ Line 120 is a different code path (constructing the snapshot-info ConfigMap for 
 labels[velerov1api.ScheduleNameLabel] = schedule.Name
 
 // After
-if len(schedule.Name) <= validation.DNS1035LabelMaxLength {
-    labels[velerov1api.ScheduleNameLabel] = schedule.Name
-} else {
-    labels[velerov1api.ScheduleNameHashLabel] = label.GetValidNameLongHash(schedule.Name)
+scheduleLabels := make(map[string]string, len(labels)+1)
+for k, v := range labels {
+    scheduleLabels[k] = v
 }
+if len(schedule.Name) <= validation.DNS1035LabelMaxLength {
+    scheduleLabels[velerov1api.ScheduleNameLabel] = schedule.Name
+} else {
+    scheduleLabels[velerov1api.ScheduleNameHashLabel] = label.GetValidNameLongHash(schedule.Name)
+}
+labels = scheduleLabels
 ```
 
 `ScheduleNameLabel` now holds *only* schedule names that are already ≤ 63 characters, verbatim; `ScheduleNameHashLabel` holds *only* hashes of names that were too long to fit. The two label keys are disjoint by construction — a value read from `ScheduleNameLabel` is never a hash, full stop, with no length-based inference required and no coincidental-collision risk between the two categories (see Category E.2 for the read side and why this fully replaces the length-heuristic approach considered and rejected there).
@@ -390,7 +395,7 @@ func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolu
         return pvb, nil
     }
 
-    if annotated := pod.Annotations[velerov1api.PVBFullNameAnnotation]; annotated != "" {
+    if annotated := pod.Annotations[velerov1api.PVBFullNameAnnotation]; annotated != "" && len(validation.IsDNS1123Subdomain(annotated)) == 0 {
         pvb, err := tryGet(annotated)
         switch {
         case err == nil:
@@ -426,6 +431,8 @@ func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolu
 ```
 
 `metav1.IsControlledBy` (from `k8s.io/apimachinery/pkg/apis/meta/v1`) checks whether `pod.OwnerReferences` contains a controller reference to the given object (matching `APIVersion`/`Kind`/`UID`) — exactly the relationship the exposer already establishes. Each of the four hosting pods is created by the shared exposer machinery (`pkg/exposer/pod_volume.go`'s `createHostingPod` for PVB/PVR, `pkg/exposer/csi_snapshot.go`/`generic_restore.go` for DataUpload/DataDownload), and in every case the hosting pod's `OwnerReferences` is set from an `ownerObject` that *is* the PVB/PVR/DataUpload/DataDownload itself (`getPVBOwnerObject`, `getPVROwnerObject`, `getOwnerObject`, `getDataDownloadOwnerObject` — each just copies `Kind`/`Name`/`UID`/`APIVersion` off the CR). So this check works identically, with no special-casing, for all four `find*ByPod` helpers: `findPVRByRestorePod`, `findDataUploadByPod`, and `findDataDownloadByPod` all use the same `metav1.IsControlledBy(&pod, resolvedObj)` guard as `findPVBByPod` above.
+
+**The annotation is validated as a DNS-1123 subdomain (`validation.IsDNS1123Subdomain`) before `tryGet` is ever called, not just checked for emptiness.** A Velero-written annotation is always a real object name and therefore already valid, but the whole point of this fallback path is defense against a stale or corrupted annotation (see the `IsControlledBy` check above) — and a syntactically invalid name is exactly the kind of corruption this should tolerate. Without the pre-validation, `client.Get` with a malformed name can fail with something other than `apierrors.IsNotFound` (e.g. a `Invalid`/`BadRequest` response for a name that fails the API server's own name-syntax check), which the original `switch` would have propagated as a hard error out of `findPVBByPod` instead of falling through to the label lookup below — turning a corrupted annotation into a spurious lookup failure rather than a graceful fallback. Checking the syntax up front sidesteps needing to enumerate every apiserver error shape a malformed name could produce.
 
 (An earlier version of this design tried to validate ownership by comparing `pvb.Spec.Pod`/`pvr.Spec.Pod` — a different `corev1api.ObjectReference` field entirely, pointing to the *client* pod whose volume is being backed up/restored, not the *hosting* pod `find*ByPod` is called with — and asserted that DataUpload/DataDownload had no equivalent field to check at all. Both were wrong: the correct signal for "does this hosting pod belong to this CR" is the `OwnerReferences` relationship the exposer already sets, which exists uniformly for all four types and needs no CR-specific field.)
 
@@ -500,7 +507,7 @@ But "empty" is still a worse answer than "the real name" for a schedule that doe
 ScheduleFullNameAnnotation = "velero.io/schedule-full-name"
 ```
 
-`pkg/builder/backup_builder.go`'s `FromSchedule` (Category D.1's write site) sets this annotation unconditionally, alongside the existing label/hash-label write, applied last so a schedule's own templated annotations can't override it — the same reserved-key-last principle as Category D.2. It copies into a fresh map rather than mutating `annotations` in place, because that variable can alias `schedule.Spec.Template.Metadata.Annotations` or `schedule.Annotations` directly (`annotations = schedule.Annotations` is a reference assignment in Go, not a copy) — writing into it would mutate the `Schedule` object itself, which may be a shared, informer-cached object read elsewhere in the controller. (The pre-existing code immediately above this, for `ScheduleNameLabel`, has the identical aliasing shape — `labels = schedule.Labels` followed by `labels[velerov1api.ScheduleNameLabel] = schedule.Name` — and appears to have the same problem already, independent of this design; out of scope for issue #8815, but worth fixing in the same change since it's adjacent code being touched anyway.)
+`pkg/builder/backup_builder.go`'s `FromSchedule` (Category D.1's write site) sets this annotation unconditionally, alongside the existing label/hash-label write, applied last so a schedule's own templated annotations can't override it — the same reserved-key-last principle as Category D.2. It copies into a fresh map rather than mutating `annotations` in place, because that variable can alias `schedule.Spec.Template.Metadata.Annotations` or `schedule.Annotations` directly (`annotations = schedule.Annotations` is a reference assignment in Go, not a copy) — writing into it would mutate the `Schedule` object itself, which may be a shared, informer-cached object read elsewhere in the controller. (The pre-existing code immediately above this, for `ScheduleNameLabel`, had the identical aliasing shape — `labels = schedule.Labels` followed by `labels[velerov1api.ScheduleNameLabel] = schedule.Name` — an independent, pre-existing bug rather than something this design introduced, but the D.1 write site is already being rewritten for the `ScheduleNameHashLabel` split, so it's fixed the same way here: copy into a fresh `scheduleLabels` map before assigning either label, same as `scheduleAnnotations` below.)
 
 ```go
 // Before
@@ -663,9 +670,8 @@ Because Category D.1 never writes a hash into `ScheduleNameLabel` itself (long n
 
 ### User-defined maintenance job PodLabels
 
-`pkg/repository/maintenance/maintenance.go` merges user-supplied `config.PodLabels` into the job pod labels without validating each value.
-A user could supply a label value longer than 63 characters, overriding the correctly hashed `RepositoryNameLabel` value.
-This is a user configuration concern and is noted as a follow-up; it is not addressed by this design because it requires a decision about whether to silently truncate, warn, or reject invalid user-supplied labels.
+Unlike Category D.2's `hostingPodLabels`, `pkg/repository/maintenance/maintenance.go`'s pod-label merge (`buildJob`, around line 601) already seeds `RepositoryNameLabel` first and then explicitly skips any user-supplied `config.PodLabels` entry whose key equals `RepositoryNameLabel` (logging a warning and continuing, rather than overwriting), and separately validates every other user-supplied label value with `validation.IsValidLabelValue` (which already enforces the 63-character limit, rejecting oversized values rather than truncating or silently accepting them).
+So the reserved-key-collision and oversized-value concerns this section originally raised are already handled by existing code, unrelated to this design — no fix is needed here, unlike Category D.2's `hostingPodLabels` and E.2's `FromSchedule`, which lacked this protection before this design added it.
 
 ## Alternatives Considered
 
@@ -740,7 +746,5 @@ All changes are confined to existing functions plus five new annotation constant
 
 ## Open Issues
 
-- **User-supplied `PodLabels` in maintenance job config**: values are merged without length validation and can override correctly bounded labels.
-  A follow-up issue should decide whether to silently truncate via `GetValidName`, log a warning, or return an error when a user-supplied label value exceeds 63 characters.
 - **Backup and Restore admission validation**: a follow-on enhancement could add CRD validation rules (via `x-kubernetes-validations`) to warn or reject names that would force truncation of all derived objects, giving operators early feedback rather than silently altered names.
 - **`GetValidName`'s 24-bit hash suffix for `RestoreNameLabel` and other pre-existing identity-critical labels**: `GetValidName` is unchanged by this design (see "Truncate without a hash suffix" under Alternatives Considered) because lengthening its shared hash algorithm would break every existing caller's already-persisted long-name labels across an upgrade. (`ScheduleNameLabel` does not have this problem and is not in scope for this issue: Category D.1/E.2 give it the longer `GetValidNameLongHash` instead, since it was never successfully hashed at all before this design.) If the collision risk for `RestoreNameLabel` or other pre-existing identity-critical `GetValidName` callers (where a collision causes a selector to match the wrong object, as opposed to labels used only for informational display) is judged worth tightening, it needs its own design: likely a versioned or migrated hash rather than an in-place algorithm change, coordinated across every existing `GetValidName` caller, not scoped to issue #8815.
