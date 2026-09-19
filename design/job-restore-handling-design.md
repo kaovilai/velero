@@ -49,7 +49,7 @@ The current logic for handling Jobs during restore will be modified as follows:
 
 4. **Pending Jobs** (created but never started — no active Pods, no recorded failures, no start time, no completion/failure condition):
    - Default behavior: Restore with original configuration (current behavior). A pending Job never ran, so restoring it as-is carries no risk of unintended re-execution. Classification is based on the Job's backed-up `status`; if the Job actually started running after that snapshot was taken but before the backup completed, it is still classified as `pending` from Velero's point of view and restored as-is (i.e. not paused) — restoring at all is still correct here, so the default is unaffected.
-   - Optional behavior: Skip restoration or restore with parallelism=0
+   - Optional behavior: Skip restoration or restore with parallelism=0. See `velero.io/job-restore-policy-pending` under Restore Annotations for a direct opt-in to this if the backup/restore classification race above is a concern.
 
 ### Implementation Details
 
@@ -138,6 +138,7 @@ These annotations are applied to the Velero Restore object and affect all Jobs t
 velero.io/job-restore-policy-completed: <policy>
 velero.io/job-restore-policy-failed: <policy>
 velero.io/job-restore-policy-running: <policy>
+velero.io/job-restore-policy-pending: <policy>
 ```
 
 ##### General Restore Policy
@@ -159,7 +160,8 @@ velero restore create --from-backup=my-backup \
 velero restore create --from-backup=my-backup \
   --annotations velero.io/job-restore-policy-completed=skip \
   --annotations velero.io/job-restore-policy-failed=restore-paused \
-  --annotations velero.io/job-restore-policy-running=restore-paused
+  --annotations velero.io/job-restore-policy-running=restore-paused \
+  --annotations velero.io/job-restore-policy-pending=restore-paused
 ```
 
 The built-in default behavior (if neither ResourcePolicy nor annotations are specified) will be:
@@ -167,7 +169,7 @@ The built-in default behavior (if neither ResourcePolicy nor annotations are spe
 - `restore-paused` for running and failed Jobs
 - `restore-as-is` for pending Jobs
 
-There is no `velero.io/job-restore-policy-pending` phase-specific annotation, since the default for pending Jobs is already non-disruptive; the general `velero.io/job-restore-policy` annotation still applies to pending Jobs as a fallback, and a `jobPhase: pending` ResourcePolicy rule can override it if a user needs different behavior.
+`velero.io/job-restore-policy-pending` is optional and defaults to unset: the default for pending Jobs is already non-disruptive (a pending Job never ran, so restoring it as-is normally carries no risk), and the general `velero.io/job-restore-policy` annotation already applies to pending Jobs as a fallback. It exists as an explicit opt-in mitigation for the backup/restore-time classification race described under "Pending Jobs" above: because classification is based on the Job's backed-up `status`, a Job that was genuinely pending when Velero read it but started (and possibly completed) afterward, before the backup finished, is still restored as-is under the default. Users who can't tolerate that narrow race — e.g. environments with very short-lived Jobs — can set `velero.io/job-restore-policy-pending=restore-paused` (or `skip`) to make pending Jobs conservative by default, without needing a full ResourcePolicy ConfigMap; a `jobPhase: pending` ResourcePolicy rule remains available too and takes precedence per the usual ordering.
 
 #### 3. Implementation Changes
 
