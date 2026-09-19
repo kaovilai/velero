@@ -62,7 +62,7 @@ When truncation is needed the last 6 characters of the (58-character) result are
 
 **`GetValidObjectName(name string) string`**
 Truncates a deterministic object name to at most 253 characters using the same hash-suffix strategy.
-Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix is what stands between two distinct long inputs and an `AlreadyExists` conflict (there is no Kubernetes-injected randomness backstopping it here, unlike the `GenerateName` case). Because that risk is a real functional conflict rather than just a readability concern, `GetValidObjectName` uses a longer, 16-character hash suffix (64 bits) than `GetValidName`/`GetValidGenerateName`'s 6; see "Truncate without a hash suffix" under Alternatives Considered for the reasoning and the collision bound.
+Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix is what stands between two distinct long inputs and an `AlreadyExists` conflict (there is no Kubernetes-injected randomness backstopping it here, unlike the `GenerateName` case). Because `GetValidObjectName` is a brand-new function with no pre-existing callers, and because that collision risk is a real functional conflict rather than just a readability concern, it uses a longer, 16-character hash suffix (64 bits) than `GetValidGenerateName`'s 6. `GetValidName` — an existing function this design does not otherwise change the collision behavior of — keeps its current 6-character suffix; see "Truncate without a hash suffix" under Alternatives Considered for why widening it was considered and rejected.
 
 All twenty-nine affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
 
@@ -97,7 +97,8 @@ const kubernetesGeneratedNameTotalLength = 63
 // characters of SHA-256(name), reducing (not eliminating) the chance that two
 // distinct long names collide after truncation. See "Truncate without a hash
 // suffix" in Alternatives Considered for why GetValidObjectName uses a longer
-// hashLen than GetValidName/GetValidGenerateName.
+// hashLen than GetValidName/GetValidGenerateName, and why GetValidName's is
+// deliberately left unchanged from its existing, already-shipped behavior.
 func getValidNameWithMaxLen(name string, maxLen, hashLen int) string {
     if len(name) <= maxLen {
         return name
@@ -111,20 +112,29 @@ func getValidNameWithMaxLen(name string, maxLen, hashLen int) string {
     return name[:charsFromName] + strSha[:hashLen]
 }
 
-// shortHashSuffixLength is used by GetValidName and GetValidGenerateName, where
-// the hash has no correctness role (see GetValidGenerateName's doc comment and
-// GetValidName's label-selector-only usage) -- it exists purely to make two
-// truncated values look different from each other at a glance.
+// shortHashSuffixLength (6 characters) is GetValidName's existing, already-shipped
+// suffix length (unchanged by this design -- see rationale below) and
+// GetValidGenerateName's suffix, where hash length has no correctness role (see
+// GetValidGenerateName's doc comment).
 const shortHashSuffixLength = 6
 
-// objectNameHashSuffixLength is used by GetValidObjectName, where a hash
+// objectNameHashSuffixLength is used only by GetValidObjectName -- a brand-new
+// function with no pre-existing callers or persisted state -- where a hash
 // collision is a real AlreadyExists conflict, not just a readability concern.
 // 16 hex characters (64 bits) makes the birthday-bound collision probability
-// negligible for any realistic number of long, similarly-prefixed objects,
-// while still costing only 16 of GetValidObjectName's 253-character budget.
+// negligible for any realistic number of long, similarly-prefixed objects, at
+// the cost of 10 more characters than GetValidGenerateName/GetValidName's 6,
+// which is negligible against GetValidObjectName's 253-character budget.
 const objectNameHashSuffixLength = 16
 
 // GetValidName converts a string to a valid Kubernetes label value (≤ 63 characters).
+// This function already exists in the codebase (with this same 6-character
+// suffix) and already has dozens of callers unrelated to this design (e.g.
+// BackupUIDLabel, StorageLocationLabel, VolumeNamespaceLabel); it is
+// refactored here to delegate to the shared helper, but its suffix length is
+// deliberately left unchanged -- see "Truncate without a hash suffix" under
+// Alternatives Considered for why lengthening it would be a compatibility
+// break, not a strict improvement.
 func GetValidName(label string) string {
     return getValidNameWithMaxLen(label, validation.DNS1035LabelMaxLength, shortHashSuffixLength)
 }
@@ -142,9 +152,7 @@ func GetValidGenerateName(prefix string) string {
 // GetValidObjectName truncates a deterministic object name to the Kubernetes
 // 253-character DNS subdomain limit. Unlike GetValidGenerateName, this name
 // is never passed through SimpleNameGenerator, so the full DNS1123Subdomain
-// limit applies. Uses a longer hash suffix than GetValidName/GetValidGenerateName
-// because a collision here is a real AlreadyExists conflict, not just a
-// readability concern.
+// limit applies.
 func GetValidObjectName(name string) string {
     return getValidNameWithMaxLen(name, validation.DNS1123SubdomainMaxLength, objectNameHashSuffixLength)
 }
@@ -347,11 +355,18 @@ func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolu
         pvb, err := tryGet(annotated)
         switch {
         case err == nil:
-            return pvb, nil
+            // The annotation resolved to a real PVB; confirm it actually owns
+            // this pod before trusting it, in case the annotation is stale or
+            // was somehow copied from an unrelated pod.
+            if pvb.Spec.Pod.Namespace == pod.Namespace && pvb.Spec.Pod.Name == pod.Name && pvb.Spec.Pod.UID == pod.UID {
+                return pvb, nil
+            }
+            // Resolved to a real but unrelated PVB -- fall through to the label,
+            // same as a NotFound.
         case !apierrors.IsNotFound(err):
             return nil, errors.Wrapf(err, "error to find PVB by pod %s/%s", pod.Namespace, pod.Name)
         }
-        // NotFound: the annotation didn't resolve -- fall through to the label.
+        // NotFound, or resolved to the wrong object: fall through to the label.
     }
 
     labeled := pod.Labels[velerov1api.PVBLabel]
@@ -366,7 +381,9 @@ func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolu
 }
 ```
 
-The other three helpers (`findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod`) follow the same pattern with their respective annotation constant.
+`findPVRByRestorePod` follows the identical pattern: `PodVolumeRestore.Spec.Pod` is the same kind of `corev1api.ObjectReference` back to the hosting pod, so the same three-field check applies. `findDataUploadByPod`/`findDataDownloadByPod` cannot perform this check: `DataUpload`/`DataDownload` have no equivalent `Spec.Pod` field (their hosting pod is created and tracked by a separate exposer helper, not referenced back from the CR spec), so for those two the annotation result is trusted once `Get` succeeds, the same as before this refinement. This is a known, narrower residual gap for those two types — accepted for the same defense-in-depth reason as the rest of Category D.2 (see above): reaching it at all requires the annotation to already be wrong in a way that happens to resolve to a real, unrelated DataUpload/DataDownload, which requires the same currently-unreachable precondition (a name long enough to have needed truncation in the first place).
+
+The other three helpers (`findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod`) follow the pattern above (see the previous paragraph for how the ownership check does or doesn't apply to each).
 Because names within current limits are unaffected by truncation, the annotation and the label hold the same value in the common case; the fallback only matters for pods whose owning object's name previously exceeded 63 characters, and only until they are replaced (hosting pods are short-lived, created fresh per backup/restore run).
 
 **Reachability today, like Category C.** All four owning objects (PodVolumeBackup, PodVolumeRestore, DataUpload, DataDownload) get their `Name` from `GenerateName` (Category A), which — per Background — Kubernetes' `SimpleNameGenerator` always bounds to 63 characters. `label.GetValidName` also truncates at 63 characters. So today, `label.GetValidName(pvb.Name)` (and the other three) is *never actually truncating anything*: the input is already ≤ 63 characters by construction, before this design ever runs. The annotation fallback this section adds is, like the Category C fix, defense-in-depth rather than a fix for a bug reachable with today's Kubernetes name-generation behavior — it only matters if a future Kubernetes version changes `GenerateName` retention, or if one of these four CRD types is ever created directly (bypassing `GenerateName`) with a hand-crafted name longer than 63 characters. The design keeps it anyway: it is cheap (a few extra map entries and an `if`), and it is exactly the fix @blackpiglet's review asked for — the point of the review was that the *original, unpatched* proposal would have broken `find*ByPod` the moment a long name was truncated; this section makes that true even in a hypothetical where it currently is not.
@@ -556,9 +573,14 @@ The hash-suffix-on-truncation approach preserves the readable prefix in the comm
 
 Simply slicing to the maximum length without appending a hash is simpler to implement but means that two distinct long names that share the same retained prefix would produce the same truncated base.
 For `GetValidObjectName` (deterministic `metadata.name`, no Kubernetes-injected randomness) that is a real collision: the second create fails with `AlreadyExists`.
-An earlier version of this design used the same 6-hex-character suffix (24 bits, ~16.7 million values) for all three helpers; the birthday bound on a 24-bit space is in the low thousands, not "astronomically" large, which is comfortable for `GetValidName`/`GetValidGenerateName` (see below) but not clearly comfortable for `GetValidObjectName` in a deployment that names many thousands of long, similarly-prefixed `BackupRepository`/cache-PVC/ConfigMap objects over its lifetime. `GetValidObjectName` therefore uses a 16-hex-character suffix (64 bits) instead — the birthday bound there is astronomically large for any realistic object count, at the cost of 10 extra characters out of its 253-character budget, which is negligible. `GetValidName`/`GetValidGenerateName` keep the 6-character suffix (see below for why a longer one wouldn't help them).
-For `GetValidGenerateName`, Kubernetes always appends its own independent 5 random characters after truncation, so final-object-name uniqueness is already guaranteed by Kubernetes regardless of what Velero's hash contributes; the hash there only helps a human distinguish two long, truncated prefixes at a glance (e.g. in `kubectl get`), not correctness — a longer suffix would only shrink the readable prefix for no benefit.
-For `GetValidName`, the value is a label used solely for selector-based filtering (Category D.1/E), never for uniqueness enforcement — Kubernetes labels are not required to be unique — so a 24-bit collision at most causes two logically-distinct long names to match the same selector query, a correctness nuisance rather than a creation failure; kept at 6 characters primarily to leave more of the 63-character label budget as a readable prefix.
+
+An earlier version of this design used a 6-hex-character suffix (24 bits, ~16.7 million values) for all three helpers; the birthday bound on a 24-bit space is in the low thousands, not "astronomically" large. For `GetValidObjectName` — a brand-new function with no pre-existing callers or persisted state — that bound isn't clearly comfortable for a deployment that creates many thousands of long, similarly-prefixed `BackupRepository`/cache-PVC/ConfigMap objects over its lifetime, so it now uses a 16-hex-character suffix (64 bits) instead: the birthday bound there is astronomically large for any realistic object count, at the cost of 10 extra characters out of its 253-character budget, which is negligible.
+
+**`GetValidName` keeps its existing 6-character suffix, unchanged.** `GetValidName` is not new: it already ships today with dozens of callers across the codebase (`BackupUIDLabel`, `StorageLocationLabel`, `VolumeNamespaceLabel`, `RestoreUIDLabel`, and more), each producing a label value that may already be persisted on real objects in real clusters. Lengthening its hash suffix looks like a pure improvement in isolation — CodeRabbit review correctly pointed out that a 24-bit collision for `RestoreNameLabel`/`ScheduleNameLabel` is a real selector-mismatch risk, not just a nuisance (see below) — but changing the *shared* function's hash algorithm would recompute a *different* label value for every long name across *every* existing caller, not just the two this design's Category D.1/E touch. Any object already created (before this design ships) with a long name would have a label baked in under the old 6-character algorithm; after upgrading to a hypothetical longer-hash `GetValidName`, every selector that recomputes that label to search for it — across all dozens of existing call sites, most of which are unrelated to issue #8815 — would compute a different value and silently stop finding that pre-existing object. That is a strictly worse compatibility break than the collision risk it would fix, and it is not scoped to this design's audit (Category A-F): it would need re-auditing every existing `GetValidName` caller in the codebase, which is out of scope for a name-*length* enforcement design. `GetValidObjectName` has no such legacy because it does not exist until this design ships, so there is nothing it could break by choosing a longer suffix from day one.
+
+Given that, `RestoreNameLabel`/`ScheduleNameLabel`'s 24-bit collision risk (a selector matching an unintended object, e.g. `cleanupStubVGSC` or `--from-schedule` selecting the wrong backup, for two restores/schedules whose long names happen to hash-collide) is accepted as a pre-existing, already-shipped characteristic of `GetValidName`, not something this design changes for better or worse. It is no different in kind from the same risk that already exists today for every other long-named `BackupUIDLabel`/`StorageLocationLabel`/etc. value in production. If this is worth tightening, it should be its own follow-up that audits and coordinates every `GetValidName` caller through an upgrade path (e.g. a versioned hash, or a migration), which is a materially bigger change than anything in this design's scope; noted in Open Issues.
+
+For `GetValidGenerateName`, Kubernetes always appends its own independent 5 random characters after truncation, so final-object-name uniqueness is already guaranteed by Kubernetes regardless of what Velero's hash contributes; the hash there only helps a human distinguish two long, truncated prefixes at a glance (e.g. in `kubectl get`), not correctness — a longer suffix would only shrink the readable prefix for no benefit, and (like `GetValidName`) it is not a new function, so the same backward-compatibility argument applies even if it were not already moot for this reason.
 
 ### Place helpers in a new `pkg/util/names` package
 
@@ -582,7 +604,7 @@ SHA-256 is appropriate for this purpose and is already used by the existing `Get
 6. Add the four full-name pod annotation constants and apply Category D.2 fixes: at each of the four hosting-pod creation sites, change both the label map and the new annotation map to apply Velero's reserved key *last* (after user-configured/third-party entries are merged in), and update `findPVBByPod`, `findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod` to prefer the annotation with label fallback.
 7. Apply Category E fixes: E.1's 2 `MatchingLabels` selectors plus the VGSC write-side fix in `pkg/restore/actions/csi/volumesnapshot_action.go`; E.2's 4 `ScheduleNameLabel` selector call sites (`pkg/cmd/cli/restore/create.go:251,313`, `pkg/controller/restore_controller.go:381`, `pkg/controller/schedule_controller.go:232`), landing in the same change as Category D.1's `ScheduleNameLabel` write-side fix so there is no release where they're inconsistent with each other.
 8. Apply Category F fixes (5 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
-9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it; and a Category E.2 regression test asserting that, once Category D.1 hashes the `ScheduleNameLabel` write side, a schedule name over 63 characters is still matched by all four E.2 read sites (`pkg/cmd/cli/restore/create.go`'s `--from-schedule` and `--allow-partially-failed` lookups, `restore_controller.go`'s most-recent-backup lookup, and `schedule_controller.checkIfBackupInNewOrProgress`) — this fix's failure mode is a silent zero-match, not an error, so it needs a test rather than relying on code review to catch a regression.
+9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a `findPVBByPod`/`findPVRByRestorePod` test where the annotation resolves to a real but unrelated PVB/PVR (a different `Spec.Pod`) to confirm the ownership check rejects it and falls back to the label; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it; and a Category E.2 regression test asserting that, once Category D.1 hashes the `ScheduleNameLabel` write side, a schedule name over 63 characters is still matched by all four E.2 read sites (`pkg/cmd/cli/restore/create.go`'s `--from-schedule` and `--allow-partially-failed` lookups, `restore_controller.go`'s most-recent-backup lookup, and `schedule_controller.checkIfBackupInNewOrProgress`) — this fix's failure mode is a silent zero-match, not an error, so it needs a test rather than relying on code review to catch a regression.
 
 All changes are confined to existing functions plus four new annotation constants, and introduce no new CRDs, API fields, or controller reconciliation loops.
 
@@ -592,3 +614,4 @@ All changes are confined to existing functions plus four new annotation constant
   A follow-up issue should decide whether to silently truncate via `GetValidName`, log a warning, or return an error when a user-supplied label value exceeds 63 characters.
 - **Backup and Restore admission validation**: a follow-on enhancement could add CRD validation rules (via `x-kubernetes-validations`) to warn or reject names that would force truncation of all derived objects, giving operators early feedback rather than silently altered names.
 - **`ScheduleNameLabel` shown as a hash in metrics for schedule names > 63 characters**: seven display-only read sites (`pkg/controller/restore_controller.go:425` for restore metrics; `pkg/controller/backup_controller.go:260,328,899`, `backup_finalizer_controller.go:204`, `backup_operations_controller.go:228`, and `backup_deletion_controller.go:241` for backup metrics) read `ScheduleNameLabel` back without `label.GetValidName`, so after Category D.1 they'll show a hash instead of the real schedule name for such schedules. See Category E.2. Not fixed by this design because a proper fix needs the same full-name-annotation mechanism as Category D.2, which is disproportionate for display-only metrics labels; a follow-up can revisit if this proves to matter in practice.
+- **`GetValidName`'s 24-bit hash suffix for identity-critical labels**: `GetValidName` is unchanged by this design (see "Truncate without a hash suffix" under Alternatives Considered) because lengthening its shared hash algorithm would break every existing caller's already-persisted long-name labels across an upgrade, not just `RestoreNameLabel`/`ScheduleNameLabel`. If the collision risk for identity-critical labels (where a collision causes a selector to match the wrong object, as opposed to labels used only for informational display) is judged worth tightening, it needs its own design: likely a versioned or migrated hash rather than an in-place algorithm change, coordinated across every existing `GetValidName` caller, not scoped to issue #8815.
