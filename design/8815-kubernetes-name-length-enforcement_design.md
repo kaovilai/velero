@@ -464,25 +464,37 @@ if restore.Spec.ScheduleName == "" {
 
 Unlike the six sites below, this value doesn't stay local: `restore` is the actual object being reconciled, and `pkg/controller/restore_controller.go:267` patches it back to the API server with `kubeutil.PatchResource(original, restore, r.kbClient)` — a `client.MergeFrom` merge-patch that persists *every* field that differs from `original`, not just `Status`. So for a schedule name over 63 characters, this would write the *hash* into `restore.Spec.ScheduleName` — a real, user-facing API field (visible via `kubectl get restore -o yaml`, and readable by any other tooling), not merely a display value. That is a materially worse outcome than the six read-only sites below, and needs an actual fix rather than being accepted as a gap.
 
-The fix relies on a property of `GetValidNameLongHash`'s truncation: it only ever modifies inputs longer than 63 characters, and whenever it does, the result is *exactly* 63 characters (`getValidNameWithMaxLen` returns either the untouched input, or exactly `maxLen` characters — never something in between). So any value **strictly shorter** than 63 characters is provably the real, un-hashed name; only a value of *exactly* 63 characters is ambiguous (it could be a genuine 63-character schedule name, or the hash of something longer). Checking the length before persisting closes the hole without needing an annotation or any change to what other controllers consume:
+The fix relies on a property of `GetValidNameLongHash`'s truncation: it only ever modifies inputs longer than 63 characters, and whenever it does, the result is *exactly* 63 characters (`getValidNameWithMaxLen` returns either the untouched input, or exactly `maxLen` characters — never something in between). So any value **strictly shorter** than 63 characters is provably the real, un-hashed name. A value of *exactly* 63 characters is ambiguous on length alone (it could be a genuine 63-character schedule name, or the hash of something longer) — but the ambiguity is resolvable rather than something to merely accept: `Schedule` is an independently-gettable object with its own real, never-hashed `metadata.name`, so a `Get` for a `Schedule` named exactly `scheduleName` in the restore's namespace settles it. If one exists, the label was never hashed to begin with (`GetValidNameLongHash` is the identity function below 64 characters, so a real 63-character schedule name and its label value are byte-for-byte the same string) and it's safe to use. If the `Get` returns `NotFound`, the label almost certainly holds a hash of some longer name, and `Spec.ScheduleName` is left empty rather than populated with it:
 
 ```go
 // After
 // Fill in the ScheduleName so it's easier to consume for metrics -- but only
-// when the label value is short enough to be provably the real name.
+// when the label value is confirmed to be the real name, not a hash.
 // GetValidNameLongHash only truncates inputs over 63 characters, and its
 // result is always exactly 63 characters when it does, so anything shorter
-// is guaranteed untouched; a length of exactly 63 is treated as possibly a
-// hash and left alone, to avoid ever persisting one into this user-facing
-// Spec field.
+// is guaranteed untouched. A value of exactly 63 characters is ambiguous on
+// length alone, so it's resolved by checking whether a Schedule with that
+// exact name exists -- Schedule names are never hashed, so a match proves
+// the label is genuine.
 if restore.Spec.ScheduleName == "" {
-    if scheduleName := info.backup.GetLabels()[api.ScheduleNameLabel]; len(scheduleName) < validation.DNS1035LabelMaxLength {
-        restore.Spec.ScheduleName = scheduleName
+    if scheduleName := info.backup.GetLabels()[api.ScheduleNameLabel]; scheduleName != "" {
+        switch {
+        case len(scheduleName) < validation.DNS1035LabelMaxLength:
+            restore.Spec.ScheduleName = scheduleName
+        default:
+            schedule := &api.Schedule{}
+            if err := r.kbClient.Get(ctx, kbclient.ObjectKey{Namespace: restore.Namespace, Name: scheduleName}, schedule); err == nil {
+                restore.Spec.ScheduleName = scheduleName
+            }
+            // NotFound (or any other Get error): scheduleName is a hash of a
+            // longer name (or the schedule was deleted); leave Spec.ScheduleName
+            // empty rather than persist it.
+        }
     }
 }
 ```
 
-The trade-off: for schedule names over 63 characters (and the rare, ambiguous exactly-63-character case), `restore.Spec.ScheduleName` is left empty instead of auto-filled, so the downstream metrics that read it (`pkg/controller/restore_finalizer_controller.go:258`/`261`, and this same function's own `RegisterRestoreAttempt` call) report an empty schedule name for those restores rather than either the real name or a hash. That is strictly better than the current design's alternative of reporting a hash that looks like real data but isn't, and it only affects the same narrow long-schedule-name case everything else in Category E.2 is already about.
+The residual trade-off is now much narrower than before: `restore.Spec.ScheduleName` is left empty only for schedule names that actually exceed 63 characters (the case Category D.1 addresses), not for the merely-ambiguous-by-length 63-character case, which this now resolves correctly. For a genuinely too-long schedule name, the downstream metrics that read this field (`pkg/controller/restore_finalizer_controller.go:258`/`261`, and this same function's own `RegisterRestoreAttempt` call) report an empty schedule name rather than either the real name or a hash — strictly better than reporting a hash that looks like real data but isn't, and limited to the same narrow long-schedule-name case everything else in Category E.2 is already about.
 
 **Known, accepted gap — not fixed by this design**: six further places read `ScheduleNameLabel` back purely as a *display* value for metrics, and none of them go through `label.GetValidNameLongHash` on the read:
 
@@ -587,7 +599,7 @@ After this fix, the query correctly matches objects whose labels were written by
 The Category E.2 fix applies the equivalent pattern to `ScheduleNameLabel` at four selector call sites, for schedule names > 63 characters, using `label.GetValidNameLongHash` rather than `label.GetValidName` (see Category D.1 and "Truncate without a hash suffix" under Alternatives Considered for why).
 Unlike E.1 (a pre-existing bug), this is a regression this design would otherwise introduce itself: before Category D.1's write-side fix, a schedule name > 63 characters made `ScheduleNameLabel` an invalid label value, so Backup creation from that schedule already failed loudly; these four selectors were unreachable dead code for such schedules. After D.1 alone, Backup creation would start succeeding (the label is now a valid hash) but these selectors would keep querying the raw name and silently match nothing — replacing a loud failure with a silent one. E.2 keeps read and write sides consistent from the same release that introduces D.1, so no such window exists.
 
-E.2's fifth fix, `restore_controller.go`'s length-gated `restore.Spec.ScheduleName` auto-fill, is compatibility-relevant in its own right: for restores auto-detected from a schedule with a name ≥ 63 characters, `Spec.ScheduleName` changes from "populated with a hash" (the bug this fixes) to "left empty." Any existing tooling reading this field for such restores was already getting a hash before this design shipped Category D.1 at all — there is no prior "correct" value to regress from, since Category D.1 and this fix land in the same change.
+E.2's fifth fix, `restore_controller.go`'s `restore.Spec.ScheduleName` auto-fill, is compatibility-relevant in its own right: for restores auto-detected from a schedule with a name over 63 characters, `Spec.ScheduleName` changes from "populated with a hash" (the bug this fixes) to "left empty" (a genuine 63-character schedule name is resolved correctly via the `Schedule` existence check, and is unaffected). Any existing tooling reading this field for restores from a >63-character-name schedule was already getting a hash before this design shipped Category D.1 at all — there is no prior "correct" value to regress from, since Category D.1 and this fix land in the same change.
 
 ### User-defined maintenance job PodLabels
 
@@ -658,7 +670,7 @@ SHA-256 is appropriate for this purpose and is already used by the existing `Get
 6. Add the four full-name pod annotation constants and apply Category D.2 fixes: at each of the four hosting-pod creation sites, change both the label map and the new annotation map to apply Velero's reserved key *last* (after user-configured/third-party entries are merged in), and update `findPVBByPod`, `findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod` to prefer the annotation with label fallback.
 7. Apply Category E fixes: E.1's 2 `MatchingLabels` selectors plus the VGSC write-side fix in `pkg/restore/actions/csi/volumesnapshot_action.go`; E.2's 4 `ScheduleNameLabel` selector call sites (`pkg/cmd/cli/restore/create.go:251,313`, `pkg/controller/restore_controller.go:388`, `pkg/controller/schedule_controller.go:234`) plus the length-gated fix to `pkg/controller/restore_controller.go:432` so a hash is never persisted into `restore.Spec.ScheduleName`, landing in the same change as Category D.1's `ScheduleNameLabel` write-side fix so there is no release where they're inconsistent with each other.
 8. Apply Category F fixes (5 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
-9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a `find*ByPod` test (all four types) where the annotation resolves to a real but unrelated object (no `OwnerReferences` match to the pod) to confirm the `metav1.IsControlledBy` check rejects it and falls back to the label; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it; a Category E.2 regression test asserting that, once Category D.1 hashes the `ScheduleNameLabel` write side, a schedule name over 63 characters is still matched by all four E.2 selector read sites (`pkg/cmd/cli/restore/create.go`'s `--from-schedule` and `--allow-partially-failed` lookups, `restore_controller.go`'s most-recent-backup lookup, and `schedule_controller.checkIfBackupInNewOrProgress`) — this fix's failure mode is a silent zero-match, not an error, so it needs a test rather than relying on code review to catch a regression; and a test that `validateAndComplete` leaves `restore.Spec.ScheduleName` empty (not hash-populated) for a schedule name over 63 characters, alongside the existing short-name auto-fill behavior.
+9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a `find*ByPod` test (all four types) where the annotation resolves to a real but unrelated object (no `OwnerReferences` match to the pod) to confirm the `metav1.IsControlledBy` check rejects it and falls back to the label; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it; a Category E.2 regression test asserting that, once Category D.1 hashes the `ScheduleNameLabel` write side, a schedule name over 63 characters is still matched by all four E.2 selector read sites (`pkg/cmd/cli/restore/create.go`'s `--from-schedule` and `--allow-partially-failed` lookups, `restore_controller.go`'s most-recent-backup lookup, and `schedule_controller.checkIfBackupInNewOrProgress`) — this fix's failure mode is a silent zero-match, not an error, so it needs a test rather than relying on code review to catch a regression; and three `validateAndComplete` tests covering the exactly-63-character boundary — leaves `restore.Spec.ScheduleName` empty for a schedule name over 63 characters (hash, no matching `Schedule`), preserves it correctly for a genuine 63-character schedule name (matching `Schedule` exists), and the existing under-63-character auto-fill behavior is unaffected.
 
 All changes are confined to existing functions plus four new annotation constants, and introduce no new CRDs, API fields, or controller reconciliation loops.
 
