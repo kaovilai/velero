@@ -62,7 +62,7 @@ When truncation is needed the last 6 characters of the (58-character) result are
 
 **`GetValidObjectName(name string) string`**
 Truncates a deterministic object name to at most 253 characters using the same hash-suffix strategy.
-Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix is what stands between two distinct long inputs and an `AlreadyExists` conflict (there is no Kubernetes-injected randomness backstopping it here, unlike the `GenerateName` case). It reduces that collision risk; see "Truncate without a hash suffix" under Alternatives Considered for the actual bound (24 bits, not an absolute guarantee).
+Unlike `GetValidGenerateName`, this path sets `metadata.name` directly — it is never passed through `SimpleNameGenerator` — so the full 253-character DNS1123 subdomain limit applies, and the hash suffix is what stands between two distinct long inputs and an `AlreadyExists` conflict (there is no Kubernetes-injected randomness backstopping it here, unlike the `GenerateName` case). Because that risk is a real functional conflict rather than just a readability concern, `GetValidObjectName` uses a longer, 16-character hash suffix (64 bits) than `GetValidName`/`GetValidGenerateName`'s 6; see "Truncate without a hash suffix" under Alternatives Considered for the reasoning and the collision bound.
 
 All twenty-nine affected call sites are updated to pass their computed name or prefix through the appropriate helper before use.
 
@@ -93,27 +93,40 @@ const kubernetesGeneratedNameTotalLength = 63
 
 // getValidNameWithMaxLen is the shared implementation for all name-length helpers.
 // If name fits within maxLen it is returned unchanged.
-// Otherwise the last 6 characters are replaced with the first 6 hex characters of
-// SHA-256(name), reducing (not eliminating) the chance that two distinct long
-// names collide after truncation. See "Truncate without a hash suffix" in
-// Alternatives Considered for the actual collision bound and why it differs
-// between GetValidObjectName and GetValidGenerateName callers.
-func getValidNameWithMaxLen(name string, maxLen int) string {
+// Otherwise the last hashLen characters are replaced with the first hashLen hex
+// characters of SHA-256(name), reducing (not eliminating) the chance that two
+// distinct long names collide after truncation. See "Truncate without a hash
+// suffix" in Alternatives Considered for why GetValidObjectName uses a longer
+// hashLen than GetValidName/GetValidGenerateName.
+func getValidNameWithMaxLen(name string, maxLen, hashLen int) string {
     if len(name) <= maxLen {
         return name
     }
     sha := sha256.Sum256([]byte(name))
     strSha := hex.EncodeToString(sha[:])
-    charsFromName := maxLen - 6
+    charsFromName := maxLen - hashLen
     if charsFromName < 0 {
         return strSha[:maxLen]
     }
-    return name[:charsFromName] + strSha[:6]
+    return name[:charsFromName] + strSha[:hashLen]
 }
+
+// shortHashSuffixLength is used by GetValidName and GetValidGenerateName, where
+// the hash has no correctness role (see GetValidGenerateName's doc comment and
+// GetValidName's label-selector-only usage) -- it exists purely to make two
+// truncated values look different from each other at a glance.
+const shortHashSuffixLength = 6
+
+// objectNameHashSuffixLength is used by GetValidObjectName, where a hash
+// collision is a real AlreadyExists conflict, not just a readability concern.
+// 16 hex characters (64 bits) makes the birthday-bound collision probability
+// negligible for any realistic number of long, similarly-prefixed objects,
+// while still costing only 16 of GetValidObjectName's 253-character budget.
+const objectNameHashSuffixLength = 16
 
 // GetValidName converts a string to a valid Kubernetes label value (≤ 63 characters).
 func GetValidName(label string) string {
-    return getValidNameWithMaxLen(label, validation.DNS1035LabelMaxLength)
+    return getValidNameWithMaxLen(label, validation.DNS1035LabelMaxLength, shortHashSuffixLength)
 }
 
 // GetValidGenerateName truncates a GenerateName prefix to the number of
@@ -123,15 +136,17 @@ func GetValidName(label string) string {
 // merely keeps the raw GenerateName field itself from being rejected at
 // admission.
 func GetValidGenerateName(prefix string) string {
-    return getValidNameWithMaxLen(prefix, kubernetesGeneratedNameTotalLength-randomSuffixLength) // 58
+    return getValidNameWithMaxLen(prefix, kubernetesGeneratedNameTotalLength-randomSuffixLength, shortHashSuffixLength) // 58
 }
 
 // GetValidObjectName truncates a deterministic object name to the Kubernetes
 // 253-character DNS subdomain limit. Unlike GetValidGenerateName, this name
 // is never passed through SimpleNameGenerator, so the full DNS1123Subdomain
-// limit applies.
+// limit applies. Uses a longer hash suffix than GetValidName/GetValidGenerateName
+// because a collision here is a real AlreadyExists conflict, not just a
+// readability concern.
 func GetValidObjectName(name string) string {
-    return getValidNameWithMaxLen(name, validation.DNS1123SubdomainMaxLength)
+    return getValidNameWithMaxLen(name, validation.DNS1123SubdomainMaxLength, objectNameHashSuffixLength)
 }
 ```
 
@@ -309,22 +324,41 @@ hostingPodAnnotation[velerov1api.PVBFullNameAnnotation] = pvb.Name // reserved; 
 
 The other three write sites (`pkg/controller/pod_volume_restore_controller.go`, `pkg/controller/data_upload_controller.go`, `pkg/controller/data_download_controller.go`) follow the same ordering with their respective label/annotation constant.
 
-Each `find*ByPod` helper is updated to prefer the annotation and fall back to the label, so pods created by an older Velero version (before this annotation existed) continue to resolve correctly. The annotation is only trusted when non-empty — an empty string (which a `pod.Annotations[key]` lookup cannot distinguish from "absent" using the two-value form alone) falls back to the label rather than being used as a lookup name, as defense in depth alongside the reserved-key-last ordering above:
+Each `find*ByPod` helper is updated to prefer the annotation and fall back to the label, so pods created by an older Velero version (before this annotation existed) continue to resolve correctly. The annotation is only trusted when non-empty — an empty string (which a `pod.Annotations[key]` lookup cannot distinguish from "absent" using the two-value form alone) falls back to the label rather than being used as a lookup name, as defense in depth alongside the reserved-key-last ordering above. If the annotation-derived name is stale or otherwise wrong (e.g. hand-edited pod metadata, or a future scenario where annotation and label genuinely diverge), the `client.Get` using it fails with `NotFound` — in that case the helper retries once with the label-derived name instead of returning the error immediately, rather than trusting the annotation unconditionally once it's present:
 
 ```go
 func findPVBByPod(client client.Client, pod corev1api.Pod) (*velerov1api.PodVolumeBackup, error) {
-    name := pod.Annotations[velerov1api.PVBFullNameAnnotation]
-    if name == "" {
-        name = pod.Labels[velerov1api.PVBLabel]
+    tryGet := func(name string) (*velerov1api.PodVolumeBackup, error) {
+        if name == "" {
+            return nil, nil
+        }
+        pvb := &velerov1api.PodVolumeBackup{}
+        err := client.Get(context.Background(), types.NamespacedName{
+            Namespace: pod.Namespace,
+            Name:      name,
+        }, pvb)
+        if err != nil {
+            return nil, err
+        }
+        return pvb, nil
     }
-    if name == "" {
+
+    if annotated := pod.Annotations[velerov1api.PVBFullNameAnnotation]; annotated != "" {
+        pvb, err := tryGet(annotated)
+        switch {
+        case err == nil:
+            return pvb, nil
+        case !apierrors.IsNotFound(err):
+            return nil, errors.Wrapf(err, "error to find PVB by pod %s/%s", pod.Namespace, pod.Name)
+        }
+        // NotFound: the annotation didn't resolve -- fall through to the label.
+    }
+
+    labeled := pod.Labels[velerov1api.PVBLabel]
+    if labeled == "" {
         return nil, nil
     }
-    pvb := &velerov1api.PodVolumeBackup{}
-    err := client.Get(context.Background(), types.NamespacedName{
-        Namespace: pod.Namespace,
-        Name:      name,
-    }, pvb)
+    pvb, err := tryGet(labeled)
     if err != nil {
         return nil, errors.Wrapf(err, "error to find PVB by pod %s/%s", pod.Namespace, pod.Name)
     }
@@ -522,8 +556,9 @@ The hash-suffix-on-truncation approach preserves the readable prefix in the comm
 
 Simply slicing to the maximum length without appending a hash is simpler to implement but means that two distinct long names that share the same retained prefix would produce the same truncated base.
 For `GetValidObjectName` (deterministic `metadata.name`, no Kubernetes-injected randomness) that is a real collision: the second create fails with `AlreadyExists`.
-The 6-hex-character hash suffix (24 bits, ~16.7 million values) makes that collision unlikely for a given pair, though — unlike a full SHA-256 suffix — it does not make it negligible at scale; a deployment naming many thousands of long, similarly-prefixed objects through `GetValidObjectName` should be aware the birthday bound on a 24-bit space is in the low thousands, not "astronomically" large. If this precision turns out to matter in practice, the implementation can revisit the suffix length for `GetValidObjectName` specifically (it does not affect `GetValidGenerateName`, see below).
-For `GetValidGenerateName`, Kubernetes always appends its own independent 5 random characters after truncation, so final-object-name uniqueness is already guaranteed by Kubernetes regardless of what Velero's hash contributes; the hash there only helps a human distinguish two long, truncated prefixes at a glance (e.g. in `kubectl get`), not correctness.
+An earlier version of this design used the same 6-hex-character suffix (24 bits, ~16.7 million values) for all three helpers; the birthday bound on a 24-bit space is in the low thousands, not "astronomically" large, which is comfortable for `GetValidName`/`GetValidGenerateName` (see below) but not clearly comfortable for `GetValidObjectName` in a deployment that names many thousands of long, similarly-prefixed `BackupRepository`/cache-PVC/ConfigMap objects over its lifetime. `GetValidObjectName` therefore uses a 16-hex-character suffix (64 bits) instead — the birthday bound there is astronomically large for any realistic object count, at the cost of 10 extra characters out of its 253-character budget, which is negligible. `GetValidName`/`GetValidGenerateName` keep the 6-character suffix (see below for why a longer one wouldn't help them).
+For `GetValidGenerateName`, Kubernetes always appends its own independent 5 random characters after truncation, so final-object-name uniqueness is already guaranteed by Kubernetes regardless of what Velero's hash contributes; the hash there only helps a human distinguish two long, truncated prefixes at a glance (e.g. in `kubectl get`), not correctness — a longer suffix would only shrink the readable prefix for no benefit.
+For `GetValidName`, the value is a label used solely for selector-based filtering (Category D.1/E), never for uniqueness enforcement — Kubernetes labels are not required to be unique — so a 24-bit collision at most causes two logically-distinct long names to match the same selector query, a correctness nuisance rather than a creation failure; kept at 6 characters primarily to leave more of the 63-character label budget as a readable prefix.
 
 ### Place helpers in a new `pkg/util/names` package
 
@@ -539,7 +574,7 @@ SHA-256 is appropriate for this purpose and is already used by the existing `Get
 
 ## Implementation
 
-1. Add `GetValidGenerateName` (targeting the 58-character retained-prefix budget, not 248) and `GetValidObjectName` to `pkg/label/label.go` with unit tests covering short, boundary, and long inputs — including a `GetValidGenerateName` test that confirms the hash lands within the first 58 characters.
+1. Add `GetValidGenerateName` (targeting the 58-character retained-prefix budget, not 248) and `GetValidObjectName` (16-character hash suffix, not 6) to `pkg/label/label.go` with unit tests covering short, boundary, and long inputs — including a `GetValidGenerateName` test that confirms the hash lands within the first 58 characters, and a `GetValidObjectName` test that confirms its result is 253 characters with a 16-character hash tail.
 2. Apply Category A fixes (10 `GenerateName` sites) — straightforward one-line changes each.
 3. Apply Category B fix (`BackupRepository` deterministic name).
 4. Apply Category C fixes (`getCachePVCName` and the DataUpload snapshot-info ConfigMap name).
