@@ -159,7 +159,7 @@ func GetValidObjectName(name string) string {
 ```
 
 `validation.DNS1035LabelMaxLength` (63) and `validation.DNS1123SubdomainMaxLength` (253) are both from `k8s.io/apimachinery/pkg/util/validation`, which is already imported by the package.
-`kubernetesGeneratedNameTotalLength` (63) and `randomSuffixLength` (5) together document the fixed total that `names.SimpleNameGenerator` produces; Velero does not add `k8s.io/apiserver` as a dependency to obtain these as real constants (see "Import `k8s.io/apiserver/pkg/storage/names`" under Alternatives Considered) — they are re-declared locally with a comment citing the upstream behavior they mirror.
+`kubernetesGeneratedNameTotalLength` (63) and `randomSuffixLength` (5) together document the fixed total that `names.SimpleNameGenerator` produces; Velero does not add `k8s.io/apiserver` as a dependency to obtain these as real constants (see "Import `k8s.io/apiserver/pkg/storage/names`" under Alternatives Considered) — they are redeclared locally with a comment citing the upstream behavior they mirror.
 
 ### Category A — `GenerateName` prefix exceeds what Kubernetes retains (10 locations)
 
