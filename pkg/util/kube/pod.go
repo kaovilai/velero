@@ -160,13 +160,12 @@ func IsPodUnrecoverable(pod *corev1api.Pod, log logrus.FieldLogger) (bool, strin
 		return true, fmt.Sprintf("Pod is in abnormal state [%s], message [%s]", pod.Status.Phase, message)
 	}
 
-	// removed "Unschedulable" check since unschedulable condition isn't always permanent, e.g.
-	// insufficient CPU/memory can resolve via autoscaling, and untolerated taints can be
-	// removed -- see #9697. A subsequent, narrower node-affinity-based variant of this check
-	// was also tried (#10276) but dropped per maintainer feedback: even a node-affinity
-	// mismatch isn't deterministic, since a matching node can still join later (e.g. a
-	// cluster-autoscaler-provisioned node). Unschedulable pods rely on the default
-	// preparing/operation timeout instead of a fast-fail path.
+	// No "Unschedulable" check here: it isn't a reliable permanent-failure signal. Insufficient
+	// CPU/memory can resolve via autoscaling, untolerated taints can be removed, and even an
+	// unsatisfiable node affinity can still be satisfied later by a node joining the cluster
+	// (e.g. one provisioned by a cluster autoscaler) -- see #9697. Unschedulable pods rely on
+	// the default preparing/operation timeout; GetPodSchedulingFailureMessage below still
+	// surfaces the scheduler's own diagnosis once that timeout is reported.
 
 	// Check the Status field
 	for _, containerStatus := range pod.Status.ContainerStatuses {
@@ -186,9 +185,9 @@ func IsPodUnrecoverable(pod *corev1api.Pod, log logrus.FieldLogger) (bool, strin
 //
 // This only relays the scheduler's own existing verdict as-is (e.g. "0/6 nodes are available:
 // 3 node(s) didn't match Pod's node affinity/selector") -- it makes no judgment about whether
-// the condition is permanent or will resolve on its own, so unlike a fail-fast/permanence check
-// (see the removed node-affinity check above), it's safe to surface immediately: it's reporting
-// data that already exists on the pod, not predicting the future.
+// the condition is permanent or will resolve on its own. That's what makes it safe to surface
+// immediately: it reports data the scheduler already produced, rather than predicting whether
+// the pod will ever be scheduled.
 func GetPodSchedulingFailureMessage(pod *corev1api.Pod) string {
 	if pod == nil {
 		return ""
