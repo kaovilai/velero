@@ -468,28 +468,28 @@ Category D.1 fixes `pkg/builder/backup_builder.go:107` to write the schedule nam
 
 | File | Context | Before | After |
 | --- | --- | --- | --- |
-| `pkg/cmd/cli/restore/create.go:251` | `velero restore create --from-schedule <name>` | `labels.SelectorFromSet(map[string]string{api.ScheduleNameLabel: o.ScheduleName})` | `labels.SelectorFromSet(scheduleNameSelectorSet(o.ScheduleName))` |
-| `pkg/cmd/cli/restore/create.go:313` | `--allow-partially-failed` lookup for the same restore | `labels.SelectorFromSet(map[string]string{api.ScheduleNameLabel: o.ScheduleName})` | `labels.SelectorFromSet(scheduleNameSelectorSet(o.ScheduleName))` |
-| `pkg/controller/restore_controller.go:388` | Fill in `BackupName` from the most recent backup of `restore.Spec.ScheduleName` | `labels.SelectorFromSet(labels.Set(map[string]string{api.ScheduleNameLabel: restore.Spec.ScheduleName}))` | `labels.SelectorFromSet(labels.Set(scheduleNameSelectorSet(restore.Spec.ScheduleName)))` |
-| `pkg/controller/schedule_controller.go:234` | `checkIfBackupInNewOrProgress`, used to skip a new backup while one is already running | `labels.Set(map[string]string{velerov1.ScheduleNameLabel: schedule.Name}).AsSelector()` | `labels.Set(scheduleNameSelectorSet(schedule.Name)).AsSelector()` |
+| `pkg/cmd/cli/restore/create.go:251` | `velero restore create --from-schedule <name>` | `labels.SelectorFromSet(map[string]string{api.ScheduleNameLabel: o.ScheduleName})` | `labels.SelectorFromSet(label.ScheduleNameSelectorSet(o.ScheduleName))` |
+| `pkg/cmd/cli/restore/create.go:313` | `--allow-partially-failed` lookup for the same restore | `labels.SelectorFromSet(map[string]string{api.ScheduleNameLabel: o.ScheduleName})` | `labels.SelectorFromSet(label.ScheduleNameSelectorSet(o.ScheduleName))` |
+| `pkg/controller/restore_controller.go:388` | Fill in `BackupName` from the most recent backup of `restore.Spec.ScheduleName` | `labels.SelectorFromSet(labels.Set(map[string]string{api.ScheduleNameLabel: restore.Spec.ScheduleName}))` | `labels.SelectorFromSet(labels.Set(label.ScheduleNameSelectorSet(restore.Spec.ScheduleName)))` |
+| `pkg/controller/schedule_controller.go:234` | `checkIfBackupInNewOrProgress`, used to skip a new backup while one is already running | `labels.Set(map[string]string{velerov1.ScheduleNameLabel: schedule.Name}).AsSelector()` | `labels.Set(label.ScheduleNameSelectorSet(schedule.Name)).AsSelector()` |
 
-where `scheduleNameSelectorSet` is a small shared helper mirroring Category D.1's write-side branching:
+where `label.ScheduleNameSelectorSet` is a small shared helper (in `pkg/label`, alongside `GetValidNameLongHash` and the package's other domain-specific selector helpers) mirroring Category D.1's write-side branching:
 
 ```go
-// scheduleNameSelectorSet returns the single-entry label map to match backups
+// ScheduleNameSelectorSet returns the single-entry label map to match backups
 // created from the given schedule name, choosing ScheduleNameLabel or
 // ScheduleNameHashLabel by the same rule the write side (Category D.1) uses:
 // the candidate name's own length, never the shape of a label value already
 // on some other object.
-func scheduleNameSelectorSet(scheduleName string) map[string]string {
+func ScheduleNameSelectorSet(scheduleName string) map[string]string {
     if len(scheduleName) <= validation.DNS1035LabelMaxLength {
         return map[string]string{velerov1api.ScheduleNameLabel: scheduleName}
     }
-    return map[string]string{velerov1api.ScheduleNameHashLabel: label.GetValidNameLongHash(scheduleName)}
+    return map[string]string{velerov1api.ScheduleNameHashLabel: GetValidNameLongHash(scheduleName)}
 }
 ```
 
-Before this design, a schedule name over 63 characters was already impossible to use this way — `ScheduleNameLabel` would have been rejected as an invalid label value the first time a Backup was created from the schedule, so these four selectors were dead code for such schedules (nothing to find). After Category D.1 alone (without this E.2 fix), long schedule names succeed and are labeled via `ScheduleNameHashLabel`, but these four selectors would still query only `ScheduleNameLabel` with the raw (long) name and silently find nothing — turning a loud creation failure into a silent, harder-to-diagnose lookup failure. `scheduleNameSelectorSet` keeps all four read sites in sync with the D.1 write side, the same fix shape as E.1 (which uses the ordinary `label.GetValidName` in place, since `RestoreNameLabel` does have pre-existing 6-character-hashed values to stay compatible with, and has no read site that depends on distinguishing a hash from a real name the way `ScheduleNameLabel` does — see "Truncate without a hash suffix" under Alternatives Considered).
+Before this design, a schedule name over 63 characters was already impossible to use this way — `ScheduleNameLabel` would have been rejected as an invalid label value the first time a Backup was created from the schedule, so these four selectors were dead code for such schedules (nothing to find). After Category D.1 alone (without this E.2 fix), long schedule names succeed and are labeled via `ScheduleNameHashLabel`, but these four selectors would still query only `ScheduleNameLabel` with the raw (long) name and silently find nothing — turning a loud creation failure into a silent, harder-to-diagnose lookup failure. `label.ScheduleNameSelectorSet` keeps all four read sites in sync with the D.1 write side, the same fix shape as E.1 (which uses the ordinary `label.GetValidName` in place, since `RestoreNameLabel` does have pre-existing 6-character-hashed values to stay compatible with, and has no read site that depends on distinguishing a hash from a real name the way `ScheduleNameLabel` does — see "Truncate without a hash suffix" under Alternatives Considered).
 
 **The two-label split alone makes every other reader of `ScheduleNameLabel` safe, but not complete.** `pkg/controller/restore_controller.go:432`'s `restore.Spec.ScheduleName = info.backup.GetLabels()[api.ScheduleNameLabel]` (persisted into the Restore's own `Spec` via the merge-patch at `pkg/controller/restore_controller.go:267`) and six backup-metrics read sites (`pkg/controller/backup_controller.go:260,328,900`, `backup_finalizer_controller.go:205`, `backup_operations_controller.go:228`, `backup_deletion_controller.go:241`) all read `ScheduleNameLabel` as-is. Because Category D.1 only ever writes a schedule's *raw* name into `ScheduleNameLabel` (a hash never appears there — it goes into the separate `ScheduleNameHashLabel` instead), none of these seven can be corrupted by a hash anymore: for a schedule ≤ 63 characters they get the real name; for one > 63 characters they get an empty string (label simply absent). That's a real fix on its own — an earlier, reverted iteration of this design tried to reach the same "never a hash" guarantee with a length check and then an unsound `Schedule`-existence check, both unnecessary once the label is split in two.
 
@@ -500,7 +500,7 @@ But "empty" is still a worse answer than "the real name" for a schedule that doe
 ScheduleFullNameAnnotation = "velero.io/schedule-full-name"
 ```
 
-`pkg/builder/backup_builder.go`'s `FromSchedule` (Category D.1's write site) sets this annotation unconditionally, alongside the existing label/hash-label write, applied last so a schedule's own templated annotations can't override it — the same reserved-key-last principle as Category D.2:
+`pkg/builder/backup_builder.go`'s `FromSchedule` (Category D.1's write site) sets this annotation unconditionally, alongside the existing label/hash-label write, applied last so a schedule's own templated annotations can't override it — the same reserved-key-last principle as Category D.2. It copies into a fresh map rather than mutating `annotations` in place, because that variable can alias `schedule.Spec.Template.Metadata.Annotations` or `schedule.Annotations` directly (`annotations = schedule.Annotations` is a reference assignment in Go, not a copy) — writing into it would mutate the `Schedule` object itself, which may be a shared, informer-cached object read elsewhere in the controller. (The pre-existing code immediately above this, for `ScheduleNameLabel`, has the identical aliasing shape — `labels = schedule.Labels` followed by `labels[velerov1api.ScheduleNameLabel] = schedule.Name` — and appears to have the same problem already, independent of this design; out of scope for issue #8815, but worth fixing in the same change since it's adjacent code being touched anyway.)
 
 ```go
 // Before
@@ -509,26 +509,40 @@ if annotations != nil {
 }
 
 // After
-if annotations == nil {
-    annotations = make(map[string]string)
+scheduleAnnotations := make(map[string]string, len(annotations)+1)
+for k, v := range annotations {
+    scheduleAnnotations[k] = v
 }
-annotations[velerov1api.ScheduleFullNameAnnotation] = schedule.Name // reserved; applied last
-b.ObjectMeta(WithAnnotationsMap(annotations))
+scheduleAnnotations[velerov1api.ScheduleFullNameAnnotation] = schedule.Name // reserved; applied last
+b.ObjectMeta(WithAnnotationsMap(scheduleAnnotations))
 ```
 
-All seven read sites switch from indexing `ScheduleNameLabel` directly to a small shared helper that prefers the annotation:
+All seven read sites switch from indexing `ScheduleNameLabel` directly to a small shared helper that prefers the annotation, but only after confirming it actually corresponds to whichever of the two labels is set — the same "resolved, but confirm it's really this object's" discipline as the `metav1.IsControlledBy` check in Category D.2, adapted to a value comparison instead of an owner reference (there's no comparable structural relationship to check here, but the label/hash-label is exactly the derived-from-the-same-name value the annotation should reproduce):
 
 ```go
 // ScheduleDisplayName returns the best available schedule name for display
 // and metrics purposes: the full, untruncated name from
-// ScheduleFullNameAnnotation when present (set on every Backup created from
-// a schedule, regardless of the schedule's name length), falling back to
-// ScheduleNameLabel for Backups created by a Velero version prior to this
-// annotation existing -- which, since Category D.1, is never a hash, only
-// ever the real name or absent.
+// ScheduleFullNameAnnotation when present *and* verified, falling back to
+// ScheduleNameLabel otherwise -- for Backups created by a Velero version
+// prior to this annotation existing, or if the annotation is stale or
+// otherwise doesn't match (e.g. hand-edited metadata), the same defense in
+// depth as Category D.2's annotation fallback. ScheduleNameLabel itself is,
+// since Category D.1, never a hash, only ever the real name or absent.
 func ScheduleDisplayName(obj metav1.Object) string {
-    if v := obj.GetAnnotations()[velerov1api.ScheduleFullNameAnnotation]; v != "" {
-        return v
+    if fullName := obj.GetAnnotations()[velerov1api.ScheduleFullNameAnnotation]; fullName != "" {
+        switch {
+        case len(fullName) <= validation.DNS1035LabelMaxLength:
+            // ScheduleNameLabel should hold this exact name verbatim.
+            if fullName == obj.GetLabels()[velerov1api.ScheduleNameLabel] {
+                return fullName
+            }
+        default:
+            // ScheduleNameHashLabel should hold this exact name's hash.
+            if GetValidNameLongHash(fullName) == obj.GetLabels()[velerov1api.ScheduleNameHashLabel] {
+                return fullName
+            }
+        }
+        // Annotation present but doesn't match either label -- don't trust it.
     }
     return obj.GetLabels()[velerov1api.ScheduleNameLabel]
 }
@@ -642,7 +656,7 @@ For restore names ≤ 63 characters the selector is unchanged.
 For restore names > 63 characters the previous code silently returned zero results (the selector could never match the stored hash).
 After this fix, the query correctly matches objects whose labels were written by the fix-consistent code.
 
-The Category E.2 fix applies the equivalent idea to `ScheduleNameLabel` at four selector call sites, for schedule names > 63 characters, using the shared `scheduleNameSelectorSet` helper (which reads from `ScheduleNameHashLabel` instead of `ScheduleNameLabel` once the candidate name exceeds 63 characters) rather than `label.GetValidName` in place (see Category D.1 and "Truncate without a hash suffix" under Alternatives Considered for why a bare hash-in-place fix, like E.1's, isn't sufficient for `ScheduleNameLabel`).
+The Category E.2 fix applies the equivalent idea to `ScheduleNameLabel` at four selector call sites, for schedule names > 63 characters, using the shared `label.ScheduleNameSelectorSet` helper (which reads from `ScheduleNameHashLabel` instead of `ScheduleNameLabel` once the candidate name exceeds 63 characters) rather than `label.GetValidName` in place (see Category D.1 and "Truncate without a hash suffix" under Alternatives Considered for why a bare hash-in-place fix, like E.1's, isn't sufficient for `ScheduleNameLabel`).
 Unlike E.1 (a pre-existing bug), this is a regression this design would otherwise introduce itself: before Category D.1's write-side fix, a schedule name > 63 characters made `ScheduleNameLabel` an invalid label value, so Backup creation from that schedule already failed loudly; these four selectors were unreachable dead code for such schedules. After D.1 alone, Backup creation would start succeeding (the name is now labeled via `ScheduleNameHashLabel` instead) but these selectors would keep querying only `ScheduleNameLabel` with the raw name and silently match nothing — replacing a loud failure with a silent one. E.2 keeps read and write sides consistent from the same release that introduces D.1, so no such window exists.
 
 Because Category D.1 never writes a hash into `ScheduleNameLabel` itself (long names get `ScheduleNameHashLabel` instead), the seven other readers of `ScheduleNameLabel` — `pkg/controller/restore_controller.go:432`'s `restore.Spec.ScheduleName` auto-fill (which persists into the Restore's own `Spec`, not just a local variable) and six backup-metrics read sites — can never be corrupted by a hash again: for a schedule name ≤ 63 characters they see the real name, and for one > 63 characters they'd otherwise see an absent label (empty string), never a hash. That safety came for free once the label was split in two, superseding an earlier iteration of this design that added a length check and, briefly, an unsound `Schedule`-existence check to `restore_controller.go:432` specifically. But "empty" for a long schedule name is a real information loss compared to every schedule name ≤ 63 characters, which these seven sites display in full — so Category E.2 additionally has all seven switch to `label.ScheduleDisplayName`, which prefers a new `ScheduleFullNameAnnotation` (set unconditionally alongside the label/hash-label at the same write site) and falls back to `ScheduleNameLabel` only for Backups created before this design shipped. After this, all seven display the real schedule name regardless of length, with no empty-value trade-off remaining.
@@ -718,9 +732,9 @@ SHA-256 is appropriate for this purpose and is already used by the existing `Get
 4. Apply Category C fixes (`getCachePVCName` and the DataUpload snapshot-info ConfigMap name).
 5. Apply Category D.1 fixes (5 selector-only label value assignments, including the new `ScheduleNameHashLabel` and `ScheduleFullNameAnnotation` constants and `pkg/builder/backup_builder.go`'s `FromSchedule` write-side split/annotation).
 6. Add the four full-name pod annotation constants and apply Category D.2 fixes: at each of the four hosting-pod creation sites, change both the label map and the new annotation map to apply Velero's reserved key *last* (after user-configured/third-party entries are merged in), and update `findPVBByPod`, `findPVRByRestorePod`, `findDataUploadByPod`, `findDataDownloadByPod` to prefer the annotation with label fallback.
-7. Apply Category E fixes: E.1's 2 `MatchingLabels` selectors plus the VGSC write-side fix in `pkg/restore/actions/csi/volumesnapshot_action.go`; E.2's 4 `ScheduleNameLabel` selector call sites (`pkg/cmd/cli/restore/create.go:251,313`, `pkg/controller/restore_controller.go:388`, `pkg/controller/schedule_controller.go:234`), each switched to the shared `scheduleNameSelectorSet` helper; and E.2's 7 display-recovery read sites (`pkg/controller/restore_controller.go:432`, `pkg/controller/backup_controller.go:260,328,900`, `backup_finalizer_controller.go:205`, `backup_operations_controller.go:228`, `backup_deletion_controller.go:241`), each switched to the shared `label.ScheduleDisplayName` helper. All of E.2 lands in the same change as Category D.1's `ScheduleNameLabel`/`ScheduleNameHashLabel`/`ScheduleFullNameAnnotation` write-side changes so there is no release where they're inconsistent with each other.
+7. Apply Category E fixes: E.1's 2 `MatchingLabels` selectors plus the VGSC write-side fix in `pkg/restore/actions/csi/volumesnapshot_action.go`; E.2's 4 `ScheduleNameLabel` selector call sites (`pkg/cmd/cli/restore/create.go:251,313`, `pkg/controller/restore_controller.go:388`, `pkg/controller/schedule_controller.go:234`), each switched to the shared `label.ScheduleNameSelectorSet` helper; and E.2's 7 display-recovery read sites (`pkg/controller/restore_controller.go:432`, `pkg/controller/backup_controller.go:260,328,900`, `backup_finalizer_controller.go:205`, `backup_operations_controller.go:228`, `backup_deletion_controller.go:241`), each switched to the shared `label.ScheduleDisplayName` helper. All of E.2 lands in the same change as Category D.1's `ScheduleNameLabel`/`ScheduleNameHashLabel`/`ScheduleFullNameAnnotation` write-side changes so there is no release where they're inconsistent with each other.
 8. Apply Category F fixes (5 `GenerateName` sites missing `CreateRetryGenerateName` wrapper).
-9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a `find*ByPod` test (all four types) where the annotation *or* the label resolves to a real but unrelated object (no `OwnerReferences` match to the pod) to confirm the `metav1.IsControlledBy` check rejects it and falls back correctly; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it; a `scheduleNameSelectorSet` unit test covering a name ≤ 63 characters (returns `ScheduleNameLabel`), a name > 63 characters (returns `ScheduleNameHashLabel` with the expected hash), and that it agrees with Category D.1's write-side branch for the same inputs; a Category E.2 regression test asserting that, once Category D.1 writes long schedule names via `ScheduleNameHashLabel`, a schedule name over 63 characters is still matched by all four E.2 selector read sites (`pkg/cmd/cli/restore/create.go`'s `--from-schedule` and `--allow-partially-failed` lookups, `restore_controller.go`'s most-recent-backup lookup, and `schedule_controller.checkIfBackupInNewOrProgress`) — this fix's failure mode is a silent zero-match, not an error, so it needs a test rather than relying on code review to catch a regression; and a `ScheduleDisplayName` unit test covering the annotation-present case, the fallback-to-label case (annotation absent, simulating a pre-upgrade Backup), and both absent (returns empty string).
+9. Add or update unit tests for each fixed function to cover the truncation path, including: a `find*ByPod` test that verifies both the annotation path and the label-fallback path; a `find*ByPod` test (all four types) where the annotation *or* the label resolves to a real but unrelated object (no `OwnerReferences` match to the pod) to confirm the `metav1.IsControlledBy` check rejects it and falls back correctly; a test that a user-configured `PodLabels`/`PodAnnotations` entry colliding with a reserved key does not override it; a `label.ScheduleNameSelectorSet` unit test covering a name ≤ 63 characters (returns `ScheduleNameLabel`), a name > 63 characters (returns `ScheduleNameHashLabel` with the expected hash), and that it agrees with Category D.1's write-side branch for the same inputs; a Category E.2 regression test asserting that, once Category D.1 writes long schedule names via `ScheduleNameHashLabel`, a schedule name over 63 characters is still matched by all four E.2 selector read sites (`pkg/cmd/cli/restore/create.go`'s `--from-schedule` and `--allow-partially-failed` lookups, `restore_controller.go`'s most-recent-backup lookup, and `schedule_controller.checkIfBackupInNewOrProgress`) — this fix's failure mode is a silent zero-match, not an error, so it needs a test rather than relying on code review to catch a regression; a `ScheduleDisplayName` unit test covering the verified-annotation case (both the ≤ 63-character exact-match branch and the > 63-character hash-match branch), the fallback-to-label case (annotation absent, simulating a pre-upgrade Backup), the mismatched-annotation case (annotation present but doesn't match either label, falls back rather than trusting it), and both absent (returns empty string); and a `FromSchedule` test confirming it does not mutate `schedule.Labels`/`schedule.Annotations` (or the template's) in place when writing `ScheduleNameLabel`/`ScheduleNameHashLabel`/`ScheduleFullNameAnnotation`.
 
 All changes are confined to existing functions plus five new annotation constants (the four Category D.2 full-name annotations and `ScheduleFullNameAnnotation`) and one new label constant (`ScheduleNameHashLabel`), and introduce no new CRDs, API fields, or controller reconciliation loops.
 
