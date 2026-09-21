@@ -280,7 +280,7 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if peekErr := r.exposer.PeekExposed(ctx, getPVROwnerObject(pvr)); peekErr != nil {
 			log.Errorf("Cancel PVR %s/%s because of expose error %s", pvr.Namespace, pvr.Name, peekErr)
 
-			diags := strings.Split(r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr)), "\n")
+			diags := strings.Split(r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr)).Text, "\n")
 			for _, diag := range diags {
 				log.Warnf("[Diagnose PVR expose]%s", diag)
 			}
@@ -489,11 +489,11 @@ func (r *PodVolumeRestoreReconciler) onPrepareTimeout(ctx context.Context, pvr *
 
 	log.Info("Timeout happened for preparing PVR")
 
+	diag := r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr))
+
 	message := "timeout on preparing PVR"
-	if pod, getErr := r.kubeClient.CoreV1().Pods(pvr.Namespace).Get(ctx, pvr.Name, metav1.GetOptions{}); getErr == nil {
-		if reason := kube.GetPodSchedulingFailureMessage(pod); reason != "" {
-			message = fmt.Sprintf("%s: pod scheduling failed: %s", message, reason)
-		}
+	if diag.PodSchedulingFailure != "" {
+		message = fmt.Sprintf("%s: pod scheduling failed: %s", message, diag.PodSchedulingFailure)
 	}
 
 	succeeded, err := funcExclusiveUpdatePodVolumeRestore(ctx, r.client, pvr, func(pvr *velerov1api.PodVolumeRestore) {
@@ -513,9 +513,8 @@ func (r *PodVolumeRestoreReconciler) onPrepareTimeout(ctx context.Context, pvr *
 		return
 	}
 
-	diags := strings.Split(r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr)), "\n")
-	for _, diag := range diags {
-		log.Warnf("[Diagnose PVR expose]%s", diag)
+	for _, d := range strings.Split(diag.Text, "\n") {
+		log.Warnf("[Diagnose PVR expose]%s", d)
 	}
 
 	r.exposer.CleanUp(ctx, getPVROwnerObject(pvr))

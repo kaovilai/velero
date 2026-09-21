@@ -1967,7 +1967,7 @@ end diagnose restore exposer`,
 			}
 
 			diag := e.DiagnoseExpose(t.Context(), ownerObject)
-			assert.Equal(t, test.expected, diag)
+			assert.Equal(t, test.expected, diag.Text)
 		})
 	}
 }

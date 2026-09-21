@@ -431,6 +431,41 @@ func TestProgress(t *testing.T) {
 				Updated:        currentTime,
 			},
 		},
+		{
+			// DataUpload's timeout message (set by DataUploadReconciler.onPrepareTimeout) flows
+			// through Progress.Err unmodified, which is what surfaces it as "Operation Error"
+			// in `velero backup describe --details`.
+			name:   "DataUpload failed due to pod scheduling failure",
+			backup: builder.ForBackup("velero", "test").Result(),
+			dataUpload: &velerov2alpha1.DataUpload{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "DataUpload",
+					APIVersion: "v2alpha1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "velero",
+					Name:      "testing",
+					Labels: map[string]string{
+						velerov1api.AsyncOperationIDLabel: "testing",
+					},
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase:               velerov2alpha1.DataUploadPhaseFailed,
+					StartTimestamp:      &metav1.Time{Time: currentTime},
+					CompletionTimestamp: &metav1.Time{Time: currentTime},
+					Message:             "timeout on preparing data upload: pod scheduling failed: 0/1 nodes are available: didn't match node affinity",
+				},
+			},
+			operationID: "testing",
+			expectedProgress: velero.OperationProgress{
+				Completed:      true,
+				Err:            "timeout on preparing data upload: pod scheduling failed: 0/1 nodes are available: didn't match node affinity",
+				OperationUnits: "Bytes",
+				Description:    "Failed",
+				Started:        currentTime,
+				Updated:        currentTime,
+			},
+		},
 	}
 
 	for _, tc := range tests {

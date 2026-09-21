@@ -248,6 +248,41 @@ func TestProgress(t *testing.T) {
 				Updated:        currentTime,
 			},
 		},
+		{
+			// DataDownload's timeout message (set by DataDownloadReconciler.onPrepareTimeout)
+			// flows through Progress.Err unmodified, which is what surfaces it as "Operation
+			// Error" in `velero restore describe --details`.
+			name:    "DataDownload failed due to pod scheduling failure",
+			restore: builder.ForRestore("velero", "test").Result(),
+			dataDownload: &velerov2alpha1.DataDownload{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "DataUpload",
+					APIVersion: velerov2alpha1.SchemeGroupVersion.String(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "velero",
+					Name:      "testing",
+					Labels: map[string]string{
+						velerov1api.AsyncOperationIDLabel: "testing",
+					},
+				},
+				Status: velerov2alpha1.DataDownloadStatus{
+					Phase:               velerov2alpha1.DataDownloadPhaseFailed,
+					StartTimestamp:      &metav1.Time{Time: currentTime},
+					CompletionTimestamp: &metav1.Time{Time: currentTime},
+					Message:             "timeout on preparing data download: pod scheduling failed: 0/1 nodes are available: didn't match node affinity",
+				},
+			},
+			operationID: "testing",
+			expectedProgress: velero.OperationProgress{
+				Completed:      true,
+				Err:            "timeout on preparing data download: pod scheduling failed: 0/1 nodes are available: didn't match node affinity",
+				OperationUnits: "Bytes",
+				Description:    "Failed",
+				Started:        currentTime,
+				Updated:        currentTime,
+			},
+		},
 	}
 
 	for _, tc := range tests {

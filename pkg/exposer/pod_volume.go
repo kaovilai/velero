@@ -100,8 +100,7 @@ type PodVolumeExposer interface {
 	PeekExposed(context.Context, corev1api.ObjectReference) error
 
 	// DiagnoseExpose generate the diagnostic info when the expose is not finished for a long time.
-	// If it finds any problem, it returns an string about the problem.
-	DiagnoseExpose(context.Context, corev1api.ObjectReference) string
+	DiagnoseExpose(context.Context, corev1api.ObjectReference) ExposeDiagnostic
 
 	// CleanUp cleans up any objects generated during the restore expose
 	CleanUp(context.Context, corev1api.ObjectReference)
@@ -283,7 +282,7 @@ func (e *podVolumeExposer) PeekExposed(ctx context.Context, ownerObject corev1ap
 	return nil
 }
 
-func (e *podVolumeExposer) DiagnoseExpose(ctx context.Context, ownerObject corev1api.ObjectReference) string {
+func (e *podVolumeExposer) DiagnoseExpose(ctx context.Context, ownerObject corev1api.ObjectReference) ExposeDiagnostic {
 	hostingPodName := ownerObject.Name
 
 	diag := "begin diagnose pod volume exposer\n"
@@ -332,7 +331,7 @@ func (e *podVolumeExposer) DiagnoseExpose(ctx context.Context, ownerObject corev
 
 	diag += "end diagnose pod volume exposer"
 
-	return diag
+	return ExposeDiagnostic{Text: diag, PodSchedulingFailure: kube.GetPodSchedulingFailureMessage(pod)}
 }
 
 func (e *podVolumeExposer) CleanUp(ctx context.Context, ownerObject corev1api.ObjectReference) {

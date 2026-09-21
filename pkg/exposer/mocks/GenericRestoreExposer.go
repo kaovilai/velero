@@ -94,18 +94,18 @@ func (_c *GenericRestoreExposer_CleanUp_Call) RunAndReturn(run func(context1 con
 }
 
 // DiagnoseExpose provides a mock function for the type GenericRestoreExposer
-func (_mock *GenericRestoreExposer) DiagnoseExpose(context1 context.Context, objectReference v1.ObjectReference) string {
+func (_mock *GenericRestoreExposer) DiagnoseExpose(context1 context.Context, objectReference v1.ObjectReference) exposer.ExposeDiagnostic {
 	ret := _mock.Called(context1, objectReference)
 
 	if len(ret) == 0 {
 		panic("no return value specified for DiagnoseExpose")
 	}
 
-	var r0 string
-	if returnFunc, ok := ret.Get(0).(func(context.Context, v1.ObjectReference) string); ok {
+	var r0 exposer.ExposeDiagnostic
+	if returnFunc, ok := ret.Get(0).(func(context.Context, v1.ObjectReference) exposer.ExposeDiagnostic); ok {
 		r0 = returnFunc(context1, objectReference)
 	} else {
-		r0 = ret.Get(0).(string)
+		r0 = ret.Get(0).(exposer.ExposeDiagnostic)
 	}
 	return r0
 }
@@ -140,12 +140,12 @@ func (_c *GenericRestoreExposer_DiagnoseExpose_Call) Run(run func(context1 conte
 	return _c
 }
 
-func (_c *GenericRestoreExposer_DiagnoseExpose_Call) Return(s string) *GenericRestoreExposer_DiagnoseExpose_Call {
-	_c.Call.Return(s)
+func (_c *GenericRestoreExposer_DiagnoseExpose_Call) Return(exposeDiagnostic exposer.ExposeDiagnostic) *GenericRestoreExposer_DiagnoseExpose_Call {
+	_c.Call.Return(exposeDiagnostic)
 	return _c
 }
 
-func (_c *GenericRestoreExposer_DiagnoseExpose_Call) RunAndReturn(run func(context1 context.Context, objectReference v1.ObjectReference) string) *GenericRestoreExposer_DiagnoseExpose_Call {
+func (_c *GenericRestoreExposer_DiagnoseExpose_Call) RunAndReturn(run func(context1 context.Context, objectReference v1.ObjectReference) exposer.ExposeDiagnostic) *GenericRestoreExposer_DiagnoseExpose_Call {
 	_c.Call.Return(run)
 	return _c
 }

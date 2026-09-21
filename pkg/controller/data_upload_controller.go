@@ -306,7 +306,7 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if peekErr := ep.PeekExposed(ctx, getOwnerObject(du)); peekErr != nil {
 			log.Errorf("Cancel du %s/%s because of expose error %s", du.Namespace, du.Name, peekErr)
 
-			diags := strings.Split(ep.DiagnoseExpose(ctx, getOwnerObject(du)), "\n")
+			diags := strings.Split(ep.DiagnoseExpose(ctx, getOwnerObject(du)).Text, "\n")
 			for _, diag := range diags {
 				log.Warnf("[Diagnose DU expose]%s", diag)
 			}
@@ -874,10 +874,14 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 
 	log.Info("Timeout happened for preparing dataupload")
 
+	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
+
 	message := "timeout on preparing data upload"
-	if pod, getErr := r.kubeClient.CoreV1().Pods(du.Namespace).Get(ctx, du.Name, metav1.GetOptions{}); getErr == nil {
-		if reason := kube.GetPodSchedulingFailureMessage(pod); reason != "" {
-			message = fmt.Sprintf("%s: pod scheduling failed: %s", message, reason)
+	var diag exposer.ExposeDiagnostic
+	if ok {
+		diag = ep.DiagnoseExpose(ctx, getOwnerObject(du))
+		if diag.PodSchedulingFailure != "" {
+			message = fmt.Sprintf("%s: pod scheduling failed: %s", message, diag.PodSchedulingFailure)
 		}
 	}
 
@@ -898,7 +902,6 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 		return
 	}
 
-	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
 	if !ok {
 		log.WithError(fmt.Errorf("%v type of snapshot exposer is not exist", du.Spec.SnapshotType)).
 			Warn("Failed to clean up resources on canceled")
@@ -908,9 +911,8 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 			volumeSnapshotName = du.Spec.CSISnapshot.VolumeSnapshot
 		}
 
-		diags := strings.Split(ep.DiagnoseExpose(ctx, getOwnerObject(du)), "\n")
-		for _, diag := range diags {
-			log.Warnf("[Diagnose DU expose]%s", diag)
+		for _, d := range strings.Split(diag.Text, "\n") {
+			log.Warnf("[Diagnose DU expose]%s", d)
 		}
 
 		ep.CleanUp(ctx, getOwnerObject(du), volumeSnapshotName, du.Spec.SourceNamespace)

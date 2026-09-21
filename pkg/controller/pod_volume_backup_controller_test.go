@@ -203,8 +203,8 @@ func (f *fakePvbExposer) PeekExposed(ctx context.Context, ownerObject corev1api.
 	return f.peekErr
 }
 
-func (f *fakePvbExposer) DiagnoseExpose(context.Context, corev1api.ObjectReference) string {
-	return ""
+func (f *fakePvbExposer) DiagnoseExpose(context.Context, corev1api.ObjectReference) exposer.ExposeDiagnostic {
+	return exposer.ExposeDiagnostic{}
 }
 
 func (f *fakePvbExposer) CleanUp(context.Context, corev1api.ObjectReference) {
@@ -1020,8 +1020,8 @@ func (dt *pvbResumeTestHelper) PeekExposed(context.Context, corev1api.ObjectRefe
 	return nil
 }
 
-func (dt *pvbResumeTestHelper) DiagnoseExpose(context.Context, corev1api.ObjectReference) string {
-	return ""
+func (dt *pvbResumeTestHelper) DiagnoseExpose(context.Context, corev1api.ObjectReference) exposer.ExposeDiagnostic {
+	return exposer.ExposeDiagnostic{}
 }
 
 func (dt *pvbResumeTestHelper) CleanUp(context.Context, corev1api.ObjectReference) {}

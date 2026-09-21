@@ -421,7 +421,7 @@ func (e *csiSnapshotExposer) PeekExposed(ctx context.Context, ownerObject corev1
 	return nil
 }
 
-func (e *csiSnapshotExposer) DiagnoseExpose(ctx context.Context, ownerObject corev1api.ObjectReference) string {
+func (e *csiSnapshotExposer) DiagnoseExpose(ctx context.Context, ownerObject corev1api.ObjectReference) ExposeDiagnostic {
 	backupPodName := ownerObject.Name
 	backupPVCName := ownerObject.Name
 	backupVSName := ownerObject.Name
@@ -487,7 +487,7 @@ func (e *csiSnapshotExposer) DiagnoseExpose(ctx context.Context, ownerObject cor
 
 	diag += "end diagnose CSI exposer"
 
-	return diag
+	return ExposeDiagnostic{Text: diag, PodSchedulingFailure: kube.GetPodSchedulingFailureMessage(pod)}
 }
 
 const cleanUpTimeout = time.Minute

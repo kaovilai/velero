@@ -824,7 +824,7 @@ end diagnose pod volume exposer`,
 			}
 
 			diag := e.DiagnoseExpose(t.Context(), ownerObject)
-			assert.Equal(t, tt.expected, diag)
+			assert.Equal(t, tt.expected, diag.Text)
 		})
 	}
 }

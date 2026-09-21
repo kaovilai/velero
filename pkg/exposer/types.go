@@ -42,3 +42,14 @@ type ExposeByPod struct {
 	VolumeName       string
 	NodeOS           *string
 }
+
+// ExposeDiagnostic is the result of DiagnoseExpose.
+type ExposeDiagnostic struct {
+	// Text is the full diagnostic dump, formatted for logging.
+	Text string
+
+	// PodSchedulingFailure is the hosting pod's own PodScheduled=False condition message (see
+	// kube.GetPodSchedulingFailureMessage), or "" if the pod is scheduled, has no such
+	// condition, or couldn't be found.
+	PodSchedulingFailure string
+}

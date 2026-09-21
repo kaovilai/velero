@@ -583,7 +583,7 @@ func TestDataDownloadReconcile(t *testing.T) {
 							ep.On("GetExposed", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 						} else if test.isPeekExposeErr {
 							ep.On("PeekExposed", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(errors.New("fake-peek-error"))
-							ep.On("DiagnoseExpose", mock.Anything, mock.Anything).Return("")
+							ep.On("DiagnoseExpose", mock.Anything, mock.Anything).Return(exposer.ExposeDiagnostic{})
 						}
 
 						if !test.notMockCleanUp {
@@ -1152,8 +1152,8 @@ func (dt *ddResumeTestHelper) PeekExposed(context.Context, corev1api.ObjectRefer
 	return nil
 }
 
-func (dt *ddResumeTestHelper) DiagnoseExpose(context.Context, corev1api.ObjectReference) string {
-	return ""
+func (dt *ddResumeTestHelper) DiagnoseExpose(context.Context, corev1api.ObjectReference) exposer.ExposeDiagnostic {
+	return exposer.ExposeDiagnostic{}
 }
 
 func (dt *ddResumeTestHelper) RebindVolume(context.Context, corev1api.ObjectReference, exposer.GenericRestoreRebindVolumeParam) error {

@@ -1782,6 +1782,33 @@ func Test_csiSnapshotExposer_DiagnoseExpose(t *testing.T) {
 		},
 	}
 
+	backupPodUnschedulable := corev1api.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1.DefaultNamespace,
+			Name:      "fake-backup",
+			UID:       "fake-pod-uid",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: backup.APIVersion,
+					Kind:       backup.Kind,
+					Name:       backup.Name,
+					UID:        backup.UID,
+				},
+			},
+		},
+		Status: corev1api.PodStatus{
+			Phase: corev1api.PodPending,
+			Conditions: []corev1api.PodCondition{
+				{
+					Type:    corev1api.PodScheduled,
+					Status:  corev1api.ConditionFalse,
+					Reason:  "Unschedulable",
+					Message: "0/1 nodes are available: didn't match node affinity",
+				},
+			},
+		},
+	}
+
 	backupPodWithNodeName := corev1api.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: velerov1.DefaultNamespace,
@@ -1947,11 +1974,12 @@ func Test_csiSnapshotExposer_DiagnoseExpose(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		ownerBackup       *velerov1.Backup
-		kubeClientObj     []runtime.Object
-		snapshotClientObj []runtime.Object
-		expected          string
+		name                         string
+		ownerBackup                  *velerov1.Backup
+		kubeClientObj                []runtime.Object
+		snapshotClientObj            []runtime.Object
+		expected                     string
+		expectedPodSchedulingFailure string
 	}{
 		{
 			name:        "no pod, pvc, vs",
@@ -1961,6 +1989,20 @@ error getting backup pod fake-backup, err: pods "fake-backup" not found
 error getting backup pvc fake-backup, err: persistentvolumeclaims "fake-backup" not found
 error getting backup vs fake-backup, err: volumesnapshots.snapshot.storage.k8s.io "fake-backup" not found
 end diagnose CSI exposer`,
+		},
+		{
+			name:        "pod unschedulable",
+			ownerBackup: backup,
+			kubeClientObj: []runtime.Object{
+				&backupPodUnschedulable,
+			},
+			expected: `begin diagnose CSI exposer
+error getting backup pvc fake-backup, err: persistentvolumeclaims "fake-backup" not found
+error getting backup vs fake-backup, err: volumesnapshots.snapshot.storage.k8s.io "fake-backup" not found
+Pod velero/fake-backup, phase Pending, node name , message 
+Pod condition PodScheduled, status False, reason Unschedulable, message 0/1 nodes are available: didn't match node affinity
+end diagnose CSI exposer`,
+			expectedPodSchedulingFailure: "0/1 nodes are available: didn't match node affinity",
 		},
 		{
 			name:        "pod without node name, pvc without volume name, vs without status",
@@ -2204,7 +2246,8 @@ end diagnose CSI exposer`,
 			}
 
 			diag := e.DiagnoseExpose(t.Context(), ownerObject)
-			assert.Equal(t, tt.expected, diag)
+			assert.Equal(t, tt.expected, diag.Text)
+			assert.Equal(t, tt.expectedPodSchedulingFailure, diag.PodSchedulingFailure)
 		})
 	}
 }

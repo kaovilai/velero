@@ -301,7 +301,7 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if peekErr := r.restoreExposer.PeekExposed(ctx, getDataDownloadOwnerObject(dd)); peekErr != nil {
 			log.Errorf("Cancel dd %s/%s because of expose error %s", dd.Namespace, dd.Name, peekErr)
 
-			diags := strings.Split(r.restoreExposer.DiagnoseExpose(ctx, getDataDownloadOwnerObject(dd)), "\n")
+			diags := strings.Split(r.restoreExposer.DiagnoseExpose(ctx, getDataDownloadOwnerObject(dd)).Text, "\n")
 			for _, diag := range diags {
 				log.Warnf("[Diagnose DD expose]%s", diag)
 			}
@@ -834,11 +834,11 @@ func (r *DataDownloadReconciler) onPrepareTimeout(ctx context.Context, dd *veler
 
 	log.Info("Timeout happened for preparing datadownload")
 
+	diag := r.restoreExposer.DiagnoseExpose(ctx, getDataDownloadOwnerObject(dd))
+
 	message := "timeout on preparing data download"
-	if pod, getErr := r.kubeClient.CoreV1().Pods(dd.Namespace).Get(ctx, dd.Name, metav1.GetOptions{}); getErr == nil {
-		if reason := kube.GetPodSchedulingFailureMessage(pod); reason != "" {
-			message = fmt.Sprintf("%s: pod scheduling failed: %s", message, reason)
-		}
+	if diag.PodSchedulingFailure != "" {
+		message = fmt.Sprintf("%s: pod scheduling failed: %s", message, diag.PodSchedulingFailure)
 	}
 
 	succeeded, err := funcExclusiveUpdateDataDownload(ctx, r.client, dd, func(dd *velerov2alpha1api.DataDownload) {
@@ -858,9 +858,8 @@ func (r *DataDownloadReconciler) onPrepareTimeout(ctx context.Context, dd *veler
 		return
 	}
 
-	diags := strings.Split(r.restoreExposer.DiagnoseExpose(ctx, getDataDownloadOwnerObject(dd)), "\n")
-	for _, diag := range diags {
-		log.Warnf("[Diagnose DD expose]%s", diag)
+	for _, d := range strings.Split(diag.Text, "\n") {
+		log.Warnf("[Diagnose DD expose]%s", d)
 	}
 
 	r.restoreExposer.CleanUp(ctx, getDataDownloadOwnerObject(dd), &exposer.GenericRestoreCleanUpParam{

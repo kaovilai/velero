@@ -139,8 +139,7 @@ type GenericRestoreExposer interface {
 	PeekExposed(context.Context, corev1api.ObjectReference) error
 
 	// DiagnoseExpose generate the diagnostic info when the expose is not finished for a long time.
-	// If it finds any problem, it returns an string about the problem.
-	DiagnoseExpose(context.Context, corev1api.ObjectReference) string
+	DiagnoseExpose(context.Context, corev1api.ObjectReference) ExposeDiagnostic
 
 	// RebindVolume unexposes the restored PV and rebind it to the target PVC
 	RebindVolume(context.Context, corev1api.ObjectReference, GenericRestoreRebindVolumeParam) error
@@ -427,7 +426,7 @@ func (e *genericRestoreExposer) PeekExposed(ctx context.Context, ownerObject cor
 	return nil
 }
 
-func (e *genericRestoreExposer) DiagnoseExpose(ctx context.Context, ownerObject corev1api.ObjectReference) string {
+func (e *genericRestoreExposer) DiagnoseExpose(ctx context.Context, ownerObject corev1api.ObjectReference) ExposeDiagnostic {
 	restorePodName := ownerObject.Name
 	restorePVCName := ownerObject.Name
 
@@ -495,7 +494,7 @@ func (e *genericRestoreExposer) DiagnoseExpose(ctx context.Context, ownerObject 
 
 	diag += "end diagnose restore exposer"
 
-	return diag
+	return ExposeDiagnostic{Text: diag, PodSchedulingFailure: kube.GetPodSchedulingFailureMessage(pod)}
 }
 
 func (e *genericRestoreExposer) CleanUp(ctx context.Context, ownerObject corev1api.ObjectReference, param *GenericRestoreCleanUpParam) {
