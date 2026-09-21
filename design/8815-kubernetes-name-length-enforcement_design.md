@@ -291,6 +291,8 @@ scheduleLabels := make(map[string]string, len(labels)+1)
 for k, v := range labels {
     scheduleLabels[k] = v
 }
+delete(scheduleLabels, velerov1api.ScheduleNameLabel)
+delete(scheduleLabels, velerov1api.ScheduleNameHashLabel)
 if len(schedule.Name) <= validation.DNS1035LabelMaxLength {
     scheduleLabels[velerov1api.ScheduleNameLabel] = schedule.Name
 } else {
@@ -300,6 +302,8 @@ labels = scheduleLabels
 ```
 
 `ScheduleNameLabel` now holds *only* schedule names that are already ≤ 63 characters, verbatim; `ScheduleNameHashLabel` holds *only* hashes of names that were too long to fit. The two label keys are disjoint by construction — a value read from `ScheduleNameLabel` is never a hash, full stop, with no length-based inference required and no coincidental-collision risk between the two categories (see Category E.2 for the read side and why this fully replaces the length-heuristic approach considered and rejected there).
+
+**Both reserved keys are deleted from `scheduleLabels` before the branch sets one of them.** The source `labels` map comes from `schedule.Spec.Template.Metadata.Labels` or `schedule.Labels` — both user-controllable (a hand-edited Schedule, or one copy-pasted from another) — so it could already carry a stale `ScheduleNameLabel` or `ScheduleNameHashLabel` entry from an unrelated source, e.g. a schedule template that used to have a long name and still carries a `ScheduleNameHashLabel` copied in by a user, or vice versa. Without the `delete` calls, the `if`/`else` branch only *adds* the correct key — it never removes a leftover of the other one already present in the copied map, so the resulting Backup could carry both a real name and a stale hash (or a stale real name alongside a fresh hash), breaking the "disjoint by construction" guarantee above. Deleting both first, unconditionally, guarantees exactly one of the two is ever present on the object this design produces, regardless of what the source map already contained.
 
 **The `VolumeSnapshotLabel` row (`pvc_action.go:389`) has a sibling that must *not* be touched.** The same function also sets an *annotation* with the identical key, on a separate `annotations` map (`pkg/backup/actions/csi/pvc_action.go:394`): `annotations[velerov1api.VolumeSnapshotLabel] = vs.Name`. That annotation, not the label, is what the restore side reads as the exact VolumeSnapshot name — `pkg/restore/actions/csi/pvc_action.go:103` reads `pvcFromBackup.Annotations[velerov1api.VolumeSnapshotLabel]`, then uses that value at `:174` (`GenerateSha256FromRestoreUIDAndVsName`), `:198`, and `:332` to point the restored PVC's data source at the original VolumeSnapshot by name. Annotations carry no 63-character limit, so `:394` must stay a raw, untruncated name; hashing it "for consistency" with the label fix at `:389` would point restored PVCs at a VolumeSnapshot that no longer exists under that name. This is Category D.2's hazard in reverse: D.2 *adds* a full-name annotation because a label can no longer hold one; here, that annotation already exists for an unrelated historical reason and must simply be left alone.
 
