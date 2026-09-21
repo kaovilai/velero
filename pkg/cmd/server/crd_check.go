@@ -167,7 +167,30 @@ func (s *server) validateCRDSchemas() error {
 		return errors.Wrap(err, "creating apiextensions client for CRD schema validation")
 	}
 
-	return runCRDSchemaValidation(s.ctx, apiextClient, expectedCRDSchemas(), mode, s.logger)
+	expectations := expectedCRDSchemas()
+
+	if mode == "strict" {
+		ctx, cancel := context.WithTimeout(s.ctx, s.config.ResourceTimeout)
+		defer cancel()
+		return runCRDSchemaValidation(ctx, apiextClient, expectations, mode, s.logger)
+	}
+
+	// warn mode never gates startup on this check — the goroutine is bound by
+	// s.ctx (cancels on server shutdown) and by the same ResourceTimeout used
+	// for strict mode's synchronous pass, so it self-terminates against an
+	// unresponsive API server instead of hanging around in the background
+	// indefinitely. Binding the deadline is not the same as gating startup on
+	// it: validateCRDSchemas itself returns immediately below, before this
+	// goroutine's result is known.
+	go func() {
+		ctx, cancel := context.WithTimeout(s.ctx, s.config.ResourceTimeout)
+		defer cancel()
+		if err := runCRDSchemaValidation(ctx, apiextClient, expectations, mode, s.logger); err != nil {
+			s.logger.WithError(err).Error("CRD schema validation failed")
+		}
+	}()
+
+	return nil
 }
 
 func runCRDSchemaValidation(ctx context.Context, client apiextclient.Interface, expectations []crdSchemaExpectation, mode string, logger logrus.FieldLogger) error {
