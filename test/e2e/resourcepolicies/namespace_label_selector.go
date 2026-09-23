@@ -23,18 +23,31 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/builder"
 	. "github.com/vmware-tanzu/velero/test/e2e/test"
 	. "github.com/vmware-tanzu/velero/test/util/k8s"
 )
 
 // NamespaceLabelSelector covers design step 8 of
 // https://github.com/velero-io/velero/pull/9772: a backup with no explicit
-// --include-namespaces (the same shape a Schedule with no includedNamespaces produces),
+// includedNamespaces (the same shape a Schedule with no includedNamespaces produces),
 // relying entirely on a ResourcePolicy ConfigMap's includedNamespacesByLabel to select which
 // namespaces to back up. Only namespaces matching the label selector should end up in the
 // backup; everything else - including namespaces that already existed in the cluster before
 // this test ran - must not.
+//
+// The Backup is created directly via the controller-runtime client rather than through
+// `velero backup create`: that CLI command's --include-namespaces flag defaults to ["*"]
+// when omitted (see pkg/cmd/cli/backup/create.go), which is an *explicit* wildcard - by
+// design, mergeNamespacesByLabel leaves an explicit "*" untouched rather than narrowing it
+// (see pkg/controller/backup_controller.go). Only a BackupSpec.IncludedNamespaces that was
+// never set at all is treated as "defaulted" and gets replaced by the label-resolved set,
+// so this test has to leave the field genuinely empty - something the CLI's own default
+// makes impossible to express.
 type NamespaceLabelSelector struct {
 	TestCase
 	cmName      string
@@ -66,25 +79,50 @@ func (n *NamespaceLabelSelector) Init() error {
 	}
 
 	n.TestMsg = &TestMSG{
-		Desc: "Backup with a ResourcePolicy includedNamespacesByLabel selector and no explicit --include-namespaces",
+		Desc: "Backup with a ResourcePolicy includedNamespacesByLabel selector and no IncludedNamespaces set",
 		Text: "should back up only the namespaces matching the label selector, replacing the " +
 			"default \"all namespaces\" behavior rather than unioning with it",
 		FailedMSG: "Failed to select namespaces by label via ResourcePolicy",
 	}
 
-	// Deliberately no --include-namespaces: this is the scenario design step 8 calls out - a
-	// Schedule (or, as here, a one-off Backup) that leaves BackupSpec.IncludedNamespaces empty
-	// and relies solely on includedNamespacesByLabel to narrow the namespace set.
-	n.BackupArgs = []string{
-		"create", "--namespace", n.VeleroCfg.VeleroNamespace, "backup", n.BackupName,
-		"--resource-policies-configmap", n.cmName,
-		"--wait",
-	}
-
+	// The Backup itself is created directly via the controller-runtime client (see
+	// Backup() below) rather than through BackupArgs/`velero backup create`, so
+	// BackupSpec.IncludedNamespaces can be left genuinely unset.
 	n.RestoreArgs = []string{
 		"create", "--namespace", n.VeleroCfg.VeleroNamespace, "restore", n.RestoreName,
 		"--from-backup", n.BackupName, "--wait",
 	}
+
+	return nil
+}
+
+func (n *NamespaceLabelSelector) Backup() error {
+	backup := builder.ForBackup(n.VeleroCfg.VeleroNamespace, n.BackupName).
+		ResourcePolicies(n.cmName).
+		Result()
+
+	By(fmt.Sprintf("Create backup %s directly via the API, with no IncludedNamespaces set\n", n.BackupName), func() {
+		Expect(n.Client.Kubebuilder.Create(n.Ctx, backup)).To(Succeed(),
+			fmt.Sprintf("Failed to create backup %s", n.BackupName))
+	})
+
+	By(fmt.Sprintf("Waiting for backup %s to complete\n", n.BackupName), func() {
+		Expect(wait.Poll(PollInterval, PollTimeout, func() (bool, error) {
+			got := &velerov1api.Backup{}
+			if err := n.Client.Kubebuilder.Get(n.Ctx, types.NamespacedName{Namespace: n.VeleroCfg.VeleroNamespace, Name: n.BackupName}, got); err != nil {
+				return false, err
+			}
+			switch got.Status.Phase {
+			case velerov1api.BackupPhaseCompleted:
+				return true, nil
+			case velerov1api.BackupPhaseFailed, velerov1api.BackupPhasePartiallyFailed,
+				velerov1api.BackupPhaseFailedValidation:
+				return false, errors.Newf("backup %s ended in phase %s", n.BackupName, got.Status.Phase)
+			default:
+				return false, nil
+			}
+		})).To(Succeed(), fmt.Sprintf("Backup %s did not complete successfully", n.BackupName))
+	})
 
 	return nil
 }
