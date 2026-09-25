@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	clocks "k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,7 +44,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	veleroapishared "github.com/vmware-tanzu/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/constant"
 	"github.com/vmware-tanzu/velero/pkg/datapath"
@@ -75,6 +75,7 @@ func NewPodVolumeRestoreReconciler(
 	repoConfigMgr repository.ConfigManager,
 	podLabels map[string]string,
 	podAnnotations map[string]string,
+	tolerations []corev1api.Toleration,
 ) *PodVolumeRestoreReconciler {
 	return &PodVolumeRestoreReconciler{
 		client:                client,
@@ -96,6 +97,7 @@ func NewPodVolumeRestoreReconciler(
 		repoConfigMgr:         repoConfigMgr,
 		podLabels:             podLabels,
 		podAnnotations:        podAnnotations,
+		tolerations:           tolerations,
 	}
 }
 
@@ -120,6 +122,7 @@ type PodVolumeRestoreReconciler struct {
 	repoConfigMgr         repository.ConfigManager
 	podLabels             map[string]string
 	podAnnotations        map[string]string
+	tolerations           []corev1api.Toleration
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=podvolumerestores,verbs=get;list;watch;create;update;patch;delete
@@ -837,6 +840,8 @@ func (r *PodVolumeRestoreReconciler) OnDataPathCompleted(ctx context.Context, na
 
 		pvr.Status.Phase = velerov1api.PodVolumeRestorePhaseCompleted
 		pvr.Status.CompletionTimestamp = &metav1.Time{Time: r.clock.Now()}
+		pvr.Status.IncrementalBytes = ptr.To(result.Restore.IncrementalBytes)
+		pvr.Status.FallbackFull = result.Restore.FallbackFull
 
 		delete(pvr.Labels, exposer.ExposeOnGoingLabel)
 
@@ -903,7 +908,20 @@ func (r *PodVolumeRestoreReconciler) OnDataPathProgress(ctx context.Context, nam
 	log := r.logger.WithField("PVR", pvrName)
 
 	if err := UpdatePVRWithRetry(ctx, r.client, types.NamespacedName{Namespace: namespace, Name: pvrName}, log, func(pvr *velerov1api.PodVolumeRestore) bool {
-		pvr.Status.Progress = veleroapishared.DataMoveOperationProgress{TotalBytes: progress.TotalBytes, BytesDone: progress.BytesDone}
+		if progress.TotalBytes != -1 {
+			pvr.Status.Progress.TotalBytes = progress.TotalBytes
+		}
+
+		if progress.BytesDone != -1 {
+			pvr.Status.Progress.BytesDone = progress.BytesDone
+		}
+
+		if progress.Message != "" {
+			if len(pvr.Status.Activities) == 0 || pvr.Status.Activities[len(pvr.Status.Activities)-1] != progress.Message {
+				pvr.Status.Activities = append(pvr.Status.Activities, progress.Message)
+			}
+		}
+
 		return true
 	}); err != nil {
 		log.WithError(err).Error("Failed to update progress")
@@ -952,15 +970,9 @@ func (r *PodVolumeRestoreReconciler) setupExposeParam(pvr *velerov1api.PodVolume
 		}
 	}
 
-	hostingPodTolerations := []corev1api.Toleration{}
-	for _, k := range util.ThirdPartyTolerations {
-		if v, err := nodeagent.GetToleration(context.Background(), r.kubeClient, pvr.Namespace, k, nodeOS); err != nil {
-			if err != nodeagent.ErrNodeAgentTolerationNotFound {
-				log.WithError(err).Warnf("Failed to check node-agent toleration, skip adding host pod toleration %s", k)
-			}
-		} else {
-			hostingPodTolerations = append(hostingPodTolerations, *v)
-		}
+	hostingPodTolerations, err := nodeagent.GetTolerations(context.Background(), r.kubeClient, pvr.Namespace, nodeOS, r.tolerations)
+	if err != nil {
+		log.WithError(err).Warn("Failed to get node-agent daemonset tolerations, hosting pod will only get configured tolerations")
 	}
 
 	var cacheVolume *exposer.CacheConfigs

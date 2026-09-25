@@ -1170,6 +1170,11 @@ func (in *PodVolumeRestoreStatus) DeepCopyInto(out *PodVolumeRestoreStatus) {
 		*out = (*in).DeepCopy()
 	}
 	out.Progress = in.Progress
+	if in.IncrementalBytes != nil {
+		in, out := &in.IncrementalBytes, &out.IncrementalBytes
+		*out = new(int64)
+		**out = **in
+	}
 	if in.AcceptedTimestamp != nil {
 		in, out := &in.AcceptedTimestamp, &out.AcceptedTimestamp
 		*out = (*in).DeepCopy()
@@ -1421,6 +1426,7 @@ func (in *RestoreSpec) DeepCopyInto(out *RestoreSpec) {
 		**out = **in
 	}
 	in.Hooks.DeepCopyInto(&out.Hooks)
+	out.CSISnapshotTimeout = in.CSISnapshotTimeout
 	out.ItemOperationTimeout = in.ItemOperationTimeout
 	if in.ResourceModifier != nil {
 		in, out := &in.ResourceModifier, &out.ResourceModifier

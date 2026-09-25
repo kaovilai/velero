@@ -154,68 +154,26 @@ func DescribeUploaderConfigForBackup(d *Describer, spec velerov1api.BackupSpec) 
 
 // DescribeBackupSpec describes a backup spec in human-readable format.
 func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
-	// TODO make a helper for this and use it in all the describers.
 	d.Printf("Namespaces:\n")
-	var s string
-	if len(spec.IncludedNamespaces) == 0 {
-		s = "*"
-	} else {
-		s = strings.Join(spec.IncludedNamespaces, ", ")
-	}
-	d.Printf("\tIncluded:\t%s\n", s)
-	if len(spec.ExcludedNamespaces) == 0 {
-		s = emptyDisplay
-	} else {
-		s = strings.Join(spec.ExcludedNamespaces, ", ")
-	}
-	d.Printf("\tExcluded:\t%s\n", s)
+	d.Printf("\tIncluded:\t%s\n", JoinStringWithFallback(spec.IncludedNamespaces, "*"))
+	d.Printf("\tExcluded:\t%s\n", JoinStringWithFallback(spec.ExcludedNamespaces, emptyDisplay))
 
 	d.Println()
 	d.Printf("Resources:\n")
 	if collections.UseOldResourceFilters(spec) {
-		if len(spec.IncludedResources) == 0 {
-			s = "*"
-		} else {
-			s = strings.Join(spec.IncludedResources, ", ")
-		}
-		d.Printf("\tIncluded:\t%s\n", s)
-		if len(spec.ExcludedResources) == 0 {
-			s = emptyDisplay
-		} else {
-			s = strings.Join(spec.ExcludedResources, ", ")
-		}
-		d.Printf("\tExcluded:\t%s\n", s)
+		d.Printf("\tIncluded:\t%s\n", JoinStringWithFallback(spec.IncludedResources, "*"))
+		d.Printf("\tExcluded:\t%s\n", JoinStringWithFallback(spec.ExcludedResources, emptyDisplay))
 		d.Printf("\tCluster-scoped:\t%s\n", BoolPointerString(spec.IncludeClusterResources, "excluded", "included", "auto"))
 	} else {
-		if len(spec.IncludedClusterScopedResources) == 0 {
-			s = emptyDisplay
-		} else {
-			s = strings.Join(spec.IncludedClusterScopedResources, ", ")
-		}
-		d.Printf("\tIncluded cluster-scoped:\t%s\n", s)
-		if len(spec.ExcludedClusterScopedResources) == 0 {
-			s = emptyDisplay
-		} else {
-			s = strings.Join(spec.ExcludedClusterScopedResources, ", ")
-		}
-		d.Printf("\tExcluded cluster-scoped:\t%s\n", s)
+		d.Printf("\tIncluded cluster-scoped:\t%s\n", JoinStringWithFallback(spec.IncludedClusterScopedResources, emptyDisplay))
+		d.Printf("\tExcluded cluster-scoped:\t%s\n", JoinStringWithFallback(spec.ExcludedClusterScopedResources, emptyDisplay))
 
-		if len(spec.IncludedNamespaceScopedResources) == 0 {
-			s = "*"
-		} else {
-			s = strings.Join(spec.IncludedNamespaceScopedResources, ", ")
-		}
-		d.Printf("\tIncluded namespace-scoped:\t%s\n", s)
-		if len(spec.ExcludedNamespaceScopedResources) == 0 {
-			s = emptyDisplay
-		} else {
-			s = strings.Join(spec.ExcludedNamespaceScopedResources, ", ")
-		}
-		d.Printf("\tExcluded namespace-scoped:\t%s\n", s)
+		d.Printf("\tIncluded namespace-scoped:\t%s\n", JoinStringWithFallback(spec.IncludedNamespaceScopedResources, "*"))
+		d.Printf("\tExcluded namespace-scoped:\t%s\n", JoinStringWithFallback(spec.ExcludedNamespaceScopedResources, emptyDisplay))
 	}
 
 	d.Println()
-	s = emptyDisplay
+	s := emptyDisplay
 	if spec.LabelSelector != nil {
 		s = metav1.FormatLabelSelector(spec.LabelSelector)
 	}
@@ -249,6 +207,10 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	}
 	d.Printf("Data Mover:\t%s\n", s)
 
+	if string(spec.BackupType) != "" {
+		d.Printf("Backup Type:\t%s\n", spec.BackupType)
+	}
+
 	d.Println()
 	d.Printf("TTL:\t%s\n", spec.TTL.Duration)
 
@@ -265,34 +227,13 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 		for _, backupResourceHookSpec := range spec.Hooks.Resources {
 			d.Printf("\t\t%s:\n", backupResourceHookSpec.Name)
 			d.Printf("\t\t\tNamespaces:\n")
-			var s string
-			if len(backupResourceHookSpec.IncludedNamespaces) == 0 {
-				s = "*"
-			} else {
-				s = strings.Join(backupResourceHookSpec.IncludedNamespaces, ", ")
-			}
-			d.Printf("\t\t\t\tIncluded:\t%s\n", s)
-			if len(backupResourceHookSpec.ExcludedNamespaces) == 0 {
-				s = emptyDisplay
-			} else {
-				s = strings.Join(backupResourceHookSpec.ExcludedNamespaces, ", ")
-			}
-			d.Printf("\t\t\t\tExcluded:\t%s\n", s)
+			d.Printf("\t\t\t\tIncluded:\t%s\n", JoinStringWithFallback(backupResourceHookSpec.IncludedNamespaces, "*"))
+			d.Printf("\t\t\t\tExcluded:\t%s\n", JoinStringWithFallback(backupResourceHookSpec.ExcludedNamespaces, emptyDisplay))
 
 			d.Println()
 			d.Printf("\t\t\tResources:\n")
-			if len(backupResourceHookSpec.IncludedResources) == 0 {
-				s = "*"
-			} else {
-				s = strings.Join(backupResourceHookSpec.IncludedResources, ", ")
-			}
-			d.Printf("\t\t\t\tIncluded:\t%s\n", s)
-			if len(backupResourceHookSpec.ExcludedResources) == 0 {
-				s = emptyDisplay
-			} else {
-				s = strings.Join(backupResourceHookSpec.ExcludedResources, ", ")
-			}
-			d.Printf("\t\t\t\tExcluded:\t%s\n", s)
+			d.Printf("\t\t\t\tIncluded:\t%s\n", JoinStringWithFallback(backupResourceHookSpec.IncludedResources, "*"))
+			d.Printf("\t\t\t\tExcluded:\t%s\n", JoinStringWithFallback(backupResourceHookSpec.ExcludedResources, emptyDisplay))
 
 			d.Println()
 			s = emptyDisplay
@@ -737,6 +678,16 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 			dataMover = info.SnapshotDataMovementInfo.DataMover
 		}
 		d.Printf("\t\t\t\tData Mover: %s\n", dataMover)
+
+		if info.BackupType != "" {
+			backupType := string(info.BackupType)
+			if info.FallbackFull {
+				backupType += " (fallen back to Full)"
+			}
+
+			d.Printf("\t\t\t\tBackup Type: %s\n", backupType)
+		}
+
 		d.Printf("\t\t\t\tUploader Type: %s\n", info.SnapshotDataMovementInfo.UploaderType)
 		d.Printf("\t\t\t\tMoved data Size (bytes): %d\n", info.SnapshotDataMovementInfo.Size)
 		// Print whenever the uploader measured a figure, including zero. A zero-delta
@@ -746,6 +697,7 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 		if info.SnapshotDataMovementInfo.IncrementalSize != nil {
 			d.Printf("\t\t\t\tIncremental data Size (bytes): %d\n", *info.SnapshotDataMovementInfo.IncrementalSize)
 		}
+
 		d.Printf("\t\t\t\tResult: %s\n", info.Result)
 	} else {
 		d.Printf("\t\t\tData Movement: %s\n", "included, specify --details for more information")

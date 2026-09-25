@@ -41,7 +41,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	veleroapishared "github.com/vmware-tanzu/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/constant"
 	"github.com/vmware-tanzu/velero/pkg/datapath"
@@ -75,6 +74,7 @@ func NewPodVolumeBackupReconciler(
 	privileged bool,
 	podLabels map[string]string,
 	podAnnotations map[string]string,
+	tolerations []corev1api.Toleration,
 ) *PodVolumeBackupReconciler {
 	return &PodVolumeBackupReconciler{
 		client:                client,
@@ -94,6 +94,7 @@ func NewPodVolumeBackupReconciler(
 		privileged:            privileged,
 		podLabels:             podLabels,
 		podAnnotations:        podAnnotations,
+		tolerations:           tolerations,
 	}
 }
 
@@ -117,6 +118,7 @@ type PodVolumeBackupReconciler struct {
 	privileged            bool
 	podLabels             map[string]string
 	podAnnotations        map[string]string
+	tolerations           []corev1api.Toleration
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=podvolumebackups,verbs=get;list;watch;create;update;patch;delete
@@ -551,6 +553,8 @@ func (r *PodVolumeBackupReconciler) OnDataPathCompleted(ctx context.Context, nam
 		pvb.Status.SnapshotID = result.Backup.SnapshotID
 		pvb.Status.CompletionTimestamp = &completionTime
 		pvb.Status.IncrementalBytes = result.Backup.IncrementalBytes
+		pvb.Status.SourceSize = result.Backup.SourceSize
+		pvb.Status.FallbackFull = result.Backup.FallbackFull
 		if result.Backup.EmptySnapshot {
 			pvb.Status.Message = "volume was empty so no snapshot was taken"
 		}
@@ -628,7 +632,20 @@ func (r *PodVolumeBackupReconciler) OnDataPathProgress(ctx context.Context, name
 	log := r.logger.WithField("pvb", pvbName)
 
 	if err := UpdatePVBWithRetry(ctx, r.client, types.NamespacedName{Namespace: namespace, Name: pvbName}, log, func(pvb *velerov1api.PodVolumeBackup) bool {
-		pvb.Status.Progress = veleroapishared.DataMoveOperationProgress{TotalBytes: progress.TotalBytes, BytesDone: progress.BytesDone}
+		if progress.TotalBytes != -1 {
+			pvb.Status.Progress.TotalBytes = progress.TotalBytes
+		}
+
+		if progress.BytesDone != -1 {
+			pvb.Status.Progress.BytesDone = progress.BytesDone
+		}
+
+		if progress.Message != "" {
+			if len(pvb.Status.Activities) == 0 || pvb.Status.Activities[len(pvb.Status.Activities)-1] != progress.Message {
+				pvb.Status.Activities = append(pvb.Status.Activities, progress.Message)
+			}
+		}
+
 		return true
 	}); err != nil {
 		log.WithError(err).Error("Failed to update progress")
@@ -784,10 +801,9 @@ func UpdatePVBStatusToFailed(ctx context.Context, c client.Client, pvb *velerov1
 				pvb.Status.SnapshotID = dataPathError.GetSnapshotID()
 			}
 			if len(strings.TrimSpace(msg)) == 0 {
-				pvb.Status.Message = errOut.Error()
-			} else {
-				pvb.Status.Message = errors.WithMessage(errOut, msg).Error()
+				msg = "pod volume backup failed"
 			}
+			pvb.Status.Message = errors.WithMessage(errOut, msg).Error()
 			if pvb.Status.StartTimestamp.IsZero() {
 				pvb.Status.StartTimestamp = &metav1.Time{Time: time}
 			}
@@ -853,15 +869,9 @@ func (r *PodVolumeBackupReconciler) setupExposeParam(pvb *velerov1api.PodVolumeB
 		}
 	}
 
-	hostingPodTolerations := []corev1api.Toleration{}
-	for _, k := range util.ThirdPartyTolerations {
-		if v, err := nodeagent.GetToleration(context.Background(), r.kubeClient, pvb.Namespace, k, nodeOS); err != nil {
-			if err != nodeagent.ErrNodeAgentTolerationNotFound {
-				log.WithError(err).Warnf("Failed to check node-agent toleration, skip adding host pod toleration %s", k)
-			}
-		} else {
-			hostingPodTolerations = append(hostingPodTolerations, *v)
-		}
+	hostingPodTolerations, err := nodeagent.GetTolerations(context.Background(), r.kubeClient, pvb.Namespace, nodeOS, r.tolerations)
+	if err != nil {
+		log.WithError(err).Warn("Failed to get node-agent daemonset tolerations, hosting pod will only get configured tolerations")
 	}
 
 	return exposer.PodVolumeExposeParam{
