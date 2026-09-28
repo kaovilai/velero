@@ -66,7 +66,7 @@ For each registered kind, the `Spec`/`Status` field types are read off the regis
 `(s *server) validateCRDSchemas() error`:
 
 1. Returns immediately, logging at info level, if `s.config.CRDSchemaCheck.String() == "skip"` — `CRDSchemaCheck` is a `*flag.Enum` (see Configuration below), not a plain string, so the comparison goes through its `String()` accessor rather than comparing the pointer directly.
-2. Builds an `apiextclient.Interface` from the server's existing kube client config — no new RBAC is required, since Velero's server already needs `get` on CRDs for other startup checks. This step happens synchronously in *either* mode, before the `warn`/`strict` branch in step 3 below — a genuine client-construction failure (e.g. a malformed kube client config) is a setup error, not a validation result, and propagates as an immediate startup error in `warn` mode exactly as it does in `strict` mode; only the CRD-checking work itself (step 3) is what runs asynchronously in `warn` mode.
+2. Builds an `apiextclient.Interface` from the server's existing kube client config. **Note:** this does require a new RBAC rule — see Security Considerations below; Velero's server does not currently hold `get` on `customresourcedefinitions` (`apiextensions.k8s.io`) via `config/rbac/role.yaml`. This step happens synchronously in *either* mode, before the `warn`/`strict` branch in step 3 below — a genuine client-construction failure (e.g. a malformed kube client config) is a setup error, not a validation result, and propagates as an immediate startup error in `warn` mode exactly as it does in `strict` mode; only the CRD-checking work itself (step 3) is what runs asynchronously in `warn` mode.
 3. In `strict` mode, delegates to `runCRDSchemaValidation(ctx, client, expectations, mode, logger)` synchronously, passing a single `context.WithTimeout(s.ctx, s.config.ResourceTimeout)` shared across every CRD `Get` in the pass — the same configurable timeout already used elsewhere in this file (`pkg/cmd/server/server.go`) — rather than one timeout per `Get`. With 13 registered CRD kinds today, a *per-Get* timeout would let a fully unreachable API server stall startup for up to 13×`ResourceTimeout` (10 minutes by default → over 2 hours) checked sequentially; one shared deadline caps the whole pass at `ResourceTimeout` regardless of CRD count. A `Get` that doesn't complete before the shared deadline (or before `s.ctx` itself is cancelled) is recorded the same fail-closed way as any other fetch error (below); every remaining CRD that the deadline firing prevented from being attempted at all also gets its own **validation-unavailable** entry (naming the CRD and "validation not attempted — startup deadline reached") rather than being silently omitted, so `warn`-mode output doesn't understate how much went unchecked.
 
    In `warn` mode, the *same* `runCRDSchemaValidation` call instead runs in a background goroutine, logging its result whenever it completes rather than blocking `run()` at all. This is deliberate, not an oversight: `warn` mode's entire premise is "advisory, never affects startup" (see Goals), so gating even `warn` mode's startup on the same `ResourceTimeout` deadline used for `strict` mode — up to 10 minutes by default — would itself be a real, mandatory regression for every default-configuration deployment upgrading to this check, silently contradicting that promise. Running it asynchronously keeps `warn` mode's startup-time cost at effectively zero, matching today's behavior, while still surfacing the same message once available.
@@ -153,7 +153,26 @@ Reference implementation: [PR #9910](https://github.com/velero-io/velero/pull/99
 
 ## Security Considerations
 
-The validation check itself uses the server's existing kube client config and the same CRD `get` permission Velero's server already requires for other startup validation (see the documented [restricted RBAC](https://github.com/velero-io/velero/blob/main/site/content/docs/main/rbac.md)). No new RBAC scope is introduced there, and no new data is exposed.
+### RBAC: new permission required
+
+This design's premise that "Velero already has CRD Get permissions" (stated in #9910's PR description) does not hold against the checked-in manifest: `config/rbac/role.yaml` today only grants rules under `apiGroups: [""]` and `apiGroups: [velero.io]` — there is no rule for `apiGroups: [apiextensions.k8s.io]` / `resources: [customresourcedefinitions]` anywhere in it. Building an `apiextclient.Interface` and calling `CustomResourceDefinitions().Get(...)` against the API server (Validation flow, step 2 and per-CRD `Get` in step 3) therefore requires a **new** RBAC rule that is not currently granted:
+
+```yaml
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+```
+
+Only `get` is needed — the reference implementation (#9910) only calls `client.ApiextensionsV1().CustomResourceDefinitions().Get(...)`; it never lists, watches, creates, updates, or patches CRDs. (Contrast with `velero install --crds-only`, which separately needs `create`/`update`/`patch` on the same resource — see Self-resolution guidance — but that is invoked by the operator's own identity, not the running server's ServiceAccount, and is out of scope here.)
+
+**Implementation follow-up:** as part of landing #9910 (or a fast-follow), `config/rbac/role.yaml` needs this rule added, and `make update-crd-rbac`/controller-gen-generated manifests, `pkg/install/*` (in-cluster ClusterRole generation), and any other manifest that mirrors `role.yaml` (e.g. Helm chart ClusterRole templates in the separate `vmware-tanzu/helm-charts` repo) need the equivalent update so that default and restricted-RBAC installs alike actually grant this permission before the check runs against them. Without it, every affected deployment sees this validation fail with a `Forbidden` error on every `Get` — which this design's own validation-unavailable path (Validation flow, step 3) already handles gracefully (logged as validation-unavailable rather than a false "missing field" report), but that graceful degradation should not be mistaken for "no RBAC change needed": until the rule is added, the check simply never succeeds anywhere restricted RBAC is in use.
+
+### Other considerations
+
+The validation check itself uses the server's existing kube client config (see the documented [restricted RBAC](https://github.com/velero-io/velero/blob/main/site/content/docs/main/rbac.md), which needs the new rule above added). No new data is exposed.
 
 The self-resolution guidance adds a new unauthenticated `/readyz` endpoint on the existing metrics mux — same threat model as the existing unauthenticated `/metrics` endpoint (reports only a boolean ready/not-ready state, no data exposure). It does **not** grant Velero's ServiceAccount any new RBAC: the remediation commands it suggests may require broader permissions (e.g. CRD write access) than the ServiceAccount holds under restricted RBAC, but that permission belongs to whoever chooses to run the remediation command (their own `kubectl exec` or `kubectl cp`-and-run-locally identity), not to Velero's own ServiceAccount or container image.
 
