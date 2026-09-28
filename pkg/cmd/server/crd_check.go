@@ -229,7 +229,7 @@ func runCRDSchemaValidation(ctx context.Context, client apiextclient.Interface, 
 	if len(allMissing) > 0 {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "CRD schema mismatch detected — %d field(s) expected by server not found in installed CRDs. "+
-			"Update CRDs with: velero install --crds-only\n", len(allMissing))
+			"Update CRDs with: velero install --crds-only --apply\n", len(allMissing))
 		for _, m := range allMissing {
 			sb.WriteString("  - " + m + "\n")
 		}
