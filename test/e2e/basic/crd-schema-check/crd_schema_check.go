@@ -231,7 +231,7 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs contain the CRD schema mismatch warning", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := getPodLogs(ctx, ns, podName)
+			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogMismatch, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogMismatch))
 		})
@@ -286,6 +286,9 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs do not contain CRD schema validation messages", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
+			// negative assertion: no async check to wait on in skip mode, so a short
+			// settle wait plus a single fetch is sufficient here.
+			time.Sleep(2 * time.Second)
 			logs, err := getPodLogs(ctx, ns, podName)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckLogRunning))
@@ -332,7 +335,7 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs contain the CRD schema mismatch warning", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := getPodLogs(ctx, ns, podName)
+			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogMismatch, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogMismatch))
 		})
@@ -347,7 +350,7 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs report success and no mismatch", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := getPodLogs(ctx, ns, podName)
+			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogSuccess, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogSuccess))
 			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckLogMismatch))
@@ -372,7 +375,7 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs contain the spec field CRD schema mismatch warning", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := getPodLogs(ctx, ns, podName)
+			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogMismatch, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogMismatch))
 			Expect(logs).To(ContainSubstring("backuprepositories.velero.io: spec.backupStorageLocation"))
@@ -433,7 +436,7 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs name the required-vs-optional field mismatch", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := getPodLogs(ctx, ns, podName)
+			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogMismatch, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogMismatch))
 			Expect(logs).To(ContainSubstring("backuprepositories.velero.io: spec." + crdSchemaCheckRequiredFieldName))
@@ -454,7 +457,7 @@ func CRDSchemaCheckTest() {
 		By("Verifying the velero pod logs report success: an extra CRD field must never be flagged", func() {
 			podName, err := getVeleroPodName(ctx, ns)
 			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := getPodLogs(ctx, ns, podName)
+			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogSuccess, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogSuccess))
 			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckLogMismatch))
@@ -760,4 +763,33 @@ func getPodLogs(ctx context.Context, ns, podName string) (string, error) {
 		return "", errors.Wrap(err, stderr)
 	}
 	return stdout, nil
+}
+
+// waitForPodLogsContaining polls the given pod's logs until they contain want, or timeout
+// elapses, returning the last logs fetched either way (so a timeout still gives a caller
+// something useful to assert against/print). Needed because in warn/default --crd-schema-check
+// mode, validateCRDSchemas runs the check in a background goroutine that is not guaranteed to
+// have finished (and logged its result) by the time waitForVeleroRollout's "Server starting..."
+// marker appears -- a single immediate log fetch right after rollout can race ahead of it,
+// especially now that the check recurses into nested struct fields and does more work per CRD.
+func waitForPodLogsContaining(ctx context.Context, ns, podName, want string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	var lastLogs string
+	for {
+		logs, err := getPodLogs(ctx, ns, podName)
+		if err == nil {
+			lastLogs = logs
+			if strings.Contains(logs, want) {
+				return logs, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return lastLogs, nil
+		}
+		select {
+		case <-ctx.Done():
+			return lastLogs, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
