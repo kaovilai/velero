@@ -323,34 +323,34 @@ func CRDSchemaCheckTest() {
 	})
 
 	It("should log a warning and keep running when the CRD schema mismatches in default mode", func() {
+		var freshPodName string
 		By("Removing status.serverVersion from the CRD schema", func() {
 			removeAndTrack(crdSchemaCheckCRDName, crdSchemaCheckFieldPath)
 		})
 
 		By("Restarting the velero deployment without changing its args", func() {
-			Expect(restartVeleroDeployment(ctx, ns)).To(Succeed())
-			Expect(waitForVeleroRollout(ctx, ns, 3*time.Minute)).To(Succeed())
+			var err error
+			freshPodName, err = restartVeleroDeploymentAndWaitForFreshPod(ctx, ns, 3*time.Minute)
+			Expect(err).ShouldNot(HaveOccurred())
 		})
 
 		By("Verifying the velero pod logs contain the CRD schema mismatch warning", func() {
-			podName, err := getVeleroPodName(ctx, ns)
-			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogMismatch, 30*time.Second)
+			logs, err := waitForPodLogsContaining(ctx, ns, freshPodName, crdSchemaCheckLogMismatch, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogMismatch))
 		})
 	})
 
 	It("should log success when CRD schemas are unmodified", func() {
+		var freshPodName string
 		By("Restarting the velero deployment to capture a fresh validation run", func() {
-			Expect(restartVeleroDeployment(ctx, ns)).To(Succeed())
-			Expect(waitForVeleroRollout(ctx, ns, 3*time.Minute)).To(Succeed())
+			var err error
+			freshPodName, err = restartVeleroDeploymentAndWaitForFreshPod(ctx, ns, 3*time.Minute)
+			Expect(err).ShouldNot(HaveOccurred())
 		})
 
 		By("Verifying the velero pod logs report success and no mismatch", func() {
-			podName, err := getVeleroPodName(ctx, ns)
-			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogSuccess, 30*time.Second)
+			logs, err := waitForPodLogsContaining(ctx, ns, freshPodName, crdSchemaCheckLogSuccess, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogSuccess))
 			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckLogMismatch))
@@ -445,19 +445,19 @@ func CRDSchemaCheckTest() {
 	})
 
 	It("should not flag a CRD field the server's Go type has no knowledge of (CRD-ahead-of-server)", func() {
+		var freshPodName string
 		By(fmt.Sprintf("Adding an unrecognized %q field to the backuprepositories CRD schema", crdSchemaCheckExtraFieldName), func() {
 			addAndTrackExtraField(crdSchemaCheckSpecCRDName, crdSchemaCheckExtraFieldPath)
 		})
 
 		By("Restarting the velero deployment to capture a fresh validation run", func() {
-			Expect(restartVeleroDeployment(ctx, ns)).To(Succeed())
-			Expect(waitForVeleroRollout(ctx, ns, 3*time.Minute)).To(Succeed())
+			var err error
+			freshPodName, err = restartVeleroDeploymentAndWaitForFreshPod(ctx, ns, 3*time.Minute)
+			Expect(err).ShouldNot(HaveOccurred())
 		})
 
 		By("Verifying the velero pod logs report success: an extra CRD field must never be flagged", func() {
-			podName, err := getVeleroPodName(ctx, ns)
-			Expect(err).ShouldNot(HaveOccurred())
-			logs, err := waitForPodLogsContaining(ctx, ns, podName, crdSchemaCheckLogSuccess, 30*time.Second)
+			logs, err := waitForPodLogsContaining(ctx, ns, freshPodName, crdSchemaCheckLogSuccess, 30*time.Second)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(logs).To(ContainSubstring(crdSchemaCheckLogSuccess))
 			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckLogMismatch))
@@ -591,6 +591,48 @@ func restartVeleroDeployment(ctx context.Context, ns string) error {
 	return nil
 }
 
+// restartVeleroDeploymentAndWaitForFreshPod restarts the velero Deployment and returns the name
+// of the newly created pod once its main run loop has started (see waitForVeleroServerStarting).
+// Plain restartVeleroDeployment + waitForVeleroRollout + getVeleroPodName is racy here: after a
+// rollout restart, the old pod can still report phase=Running (terminating) for a few seconds,
+// so a caller that immediately calls getVeleroPodName can get back the OLD pod -- whose logs
+// were captured under the PREVIOUS CRD schema/args and don't reflect the fresh validation run the
+// test just triggered. Tracking old pod names and waiting for a name not in that set removes the
+// ambiguity, the same way the strict-mode test cases already do via waitForNewVeleroPod.
+func restartVeleroDeploymentAndWaitForFreshPod(ctx context.Context, ns string, timeout time.Duration) (string, error) {
+	oldPods, err := listVeleroPodNames(ctx, ns)
+	if err != nil {
+		return "", err
+	}
+	if err := restartVeleroDeployment(ctx, ns); err != nil {
+		return "", err
+	}
+	if err := waitForVeleroRolloutStatus(ctx, ns, timeout); err != nil {
+		return "", err
+	}
+	newPod, err := waitForNewVeleroPod(ctx, ns, oldPods, timeout)
+	if err != nil {
+		return "", err
+	}
+	if err := waitForPodServerStarting(ctx, ns, newPod, timeout); err != nil {
+		return "", err
+	}
+	return newPod, nil
+}
+
+// waitForVeleroRolloutStatus waits for the velero Deployment rollout to complete successfully
+// (kubectl rollout status only -- does not itself wait for the resulting pod's main run loop;
+// see waitForVeleroServerStarting/waitForPodServerStarting for that).
+func waitForVeleroRolloutStatus(ctx context.Context, ns string, timeout time.Duration) error {
+	cmd := exec.CommandContext(ctx, "kubectl", "rollout", "status", "deployment/velero",
+		"-n", ns, fmt.Sprintf("--timeout=%s", timeout))
+	_, stderr, err := veleroexec.RunCommand(cmd)
+	if err != nil {
+		return errors.Wrap(err, stderr)
+	}
+	return nil
+}
+
 // waitForVeleroRollout waits for the velero Deployment rollout to complete successfully, and for
 // the resulting pod to reach its main run loop. The velero Deployment defines no readiness probe,
 // so Kubernetes reports the pod Ready as soon as its container starts — well before
@@ -607,6 +649,29 @@ func waitForVeleroRollout(ctx context.Context, ns string, timeout time.Duration)
 	return waitForVeleroServerStarting(ctx, ns, timeout)
 }
 
+// waitForPodServerStarting polls a specific pod's logs until it has logged "Server starting..."
+// (emitted just before the controller-runtime manager starts, after --crd-schema-check validation
+// completes), or timeout elapses. Unlike waitForVeleroServerStarting, this checks one fixed pod
+// name rather than re-resolving "the current velero pod" on each poll -- needed by callers (e.g.
+// restartVeleroDeploymentAndWaitForFreshPod) that already know exactly which pod is the fresh one
+// and must not silently fall back to reading a still-terminating old pod's logs instead.
+func waitForPodServerStarting(ctx context.Context, ns, podName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if logs, err := getPodLogs(ctx, ns, podName); err == nil && strings.Contains(logs, "Server starting...") {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.Errorf("timed out waiting for pod %s to start in namespace %s", podName, ns)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
 // waitForVeleroServerStarting polls the current velero pod's logs until the server has logged
 // "Server starting..." (emitted just before the controller-runtime manager starts, after
 // --crd-schema-check validation completes), or timeout elapses.
@@ -614,7 +679,7 @@ func waitForVeleroServerStarting(ctx context.Context, ns string, timeout time.Du
 	deadline := time.Now().Add(timeout)
 	for {
 		if podName, err := getVeleroPodName(ctx, ns); err == nil {
-			if logs, err := getPodLogs(ctx, ns, podName); err == nil && strings.Contains(logs, "Server starting...") {
+			if waitForPodServerStarting(ctx, ns, podName, time.Until(deadline)) == nil {
 				return nil
 			}
 		}

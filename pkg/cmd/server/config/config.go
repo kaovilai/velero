@@ -226,7 +226,11 @@ func GetDefaultConfig() *Config {
 		CredentialsDirectory:             credentials.DefaultStoreDirectory(),
 		ItemBlockWorkerCount:             DefaultItemBlockWorkerCount,
 		ConcurrentBackups:                DefaultConcurrentBackups,
-		CRDSchemaCheck:                   flag.NewEnum("warn", "warn", "strict", "skip"),
+		// NewEnum(defaultValue, allowedValues...): the default is the first ("warn")
+		// argument, independent of its position in allowedValues -- it is repeated as
+		// the first allowed value here only for readability/consistency, not because
+		// position controls the default.
+		CRDSchemaCheck: flag.NewEnum("warn", "warn", "strict", "skip"),
 	}
 
 	return config
