@@ -18,6 +18,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -136,12 +137,26 @@ func jsonFields(t reflect.Type) map[string]jsonFieldInfo {
 		info := jsonFieldInfo{
 			optional: strings.Contains(","+opts+",", ",omitempty,"),
 		}
-		if ft.Kind() == reflect.Struct {
+		// A struct type with its own custom json.Marshaler (e.g. metav1.Time,
+		// metav1.Duration) serializes to a scalar (string/number), not a nested JSON
+		// object -- the CRD schema represents it as a plain leaf property, so recursing
+		// into its internal Go fields would compare against a schema node that doesn't
+		// and shouldn't exist, producing false "missing field" reports. Only recurse
+		// into plain structs that rely on the default field-by-field JSON encoding.
+		if ft.Kind() == reflect.Struct && !implementsJSONMarshaler(ft) {
 			info.nestedTyp = ft
 		}
 		fields[name] = info
 	}
 	return fields
+}
+
+var jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
+
+// implementsJSONMarshaler reports whether t or *t implements json.Marshaler, covering both
+// value-receiver marshalers (e.g. metav1.Duration) and pointer-receiver ones (e.g. metav1.Time).
+func implementsJSONMarshaler(t reflect.Type) bool {
+	return t.Implements(jsonMarshalerType) || reflect.PointerTo(t).Implements(jsonMarshalerType)
 }
 
 // schemaNodeAt walks a CRD OpenAPI schema down a dotted path and returns the

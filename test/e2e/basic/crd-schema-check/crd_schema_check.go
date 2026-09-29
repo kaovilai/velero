@@ -60,6 +60,27 @@ type crdSchemaMutation struct {
 	originalValue json.RawMessage
 }
 
+// crdSchemaCheckRequiredCRDName/-FieldPath/-RequiredPath target
+// backuprepositories.velero.io's spec.resticIdentifier: the Go type
+// (BackupRepositorySpec.ResticIdentifier) is tagged `omitempty` (the server may legitimately
+// not set it on every write), so adding it to the CRD's own `required` list is exactly the
+// required-vs-optional compatibility break raised in review — a real mismatch even though the
+// field's *name* is present on both sides, which the earlier name-only check couldn't detect.
+const (
+	crdSchemaCheckRequiredCRDName    = crdSchemaCheckSpecCRDName
+	crdSchemaCheckRequiredFieldName  = "resticIdentifier"
+	crdSchemaCheckRequiredArrayPath  = "/spec/versions/0/schema/openAPIV3Schema/properties/spec/required"
+	crdSchemaCheckLogRequiredMessage = "required by installed CRD but optional"
+
+	// crdSchemaCheckExtraFieldName is added to backuprepositories.velero.io's spec schema (not
+	// removed from it) to exercise the CRD-ahead-of-server / extra-optional-field case: a field
+	// the CRD declares that the server's Go type has no knowledge of at all. Per this check's
+	// documented Non Goals, an extra field the CRD has and the server doesn't is intentionally
+	// never flagged in either direction, so this is a false-positive guard, not a mismatch case.
+	crdSchemaCheckExtraFieldName = "e2eTestExtraField"
+	crdSchemaCheckExtraFieldPath = "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/" + crdSchemaCheckExtraFieldName
+)
+
 // CRDSchemaCheckTest exercises the --crd-schema-check server flag (warn/strict/skip) by
 // temporarily removing a known field from an installed CRD's schema and verifying the
 // resulting velero server behavior and log output for each mode.
@@ -83,6 +104,54 @@ func CRDSchemaCheckTest() {
 			mutations = append(mutations, crdSchemaMutation{crdName: crdName, fieldPath: path, originalValue: orig})
 		}
 		Expect(err).ShouldNot(HaveOccurred())
+	}
+
+	// addAndTrackRequired appends fieldName to the CRD's spec.required array (creating the
+	// array if it doesn't exist yet) and tracks it for restoration to its original value —
+	// unlike removeAndTrack/addAndTrackExtraField, restoration here is "replace the whole
+	// array back to what it was", not "remove the one field", since a JSON Patch "add" onto an
+	// array is index/append-based rather than keyed, so there's no single "remove" that's
+	// guaranteed to undo it if anything else raced on the same array in between.
+	addAndTrackRequired := func(crdName, requiredArrayPath, fieldName string) {
+		var current []string
+		orig, err := getCRDSchemaProperty(ctx, crdName, requiredArrayPath)
+		hadExisting := err == nil
+		if hadExisting {
+			Expect(json.Unmarshal(orig, &current)).To(Succeed())
+			mutations = append(mutations, crdSchemaMutation{crdName: crdName, fieldPath: requiredArrayPath, originalValue: orig})
+		} else {
+			// No existing required array — track with a nil originalValue so AfterEach
+			// removes the array entirely on restore, matching addAndTrackExtraField's
+			// "field never existed before this test" convention, rather than leaving
+			// behind an artificial empty `required: []`.
+			mutations = append(mutations, crdSchemaMutation{crdName: crdName, fieldPath: requiredArrayPath, originalValue: nil})
+		}
+
+		updated, err := json.Marshal(append(current, fieldName))
+		Expect(err).ShouldNot(HaveOccurred())
+
+		op := "replace"
+		if !hadExisting {
+			op = "add"
+		}
+		patch := fmt.Sprintf(`[{"op":%q,"path":"%s","value":%s}]`, op, requiredArrayPath, updated)
+		cmd := exec.CommandContext(ctx, "kubectl", "patch", "crd", crdName, "--type=json", "-p", patch)
+		_, stderr, err := veleroexec.RunCommand(cmd)
+		Expect(err).ShouldNot(HaveOccurred(), stderr)
+	}
+
+	// addAndTrackExtraField adds a brand-new property (one the server's Go type has never heard
+	// of) to the CRD's schema, and tracks it for later removal — the inverse of removeAndTrack,
+	// used to exercise the CRD-ahead-of-server / extra-field false-positive check.
+	addAndTrackExtraField := func(crdName, fieldPath string) {
+		patch := fmt.Sprintf(`[{"op":"add","path":"%s","value":{"type":"string"}}]`, fieldPath)
+		cmd := exec.CommandContext(ctx, "kubectl", "patch", "crd", crdName, "--type=json", "-p", patch)
+		_, stderr, err := veleroexec.RunCommand(cmd)
+		Expect(err).ShouldNot(HaveOccurred(), stderr)
+		// nil originalValue is restoreCRDSchemaProperty's signal (via restoreMutation below)
+		// to remove the field entirely rather than restore a prior value, since the field
+		// never existed before this test added it.
+		mutations = append(mutations, crdSchemaMutation{crdName: crdName, fieldPath: fieldPath, originalValue: nil})
 	}
 
 	BeforeEach(func() {
@@ -345,6 +414,53 @@ func CRDSchemaCheckTest() {
 			Expect(logs).To(ContainSubstring("backuprepositories.velero.io: spec.backupStorageLocation"))
 		})
 	})
+
+	It("should log a warning when the CRD requires a field the server treats as optional", func() {
+		By(fmt.Sprintf("Adding %q to the backuprepositories CRD's spec.required list", crdSchemaCheckRequiredFieldName), func() {
+			addAndTrackRequired(crdSchemaCheckRequiredCRDName, crdSchemaCheckRequiredArrayPath, crdSchemaCheckRequiredFieldName)
+		})
+
+		By(fmt.Sprintf("Setting velero deployment args to include %swarn", crdSchemaCheckFlag), func() {
+			err := setVeleroContainerArgs(ctx, ns, append(originalArgs, crdSchemaCheckFlag+"warn"))
+			argsMutated = true
+			Expect(err).To(Succeed())
+		})
+
+		By("Waiting for the velero deployment to roll out successfully despite the required-field mismatch", func() {
+			Expect(waitForVeleroRollout(ctx, ns, 3*time.Minute)).To(Succeed())
+		})
+
+		By("Verifying the velero pod logs name the required-vs-optional field mismatch", func() {
+			podName, err := getVeleroPodName(ctx, ns)
+			Expect(err).ShouldNot(HaveOccurred())
+			logs, err := getPodLogs(ctx, ns, podName)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(logs).To(ContainSubstring(crdSchemaCheckLogMismatch))
+			Expect(logs).To(ContainSubstring("backuprepositories.velero.io: spec." + crdSchemaCheckRequiredFieldName))
+			Expect(logs).To(ContainSubstring(crdSchemaCheckLogRequiredMessage))
+		})
+	})
+
+	It("should not flag a CRD field the server's Go type has no knowledge of (CRD-ahead-of-server)", func() {
+		By(fmt.Sprintf("Adding an unrecognized %q field to the backuprepositories CRD schema", crdSchemaCheckExtraFieldName), func() {
+			addAndTrackExtraField(crdSchemaCheckSpecCRDName, crdSchemaCheckExtraFieldPath)
+		})
+
+		By("Restarting the velero deployment to capture a fresh validation run", func() {
+			Expect(restartVeleroDeployment(ctx, ns)).To(Succeed())
+			Expect(waitForVeleroRollout(ctx, ns, 3*time.Minute)).To(Succeed())
+		})
+
+		By("Verifying the velero pod logs report success: an extra CRD field must never be flagged", func() {
+			podName, err := getVeleroPodName(ctx, ns)
+			Expect(err).ShouldNot(HaveOccurred())
+			logs, err := getPodLogs(ctx, ns, podName)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(logs).To(ContainSubstring(crdSchemaCheckLogSuccess))
+			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckLogMismatch))
+			Expect(logs).NotTo(ContainSubstring(crdSchemaCheckExtraFieldName))
+		})
+	})
 }
 
 // getVeleroContainerArgs returns the current args of the "velero" container in the velero Deployment.
@@ -442,9 +558,16 @@ func removeCRDSchemaProperty(ctx context.Context, crdName, path string) (json.Ra
 }
 
 // restoreCRDSchemaProperty adds back the field at path to the CRD's (single-version) OpenAPI schema,
-// using the original value captured by removeCRDSchemaProperty.
+// using the original value captured by removeCRDSchemaProperty/addAndTrackRequired. A nil value (as
+// set by addAndTrackExtraField, for a field that never existed before the test added it) instead
+// removes the field entirely rather than restoring a prior value.
 func restoreCRDSchemaProperty(ctx context.Context, crdName, path string, value json.RawMessage) error {
-	patch := fmt.Sprintf(`[{"op":"add","path":"%s","value":%s}]`, path, value)
+	var patch string
+	if value == nil {
+		patch = fmt.Sprintf(`[{"op":"remove","path":"%s"}]`, path)
+	} else {
+		patch = fmt.Sprintf(`[{"op":"add","path":"%s","value":%s}]`, path, value)
+	}
 	cmd := exec.CommandContext(ctx, "kubectl", "patch", "crd", crdName, "--type=json", "-p", patch)
 	_, stderr, err := veleroexec.RunCommand(cmd)
 	if err != nil {

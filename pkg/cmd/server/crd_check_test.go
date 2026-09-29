@@ -171,6 +171,21 @@ func TestJsonFields(t *testing.T) {
 		require.NotNil(t, result["base"].nestedTyp)
 		assert.Equal(t, reflect.TypeFor[TestBase](), result["base"].nestedTyp)
 	})
+
+	t.Run("struct field with a custom json.Marshaler is NOT reported as nested (regression)", func(t *testing.T) {
+		// metav1.Duration/metav1.Time marshal to a scalar (string), not a JSON object --
+		// recursing into their internal Go fields as if they were a nested CRD schema
+		// object produces false "missing field" reports against a real, unmodified CRD.
+		// This is the exact bug that broke the kind e2e CRDSchemaCheck suite (all versions)
+		// against backuprepositories.velero.io's maintenanceFrequency/lastMaintenanceTime.
+		type withTimeAndDuration struct {
+			MaintenanceFrequency metav1.Duration `json:"maintenanceFrequency"`
+			LastMaintenanceTime  *metav1.Time    `json:"lastMaintenanceTime,omitempty"`
+		}
+		result := jsonFields(reflect.TypeFor[withTimeAndDuration]())
+		assert.Nil(t, result["maintenanceFrequency"].nestedTyp, "metav1.Duration must not be recursed into")
+		assert.Nil(t, result["lastMaintenanceTime"].nestedTyp, "*metav1.Time must not be recursed into")
+	})
 }
 
 func TestSchemaNodeAt(t *testing.T) {
