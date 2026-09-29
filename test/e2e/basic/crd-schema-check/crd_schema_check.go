@@ -29,10 +29,18 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/format"
 
 	veleroexec "github.com/vmware-tanzu/velero/pkg/util/exec"
 	. "github.com/vmware-tanzu/velero/test"
 )
+
+func init() {
+	// The default Gomega truncation (format.MaxLength) cuts pod log dumps off after the
+	// early plugin-registration spam, before the interesting CRD schema validation lines --
+	// making CI failures for this suite show a useless truncated snippet. Disable it here.
+	format.MaxLength = 0
+}
 
 var veleroCfg VeleroConfig
 
