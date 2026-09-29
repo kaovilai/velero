@@ -85,8 +85,21 @@ func expectedCRDSchemas() []crdSchemaExpectation {
 	return expectations
 }
 
-// jsonFieldNames extracts top-level JSON field names from a Go struct type using reflection.
-func jsonFieldNames(t reflect.Type) sets.Set[string] {
+// jsonFieldInfo describes one JSON-tagged field of a Go struct: whether it's
+// optional from the server's perspective (carries `omitempty`, so the server
+// may legitimately not send it on every write), and — when the field is
+// itself a struct (directly or through a pointer) — its type, so callers can
+// recurse into it to check nested fields the same way.
+type jsonFieldInfo struct {
+	optional  bool
+	nestedTyp reflect.Type // nil unless the field is a struct/pointer-to-struct
+}
+
+// jsonFields extracts the JSON field names of a Go struct type using
+// reflection, one level deep (anonymous/inlined fields are flattened into
+// the parent, matching encoding/json's own promotion rules, so they don't
+// count as a nesting level here).
+func jsonFields(t reflect.Type) map[string]jsonFieldInfo {
 	if t == nil {
 		return nil
 	}
@@ -97,33 +110,46 @@ func jsonFieldNames(t reflect.Type) sets.Set[string] {
 		return nil
 	}
 
-	fields := sets.New[string]()
+	fields := map[string]jsonFieldInfo{}
 	for field := range t.Fields() {
 		tag := field.Tag.Get("json")
-		name, _, _ := strings.Cut(tag, ",")
+		name, opts, _ := strings.Cut(tag, ",")
 		// An anonymous field with no JSON tag, or tagged `json:",inline"` (the
 		// Kubernetes convention for structural-schema inlining), is promoted/
 		// flattened rather than nested under its own field name. One with an
 		// explicit tag name (e.g. `json:"metadata,omitempty"`) is instead
 		// marshaled as a regular named field, not inlined.
 		if field.Anonymous && name == "" && tag != "-" {
-			embedded := jsonFieldNames(field.Type)
-			fields = fields.Union(embedded)
+			for embeddedName, info := range jsonFields(field.Type) {
+				fields[embeddedName] = info
+			}
 			continue
 		}
 		if tag == "" || tag == "-" || name == "" {
 			continue
 		}
-		fields.Insert(name)
+
+		ft := field.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		info := jsonFieldInfo{
+			optional: strings.Contains(","+opts+",", ",omitempty,"),
+		}
+		if ft.Kind() == reflect.Struct {
+			info.nestedTyp = ft
+		}
+		fields[name] = info
 	}
 	return fields
 }
 
-// schemaPropertyNames extracts top-level property names from a CRD OpenAPI schema.
-// The second return value is false if path could not be traversed (schema is nil,
-// or an intermediate/final segment is missing), distinct from reaching a node that
-// legitimately declares no properties (true, empty set).
-func schemaPropertyNames(schema *apiextv1.JSONSchemaProps, path string) (sets.Set[string], bool) {
+// schemaNodeAt walks a CRD OpenAPI schema down a dotted path and returns the
+// node reached, plus false if the path could not be traversed at all (schema
+// is nil, or an intermediate/final segment is missing) — distinct from
+// reaching a node that legitimately declares no properties (true, with a nil
+// Properties map on the returned node).
+func schemaNodeAt(schema *apiextv1.JSONSchemaProps, path string) (*apiextv1.JSONSchemaProps, bool) {
 	if schema == nil {
 		return nil, false
 	}
@@ -142,15 +168,7 @@ func schemaPropertyNames(schema *apiextv1.JSONSchemaProps, path string) (sets.Se
 		}
 		current = &next
 	}
-
-	names := sets.New[string]()
-	if current.Properties == nil {
-		return names, true
-	}
-	for name := range current.Properties {
-		names.Insert(name)
-	}
-	return names, true
+	return current, true
 }
 
 func (s *server) validateCRDSchemas() error {
@@ -250,17 +268,64 @@ func checkMissing(goType reflect.Type, schema *apiextv1.JSONSchemaProps, section
 	if goType == nil {
 		return nil
 	}
-	expectedFields := jsonFieldNames(goType)
-	installedFields, ok := schemaPropertyNames(schema, section)
+	node, ok := schemaNodeAt(schema, section)
 	if !ok {
-		installedFields = sets.New[string]()
+		node = &apiextv1.JSONSchemaProps{}
+	}
+	return checkMissingAt(goType, node, section, crdName)
+}
+
+// checkMissingAt is the recursive core of checkMissing: it diffs one Go
+// struct type against one CRD schema node (already resolved to the given
+// dotted path) and returns every mismatch found, either directly at this
+// level or in a nested struct field. A "mismatch" is either:
+//   - a field the server's Go type has that the installed CRD schema does
+//     not declare at all (an outdated CRD, the original check), or
+//   - a field the CRD schema *does* declare, but marks `required` while the
+//     server's Go type treats it as optional (`omitempty`) — i.e. the server
+//     may legitimately not set it on some writes, which the older/stricter
+//     CRD would then reject as a validation failure, exactly the failure
+//     mode raised in review (e.g. BackupRepository.spec.resticIdentifier).
+//
+// Fields present in the CRD but absent from the Go type are intentionally
+// not flagged either way — see checkMissing's callers / the design doc's
+// Non Goals for why a CRD newer/wider than the server isn't this check's
+// concern.
+func checkMissingAt(goType reflect.Type, node *apiextv1.JSONSchemaProps, path, crdName string) []string {
+	fields := jsonFields(goType)
+	if fields == nil {
+		return nil
 	}
 
-	var missing []string
-	for field := range expectedFields {
-		if !installedFields.Has(field) {
-			missing = append(missing, fmt.Sprintf("%s: %s.%s", crdName, section, field))
+	installedRequired := sets.New[string]()
+	if node != nil {
+		installedRequired = sets.New(node.Required...)
+	}
+
+	var mismatches []string
+	for name, info := range fields {
+		fieldPath := path + "." + name
+		var installed *apiextv1.JSONSchemaProps
+		if node != nil && node.Properties != nil {
+			if p, ok := node.Properties[name]; ok {
+				installed = &p
+			}
+		}
+
+		if installed == nil {
+			mismatches = append(mismatches, fmt.Sprintf("%s: %s", crdName, fieldPath))
+			continue
+		}
+
+		if info.optional && installedRequired.Has(name) {
+			mismatches = append(mismatches, fmt.Sprintf(
+				"%s: %s is required by installed CRD but optional (omitempty) on the server — a write that omits it would be rejected",
+				crdName, fieldPath))
+		}
+
+		if info.nestedTyp != nil {
+			mismatches = append(mismatches, checkMissingAt(info.nestedTyp, installed, fieldPath, crdName)...)
 		}
 	}
-	return missing
+	return mismatches
 }

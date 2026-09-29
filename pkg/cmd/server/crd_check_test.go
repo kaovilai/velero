@@ -66,7 +66,7 @@ type testSpecWithInlineEmbedded struct {
 	Extra    string `json:"extra"`
 }
 
-func TestJsonFieldNames(t *testing.T) {
+func TestJsonFields(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    reflect.Type
@@ -96,44 +96,84 @@ func TestJsonFieldNames(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := jsonFieldNames(tc.input)
+			result := jsonFields(tc.input)
 			if tc.expected == nil {
 				assert.Nil(t, result)
 				return
 			}
 			for _, field := range tc.expected {
-				assert.True(t, result.Has(field), "expected field %q", field)
+				_, ok := result[field]
+				assert.True(t, ok, "expected field %q", field)
 			}
-			assert.False(t, result.Has("Ignored"))
-			assert.False(t, result.Has("private"))
+			_, hasIgnored := result["Ignored"]
+			_, hasPrivate := result["private"]
+			assert.False(t, hasIgnored)
+			assert.False(t, hasPrivate)
 		})
 	}
 
 	t.Run("embedded field with explicit json tag name is not promoted", func(t *testing.T) {
-		result := jsonFieldNames(reflect.TypeFor[testSpecWithNamedEmbedded]())
-		assert.True(t, result.Has("base"))
-		assert.True(t, result.Has("extra"))
-		assert.False(t, result.Has("name"), "embedded fields should nest under their tag name, not promote")
-		assert.False(t, result.Has("count"), "embedded fields should nest under their tag name, not promote")
+		result := jsonFields(reflect.TypeFor[testSpecWithNamedEmbedded]())
+		_, hasBase := result["base"]
+		_, hasExtra := result["extra"]
+		_, hasName := result["name"]
+		_, hasCount := result["count"]
+		assert.True(t, hasBase)
+		assert.True(t, hasExtra)
+		assert.False(t, hasName, "embedded fields should nest under their tag name, not promote")
+		assert.False(t, hasCount, "embedded fields should nest under their tag name, not promote")
+		// The named-embedded field is itself a struct, so it should be
+		// reported as nested for recursion rather than a plain leaf.
+		require.NotNil(t, result["base"].nestedTyp)
 	})
 
 	t.Run("embedded field tagged json:,inline is promoted like an untagged one", func(t *testing.T) {
-		result := jsonFieldNames(reflect.TypeFor[testSpecWithInlineEmbedded]())
-		assert.True(t, result.Has("name"))
-		assert.True(t, result.Has("count"))
-		assert.True(t, result.Has("extra"))
-		assert.False(t, result.Has("base"), "\",inline\" tag has no name to nest under")
+		result := jsonFields(reflect.TypeFor[testSpecWithInlineEmbedded]())
+		_, hasName := result["name"]
+		_, hasCount := result["count"]
+		_, hasExtra := result["extra"]
+		_, hasBase := result["base"]
+		assert.True(t, hasName)
+		assert.True(t, hasCount)
+		assert.True(t, hasExtra)
+		assert.False(t, hasBase, "\",inline\" tag has no name to nest under")
 	})
 
 	t.Run("real BackupStorageLocationSpec promotes inline-embedded StorageType", func(t *testing.T) {
-		result := jsonFieldNames(reflect.TypeFor[velerov1api.BackupStorageLocationSpec]())
-		assert.True(t, result.Has("objectStorage"),
-			"StorageType is embedded with `json:\",inline\"` and must be flattened, not dropped")
-		assert.True(t, result.Has("provider"))
+		result := jsonFields(reflect.TypeFor[velerov1api.BackupStorageLocationSpec]())
+		_, hasObjectStorage := result["objectStorage"]
+		_, hasProvider := result["provider"]
+		assert.True(t, hasObjectStorage,
+			"StorageType is embedded with `json:\\\",inline\\\"` and must be flattened, not dropped")
+		assert.True(t, hasProvider)
+	})
+
+	t.Run("omitempty marks a field optional, its absence does not", func(t *testing.T) {
+		result := jsonFields(reflect.TypeFor[testSpec]())
+		assert.True(t, result["count"].optional, "count carries omitempty")
+		assert.False(t, result["name"].optional, "name has no omitempty")
+	})
+
+	t.Run("struct-typed field is reported as nested for recursion", func(t *testing.T) {
+		type withNested struct {
+			Base TestBase `json:"base"`
+		}
+		result := jsonFields(reflect.TypeFor[withNested]())
+		require.NotNil(t, result["base"].nestedTyp)
+		assert.Equal(t, reflect.TypeFor[TestBase](), result["base"].nestedTyp)
+	})
+
+	t.Run("pointer-to-struct field is unwrapped and reported as nested", func(t *testing.T) {
+		type withNestedPtr struct {
+			Base *TestBase `json:"base"`
+		}
+		result := jsonFields(reflect.TypeFor[withNestedPtr]())
+		require.NotNil(t, result["base"].nestedTyp)
+		assert.Equal(t, reflect.TypeFor[TestBase](), result["base"].nestedTyp)
 	})
 }
 
-func TestSchemaPropertyNames(t *testing.T) {
+func TestSchemaNodeAt(t *testing.T) {
 	schema := &apiextv1.JSONSchemaProps{
 		Properties: map[string]apiextv1.JSONSchemaProps{
 			"spec": {
@@ -151,31 +191,35 @@ func TestSchemaPropertyNames(t *testing.T) {
 		},
 	}
 
-	t.Run("extract spec properties", func(t *testing.T) {
-		result, ok := schemaPropertyNames(schema, "spec")
+	t.Run("extract spec node", func(t *testing.T) {
+		result, ok := schemaNodeAt(schema, "spec")
 		require.True(t, ok)
 		require.NotNil(t, result)
-		assert.True(t, result.Has("name"))
-		assert.True(t, result.Has("count"))
-		assert.Equal(t, 2, result.Len())
+		_, hasName := result.Properties["name"]
+		_, hasCount := result.Properties["count"]
+		assert.True(t, hasName)
+		assert.True(t, hasCount)
+		assert.Len(t, result.Properties, 2)
 	})
 
-	t.Run("extract status properties", func(t *testing.T) {
-		result, ok := schemaPropertyNames(schema, "status")
+	t.Run("extract status node", func(t *testing.T) {
+		result, ok := schemaNodeAt(schema, "status")
 		require.True(t, ok)
 		require.NotNil(t, result)
-		assert.True(t, result.Has("phase"))
-		assert.True(t, result.Has("message"))
+		_, hasPhase := result.Properties["phase"]
+		_, hasMessage := result.Properties["message"]
+		assert.True(t, hasPhase)
+		assert.True(t, hasMessage)
 	})
 
 	t.Run("nonexistent path", func(t *testing.T) {
-		result, ok := schemaPropertyNames(schema, "nonexistent")
+		result, ok := schemaNodeAt(schema, "nonexistent")
 		assert.False(t, ok)
 		assert.Nil(t, result)
 	})
 
 	t.Run("nil schema", func(t *testing.T) {
-		result, ok := schemaPropertyNames(nil, "spec")
+		result, ok := schemaNodeAt(nil, "spec")
 		assert.False(t, ok)
 		assert.Nil(t, result)
 	})
@@ -186,10 +230,31 @@ func TestSchemaPropertyNames(t *testing.T) {
 				"spec": {},
 			},
 		}
-		result, ok := schemaPropertyNames(emptySchema, "spec")
+		result, ok := schemaNodeAt(emptySchema, "spec")
 		assert.True(t, ok)
 		require.NotNil(t, result)
-		assert.Equal(t, 0, result.Len())
+		assert.Empty(t, result.Properties)
+	})
+
+	t.Run("nested dotted path", func(t *testing.T) {
+		nested := &apiextv1.JSONSchemaProps{
+			Properties: map[string]apiextv1.JSONSchemaProps{
+				"spec": {
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"objectStorage": {
+							Properties: map[string]apiextv1.JSONSchemaProps{
+								"caCertRef": {Type: "string"},
+							},
+						},
+					},
+				},
+			},
+		}
+		result, ok := schemaNodeAt(nested, "spec.objectStorage")
+		require.True(t, ok)
+		require.NotNil(t, result)
+		_, hasCaCertRef := result.Properties["caCertRef"]
+		assert.True(t, hasCaCertRef)
 	})
 }
 
@@ -261,6 +326,105 @@ func TestCheckMissing(t *testing.T) {
 		assert.Len(t, missing, 2)
 		assert.Contains(t, missing, "tests.velero.io: spec.name")
 		assert.Contains(t, missing, "tests.velero.io: spec.count")
+	})
+
+	t.Run("nested struct field: missing nested property is detected", func(t *testing.T) {
+		type nestedSpec struct {
+			ObjectStorage TestBase `json:"objectStorage"`
+		}
+		// CRD declares objectStorage but only "name", missing "count".
+		schemaMissingNested := &apiextv1.JSONSchemaProps{
+			Properties: map[string]apiextv1.JSONSchemaProps{
+				"spec": {
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"objectStorage": {
+							Properties: map[string]apiextv1.JSONSchemaProps{
+								"name": {Type: "string"},
+							},
+						},
+					},
+				},
+			},
+		}
+		missing := checkMissing(reflect.TypeFor[nestedSpec](), schemaMissingNested, "spec", "backupstoragelocations.velero.io")
+		assert.Contains(t, missing, "backupstoragelocations.velero.io: spec.objectStorage.count")
+	})
+
+	t.Run("nested struct field: fully present nested property is not flagged", func(t *testing.T) {
+		type nestedSpec struct {
+			ObjectStorage TestBase `json:"objectStorage"`
+		}
+		fullNestedSchema := &apiextv1.JSONSchemaProps{
+			Properties: map[string]apiextv1.JSONSchemaProps{
+				"spec": {
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"objectStorage": {
+							Properties: map[string]apiextv1.JSONSchemaProps{
+								"name":  {Type: "string"},
+								"count": {Type: "integer"},
+							},
+						},
+					},
+				},
+			},
+		}
+		missing := checkMissing(reflect.TypeFor[nestedSpec](), fullNestedSchema, "spec", "backupstoragelocations.velero.io")
+		assert.Empty(t, missing)
+	})
+
+	t.Run("required-field mismatch: CRD requires a field the server treats as optional", func(t *testing.T) {
+		type repoSpec struct {
+			ResticIdentifier string `json:"resticIdentifier,omitempty"`
+		}
+		strictSchema := &apiextv1.JSONSchemaProps{
+			Properties: map[string]apiextv1.JSONSchemaProps{
+				"spec": {
+					Required: []string{"resticIdentifier"},
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"resticIdentifier": {Type: "string"},
+					},
+				},
+			},
+		}
+		missing := checkMissing(reflect.TypeFor[repoSpec](), strictSchema, "spec", "backuprepositories.velero.io")
+		require.Len(t, missing, 1)
+		assert.Contains(t, missing[0], "resticIdentifier")
+		assert.Contains(t, missing[0], "required by installed CRD but optional")
+	})
+
+	t.Run("required-field match: CRD does not require what the server treats as optional", func(t *testing.T) {
+		type repoSpec struct {
+			ResticIdentifier string `json:"resticIdentifier,omitempty"`
+		}
+		looseSchema := &apiextv1.JSONSchemaProps{
+			Properties: map[string]apiextv1.JSONSchemaProps{
+				"spec": {
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"resticIdentifier": {Type: "string"},
+					},
+				},
+			},
+		}
+		missing := checkMissing(reflect.TypeFor[repoSpec](), looseSchema, "spec", "backuprepositories.velero.io")
+		assert.Empty(t, missing)
+	})
+
+	t.Run("required-field on server-required field is fine even if CRD also requires it", func(t *testing.T) {
+		type repoSpec struct {
+			ResticIdentifier string `json:"resticIdentifier"`
+		}
+		strictSchema := &apiextv1.JSONSchemaProps{
+			Properties: map[string]apiextv1.JSONSchemaProps{
+				"spec": {
+					Required: []string{"resticIdentifier"},
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"resticIdentifier": {Type: "string"},
+					},
+				},
+			},
+		}
+		missing := checkMissing(reflect.TypeFor[repoSpec](), strictSchema, "spec", "backuprepositories.velero.io")
+		assert.Empty(t, missing)
 	})
 }
 
