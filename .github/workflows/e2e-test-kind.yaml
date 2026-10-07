@@ -105,7 +105,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ./minio-image.tar
-          key: minio-bitnami-${{ steps.minio-version.outputs.dockerfile_sha }}
+          key: minio-bitnami-${{ env.BITNAMI_CONTAINERS_COMMIT }}
   # Create json of k8s versions to test
   # from guide: https://stackoverflow.com/a/65094398/4590470
   setup-test-matrix:
