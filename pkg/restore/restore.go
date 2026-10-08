@@ -1962,6 +1962,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 					err := errors.Errorf("in-place restore pre-flight check failed, skipping volume data restore: pod %s already exists and is still using the backed-up volumes: delete the pod and its owning workload and retry", kube.NamespaceAndName(obj))
 					restoreLogger.Error(err.Error())
 					errs.Add(namespace, err)
+					return warnings, errs, itemExists
 				} else {
 					err := errors.Errorf("skipping volume data restore: pod %s already exists, its PodVolumeBackups will not be restored", kube.NamespaceAndName(obj))
 					restoreLogger.Warn(err.Error())

@@ -4411,6 +4411,8 @@ func TestRestoreInplaceExistingPodWithPodVolumeBackups(t *testing.T) {
 				require.Len(t, errs.Namespaces["ns-1"], 1)
 				assert.Contains(t, errs.Namespaces["ns-1"][0], "in-place restore pre-flight check failed")
 				assert.Contains(t, errs.Namespaces["ns-1"][0], "pod ns-1/pod-1 already exists")
+				// The restore of the pod stops at the pre-flight failure.
+				assert.Empty(t, warnings.Namespaces)
 			} else {
 				assert.Empty(t, errs.Namespaces)
 			}
