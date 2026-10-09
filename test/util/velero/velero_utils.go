@@ -1522,15 +1522,36 @@ func InstallStorageClasses(provider string, clients ...TestClient) error {
 	ctx, ctxCancel := context.WithTimeout(context.Background(), time.Minute*5)
 	defer ctxCancel()
 
-	storageClassFilePath := fmt.Sprintf("../testdata/storage-class/%s.yaml", provider)
+	// The names stay fixed, since every spec refers to them. What a caller can
+	// choose is the definition they are created from, so a cluster whose volumes
+	// need a different provisioner or parameters can be targeted without editing
+	// the shared test data.
+	providerFile := fmt.Sprintf("../testdata/storage-class/%s.yaml", provider)
 
-	fmt.Printf("Install storage class with %s.\n", storageClassFilePath)
-	if err := CreateStorageClassFromYaml(ctx, client, storageClassFilePath, StorageClassName); err != nil {
+	firstFile := StorageClassFile
+	if firstFile == "" {
+		firstFile = providerFile
+	}
+
+	fmt.Printf("Install storage class %s with %s.\n", StorageClassName, firstFile)
+	if err := CreateStorageClassFromYaml(ctx, client, firstFile, StorageClassName); err != nil {
 		return err
 	}
 
-	fmt.Printf("Install storage class %s with %s.\n", StorageClassName2, storageClassFilePath)
-	return CreateStorageClassFromYaml(ctx, client, storageClassFilePath, StorageClassName2)
+	// An explicitly empty second file runs the suite without a second
+	// StorageClass. The cases that map between two of them skip.
+	if !SecondStorageClassInstalled() {
+		fmt.Printf("Skip installing %s, no StorageClass definition was given for it.\n", StorageClassName2)
+		return nil
+	}
+
+	secondFile := StorageClassFile2
+	if secondFile == "" {
+		secondFile = providerFile
+	}
+
+	fmt.Printf("Install storage class %s with %s.\n", StorageClassName2, secondFile)
+	return CreateStorageClassFromYaml(ctx, client, secondFile, StorageClassName2)
 }
 
 func GetPvName(ctx context.Context, client TestClient, pvcName, namespace string) (string, error) {

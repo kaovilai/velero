@@ -378,6 +378,20 @@ func init() {
 		"",
 		"comma-separated list of key=value annotations to add to Velero service account",
 	)
+	flag.StringVar(
+		&test.StorageClassFile,
+		"storage-class-file",
+		"",
+		"StorageClass manifest the tests provision volumes with. Defaults to the provider's file under testdata/storage-class. Optional.",
+	)
+	flag.Func(
+		"storage-class-file-2",
+		"StorageClass manifest for the second class, used by the cases that map between two. Defaults to the provider's file; empty runs without a second StorageClass and skips those cases. Optional.",
+		func(value string) error {
+			test.StorageClassFile2, test.StorageClassFile2Set = value, true
+			return nil
+		},
+	)
 }
 
 // Add label [SkipVanillaZfs]:
