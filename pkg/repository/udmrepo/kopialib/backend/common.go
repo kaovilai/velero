@@ -18,7 +18,6 @@ package backend
 
 import (
 	"context"
-	"time"
 
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob"
@@ -82,7 +81,7 @@ func SetupConnectOptions(ctx context.Context, repoOptions udmrepo.RepoOptions) r
 			// hardLimit 100%
 			ContentCacheSizeLimitBytes:  dataCacheLimit << 10,
 			MetadataCacheSizeLimitBytes: metadataCacheLimit << 10,
-			MaxListCacheDuration:        content.DurationSeconds(time.Duration(maxCacheDurationSecond) * time.Second),
+			MaxListCacheDuration:        content.DurationSeconds(maxCacheDurationSecond),
 		},
 		ClientOptions: repo.ClientOptions{
 			Hostname:    optionalHaveString(udmrepo.GenOptionOwnerDomain, repoOptions.GeneralOptions),
