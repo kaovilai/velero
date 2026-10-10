@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -377,6 +378,20 @@ func init() {
 		"",
 		"comma-separated list of key=value annotations to add to Velero service account",
 	)
+	flag.StringVar(
+		&test.StorageClassFile,
+		"storage-class-file",
+		"",
+		"StorageClass manifest the tests provision volumes with. Defaults to the provider's file under testdata/storage-class. Optional.",
+	)
+	flag.Func(
+		"storage-class-file-2",
+		"StorageClass manifest for the second class, used by the cases that map between two. Defaults to the provider's file; empty runs without a second StorageClass and skips those cases. Optional.",
+		func(value string) error {
+			test.StorageClassFile2, test.StorageClassFile2Set = value, true
+			return nil
+		},
+	)
 }
 
 // Add label [SkipVanillaZfs]:
@@ -392,16 +407,15 @@ var _ = Describe(
 	APIGroupVersionsTest,
 )
 var _ = Describe(
-	"CRD of apiextentions v1beta1 should be B/R successfully from cluster(k8s version < 1.22) to cluster(k8s version >= 1.22)",
+	"CRD of apiextensions v1beta1 should be B/R successfully from cluster(k8s version < 1.22) to cluster(k8s version >= 1.22)",
 	Label("APIGroup", "APIExtensions", "SKIP_KIND"),
 	APIExtensionsVersionsTest,
 )
 
-// Test backup and restore of Kibishii using restic
 var _ = Describe(
-	"Velero tests on cluster using the plugin provider for object storage and Restic for volume backups",
-	Label("Basic", "Restic", "AdditionalBSL"),
-	BackupRestoreWithRestic,
+	"Velero tests on cluster using the plugin provider for object storage and file system backup for volumes",
+	Label("Basic", "FSBackup", "AdditionalBSL"),
+	BackupRestoreWithFSBackup,
 )
 
 var _ = Describe(
@@ -417,9 +431,9 @@ var _ = Describe(
 )
 
 var _ = Describe(
-	"Velero tests on cluster using the plugin provider for object storage and snapshots for volume backups",
-	Label("Basic", "Restic", "RetainPV", "AdditionalBSL"),
-	BackupRestoreRetainedPVWithRestic,
+	"Velero tests on cluster using the plugin provider for object storage and file system backup for volumes",
+	Label("Basic", "FSBackup", "RetainPV", "AdditionalBSL"),
+	BackupRestoreRetainedPVWithFSBackup,
 )
 
 var _ = Describe(
@@ -452,11 +466,10 @@ var _ = Describe(
 	MultiNSBackupRestore,
 )
 
-// Upgrade test by Kibishii using Restic
 var _ = Describe(
-	"Velero upgrade tests on cluster using the plugin provider for object storage and Restic for volume backups",
-	Label("Upgrade", "Restic"),
-	BackupUpgradeRestoreWithRestic,
+	"Velero upgrade tests on cluster using the plugin provider for object storage and file system backup for volumes",
+	Label("Upgrade", "FSBackup"),
+	BackupUpgradeRestoreWithFSBackup,
 )
 var _ = Describe(
 	"Velero upgrade tests on cluster using the plugin provider for object storage and snapshots for volume backups",
@@ -522,8 +535,13 @@ var _ = Describe(
 )
 var _ = Describe(
 	"Velero test on skip backup of volume by resource policies",
-	Label("ResourceFiltering", "ResourcePolicies", "Restic"),
+	Label("ResourceFiltering", "ResourcePolicies", "FSBackup"),
 	ResourcePoliciesTest,
+)
+var _ = Describe(
+	"Velero test on namespace selection by label via resource policies",
+	Label("ResourceFiltering", "ResourcePolicies"),
+	NamespaceLabelSelectorTest,
 )
 
 // backup VolumeInfo test
@@ -549,6 +567,11 @@ var _ = Describe(
 )
 var _ = Describe(
 	"",
+	Label("BackupVolumeInfo", "CSIVolumeGroupSnapshot"),
+	CSIVolumeGroupSnapshotVolumeInfoTest,
+)
+var _ = Describe(
+	"",
 	Label("BackupVolumeInfo", "NativeSnapshot"),
 	NativeSnapshotVolumeInfoTest,
 )
@@ -560,9 +583,9 @@ var _ = Describe(
 )
 
 var _ = Describe(
-	"Velero tests of Restic backup deletion",
-	Label("Backups", "Deletion", "Restic"),
-	BackupDeletionWithRestic,
+	"Velero tests of file system backup deletion",
+	Label("Backups", "Deletion", "FSBackup"),
+	BackupDeletionWithFSBackup,
 )
 var _ = Describe(
 	"Velero tests of snapshot backup deletion",
@@ -570,7 +593,7 @@ var _ = Describe(
 	BackupDeletionWithSnapshots,
 )
 var _ = Describe(
-	"Local backups and Restic repos will be deleted once the corresponding backup storage location is deleted",
+	"Local backups and backup repos will be deleted once the corresponding backup storage location is deleted",
 	Label("Backups", "TTL", "LongTime", "Snapshot", "SkipVanillaZfs"),
 	TTLTest,
 )
@@ -608,9 +631,9 @@ var _ = Describe(
 	BslDeletionWithSnapshots,
 )
 var _ = Describe(
-	"Local backups and Restic repos will be deleted once the corresponding backup storage location is deleted",
-	Label("BSL", "Deletion", "Restic", "AdditionalBSL"),
-	BslDeletionWithRestic,
+	"Local backups and backup repos will be deleted once the corresponding backup storage location is deleted",
+	Label("BSL", "Deletion", "FSBackup", "AdditionalBSL"),
+	BslDeletionWithFSBackup,
 )
 
 var _ = Describe(
@@ -626,13 +649,13 @@ var _ = Describe(
 
 var _ = Describe(
 	"Backup resources should follow the specific order in schedule",
-	Label("NamespaceMapping", "Single", "Restic"),
-	OneNamespaceMappingResticTest,
+	Label("NamespaceMapping", "Single", "FSBackup"),
+	OneNamespaceMappingFSBackupTest,
 )
 var _ = Describe(
 	"Backup resources should follow the specific order in schedule",
-	Label("NamespaceMapping", "Multiple", "Restic"),
-	MultiNamespacesMappingResticTest,
+	Label("NamespaceMapping", "Multiple", "FSBackup"),
+	MultiNamespacesMappingFSBackupTest,
 )
 var _ = Describe(
 	"Backup resources should follow the specific order in schedule",
@@ -786,6 +809,16 @@ func TestE2e(t *testing.T) {
 	testSuitePassed = RunSpecs(t, "E2e Suite")
 }
 
+// volumeGroupSnapshotClassFile returns the VolumeGroupSnapshotClass test data
+// for the provider under test, or the empty string when it has none.
+func volumeGroupSnapshotClassFile() string {
+	path := fmt.Sprintf("../testdata/volume-group-snapshot-class/%s.yaml", test.VeleroCfg.CloudProvider)
+	if _, err := os.Stat(path); err != nil {
+		return ""
+	}
+	return path
+}
+
 var _ = BeforeSuite(func() {
 	By("Install StorageClass for E2E.")
 	Expect(veleroutil.InstallStorageClasses(test.VeleroCfg.CloudProvider)).To(Succeed())
@@ -799,6 +832,13 @@ var _ = BeforeSuite(func() {
 				fmt.Sprintf("../testdata/volume-snapshot-class/%s.yaml", test.VeleroCfg.CloudProvider),
 			),
 		).To(Succeed())
+
+		// Only some providers have a VolumeGroupSnapshotClass to install, so
+		// the VolumeGroupSnapshot cases only run where the test data exists.
+		if path := volumeGroupSnapshotClassFile(); path != "" {
+			By("Install VolumeGroupSnapshotClass for E2E.")
+			Expect(k8s.KubectlApplyByFile(context.Background(), path)).To(Succeed())
+		}
 	}
 
 	By("Install PriorityClasses for E2E.")
@@ -832,7 +872,7 @@ var _ = AfterSuite(func() {
 		),
 	).To(Succeed())
 
-	By("Delete PriorityClasses created by E2E")
+	By(fmt.Sprintf("Delete StorageClass %s created by E2E", test.StorageClassName2))
 	Expect(
 		k8s.DeleteStorageClass(
 			ctx,
@@ -850,8 +890,14 @@ var _ = AfterSuite(func() {
 				fmt.Sprintf("../testdata/volume-snapshot-class/%s.yaml", test.VeleroCfg.CloudProvider),
 			),
 		).To(Succeed())
+
+		if path := volumeGroupSnapshotClassFile(); path != "" {
+			By("Delete VolumeGroupSnapshotClass created by E2E")
+			Expect(k8s.KubectlDeleteByFile(ctx, path)).To(Succeed())
+		}
 	}
 
+	By("Delete PriorityClasses created by E2E")
 	Expect(veleroutil.DeletePriorityClasses(
 		ctx,
 		test.VeleroCfg.ClientToInstallVelero.Kubebuilder,

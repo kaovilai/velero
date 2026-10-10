@@ -21,9 +21,9 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/cockroachdb/errors"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/pkg/errors"
 	corev1api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -58,6 +58,10 @@ var ResourcePoliciesTest func() = TestFunc(&ResourcePoliciesCase{})
 func (r *ResourcePoliciesCase) Init() error {
 	// generate random number as UUIDgen and set one default timeout duration
 	r.TestCase.Init()
+
+	if !SecondStorageClassInstalled() {
+		Skip("this case maps between two StorageClasses; it needs --storage-class-file-2")
+	}
 
 	// generate variable names based on CaseBaseName + UUIDgen
 	r.CaseBaseName = "resource-policies-" + r.UUIDgen

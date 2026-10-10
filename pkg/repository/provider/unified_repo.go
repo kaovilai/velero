@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
@@ -327,7 +327,7 @@ func (urp *unifiedRepoProvider) Forget(ctx context.Context, snapshotID string, p
 		}
 	}()
 
-	err = bkRepo.DeleteManifest(ctx, udmrepo.ID(snapshotID))
+	err = bkRepo.DeleteSnapshot(ctx, udmrepo.ID(snapshotID))
 	if err != nil {
 		return errors.Wrap(err, "error to delete manifest")
 	}
@@ -376,7 +376,7 @@ func (urp *unifiedRepoProvider) BatchForget(ctx context.Context, snapshotIDs []s
 
 	errs := []error{}
 	for _, snapshotID := range snapshotIDs {
-		err = bkRepo.DeleteManifest(ctx, udmrepo.ID(snapshotID))
+		err = bkRepo.DeleteSnapshot(ctx, udmrepo.ID(snapshotID))
 		if err != nil {
 			errs = append(errs, errors.Wrapf(err, "error to delete manifest %s", snapshotID))
 		}
@@ -384,7 +384,7 @@ func (urp *unifiedRepoProvider) BatchForget(ctx context.Context, snapshotIDs []s
 
 	err = bkRepo.Flush(ctx)
 	if err != nil {
-		return []error{errors.Wrap(err, "error to flush repo")}
+		return append(errs, errors.Wrap(err, "error to flush repo"))
 	}
 
 	log.Debug("Forget snapshot complete")
@@ -501,10 +501,15 @@ func getStorageCredentials(backupLocation *velerov1api.BackupStorageLocation, cr
 		return map[string]string{}, errors.New("invalid storage provider")
 	}
 
-	config := backupLocation.Spec.Config
-	if config == nil {
-		config = map[string]string{}
+	config := make(map[string]string)
+	if backupLocation.Spec.Config != nil {
+		for k, v := range backupLocation.Spec.Config {
+			config[k] = v
+		}
 	}
+
+	// Delete any user-provided credentialsFile to prevent path traversal vulnerabilities
+	delete(config, repoconfig.CredentialsFileKey)
 
 	if backupLocation.Spec.Credential != nil {
 		config[repoconfig.CredentialsFileKey], err = credentialsFileStore.Path(backupLocation.Spec.Credential)
@@ -549,10 +554,15 @@ func getStorageVariables(backupLocation *velerov1api.BackupStorageLocation, repo
 		return map[string]string{}, errors.New("invalid storage provider")
 	}
 
-	config := backupLocation.Spec.Config
-	if config == nil {
-		config = map[string]string{}
+	config := make(map[string]string)
+	if backupLocation.Spec.Config != nil {
+		for k, v := range backupLocation.Spec.Config {
+			config[k] = v
+		}
 	}
+
+	// Delete any user-provided credentialsFile to prevent path traversal vulnerabilities
+	delete(config, repoconfig.CredentialsFileKey)
 
 	bucket := strings.Trim(config["bucket"], "/")
 	prefix := strings.Trim(config["prefix"], "/")
