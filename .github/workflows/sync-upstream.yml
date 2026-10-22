@@ -1,0 +1,23 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    # Allow manual triggering
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Sync fork with upstream
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh repo sync ${{ github.repository }} \
+          --source vmware-tanzu/velero \
+          --branch main
