@@ -1,0 +1,1 @@
+Drop a backup from the in-progress tracker when its CR is deleted while running (e.g. by Schedule owner-reference garbage collection), so it can be deleted without restarting Velero; clarify what useOwnerReferencesInBackup does on schedule deletion

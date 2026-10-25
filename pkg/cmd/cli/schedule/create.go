@@ -103,7 +103,7 @@ func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 	o.BackupOptions.BindFlags(flags)
 	o.SkipOptions.BindFlags(flags)
 	flags.StringVar(&o.Schedule, "schedule", o.Schedule, "A cron expression specifying a recurring schedule for this backup to run")
-	flags.BoolVar(&o.UseOwnerReferencesInBackup, "use-owner-references-in-backup", o.UseOwnerReferencesInBackup, "Specifies whether to use OwnerReferences on backups created by this Schedule. Notice: if set to true, when schedule is deleted, backups will be deleted too.")
+	flags.BoolVar(&o.UseOwnerReferencesInBackup, "use-owner-references-in-backup", o.UseOwnerReferencesInBackup, "Specifies whether to use OwnerReferences on backups created by this Schedule. Notice: if set to true, deleting the schedule only removes the Backup CRs; backup data and snapshots are kept and the backups are synced back from the backup storage location.")
 	flags.BoolVar(&o.Paused, "paused", o.Paused, "Specifies whether the newly created schedule is paused or not.")
 }
 

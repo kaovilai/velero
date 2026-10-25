@@ -2177,6 +2177,83 @@ func TestProcessBackupCompletions(t *testing.T) {
 	}
 }
 
+// TestProcessBackupDeletedWhileRunning verifies that a backup whose CR is deleted
+// while it is running (e.g. garbage collected through a Schedule owner reference)
+// does not stay in the backup tracker, where it would block deleting a backup with
+// the same name until Velero restarts.
+func TestProcessBackupDeletedWhileRunning(t *testing.T) {
+	tests := []struct {
+		name                   string
+		deleteWhileRunning     bool
+		expectTrackerContained bool
+	}{
+		{
+			name:                   "backup still exists stays tracked for post-processing",
+			deleteWhileRunning:     false,
+			expectTrackerContained: true,
+		},
+		{
+			name:                   "backup deleted while running is dropped from the tracker",
+			deleteWhileRunning:     true,
+			expectTrackerContained: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var (
+				logger        = logging.DefaultLogger(logrus.DebugLevel, logging.FormatText)
+				pluginManager = new(pluginmocks.Manager)
+				backupStore   = new(persistencemocks.BackupStore)
+				backupper     = new(fakeBackupper)
+				location      = builder.ForBackupStorageLocation("velero", "loc-1").Default(true).Bucket("store-1").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+				backup        = defaultBackup().Result()
+				fakeClient    = velerotest.NewFakeControllerRuntimeClient(t, location, backup)
+				tracker       = NewBackupTracker()
+			)
+
+			apiServer := velerotest.NewAPIServer(t)
+			discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+			require.NoError(t, err)
+
+			c := &backupReconciler{
+				logger:                logger,
+				discoveryHelper:       discoveryHelper,
+				kbClient:              fakeClient,
+				defaultBackupLocation: location.Name,
+				backupTracker:         tracker,
+				metrics:               metrics.NewServerMetrics(),
+				clock:                 testclocks.NewFakeClock(time.Now()),
+				resourceTimeout:       time.Second,
+				newPluginManager:      func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
+				backupStoreGetter:     NewFakeSingleObjectBackupStoreGetter(backupStore),
+				backupper:             backupper,
+				formatFlag:            logging.FormatText,
+				globalCRClient:        velerotest.NewFakeControllerRuntimeClient(t),
+			}
+
+			pluginManager.On("GetBackupItemActionsV2").Return(nil, nil)
+			pluginManager.On("GetItemBlockActions").Return(nil, nil)
+			pluginManager.On("CleanupClients").Return(nil)
+			backupStore.On("BackupExists", location.Spec.StorageType.ObjectStorage.Bucket, backup.Name).Return(false, nil)
+			backupStore.On("PutBackup", mock.Anything).Return(nil)
+			backupper.On("BackupWithResolvers", mock.Anything, mock.Anything, mock.Anything, framework.BackupItemActionResolverV2{}, pluginManager).
+				Run(func(mock.Arguments) {
+					if test.deleteWhileRunning {
+						require.NoError(t, fakeClient.Delete(t.Context(), backup.DeepCopy()))
+					}
+				}).
+				Return(nil)
+
+			result, err := c.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backup.Namespace, Name: backup.Name}})
+			require.NoError(t, err)
+			assert.Equal(t, ctrl.Result{}, result)
+			assert.Equal(t, test.expectTrackerContained, tracker.Contains(backup.Namespace, backup.Name))
+			assert.Equal(t, 0, tracker.RunningCount())
+		})
+	}
+}
+
 func TestValidateAndGetSnapshotLocations(t *testing.T) {
 	defaultBSL := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "bsl").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
 	tests := []struct {

@@ -143,6 +143,35 @@ func TestBackupFinalizerReconcileCleansVGSAfterFailedBackup(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestBackupFinalizerReconcileDropsDeletedBackupFromTracker(t *testing.T) {
+	tracker := NewBackupTracker()
+	tracker.AddReadyToStart(velerov1api.DefaultNamespace, "backup-ready")
+	tracker.Add(velerov1api.DefaultNamespace, "backup-in-progress")
+	tracker.AddPostProcessing(velerov1api.DefaultNamespace, "backup-post-processing")
+	tracker.AddPostProcessing(velerov1api.DefaultNamespace, "backup-still-exists")
+
+	existing := builder.ForBackup(velerov1api.DefaultNamespace, "backup-still-exists").
+		Phase(velerov1api.BackupPhaseWaitingForPluginOperations).Result()
+	reconciler := &backupFinalizerReconciler{
+		client:        velerotest.NewFakeControllerRuntimeClient(t, existing),
+		backupTracker: tracker,
+		log:           logrus.New(),
+	}
+
+	for _, name := range []string{"backup-ready", "backup-in-progress", "backup-post-processing", "backup-still-exists"} {
+		_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      name,
+		}})
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 0, tracker.RunningCount())
+	assert.False(t, tracker.Contains(velerov1api.DefaultNamespace, "backup-in-progress"))
+	assert.False(t, tracker.Contains(velerov1api.DefaultNamespace, "backup-post-processing"))
+	assert.True(t, tracker.Contains(velerov1api.DefaultNamespace, "backup-still-exists"))
+}
+
 func TestBackupFinalizerReconcile(t *testing.T) {
 	fakeClock := testclocks.NewFakeClock(time.Now())
 	metav1Now := metav1.NewTime(fakeClock.Now())

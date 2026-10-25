@@ -113,6 +113,11 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err := r.client.Get(ctx, req.NamespacedName, backup); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Debug("Unable to find Backup")
+			// The backup was deleted. If it was deleted before reaching a terminal
+			// phase (e.g. garbage collected through a Schedule owner reference), no
+			// controller would otherwise remove it from the tracker, which blocks
+			// deleting a backup with the same name until Velero restarts.
+			r.backupTracker.Delete(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 

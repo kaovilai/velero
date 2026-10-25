@@ -328,7 +328,17 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	backupScheduleName := request.GetLabels()[velerov1api.ScheduleNameLabel]
 
 	b.backupTracker.Add(request.Namespace, request.Name)
+	backupDeleted := false
 	defer func() {
+		if backupDeleted {
+			// The Backup CR was deleted while the backup was running, e.g. garbage
+			// collected through a Schedule owner reference. No controller will process
+			// it again, so drop it from the tracker; otherwise deleting a backup with
+			// the same name, such as one synced back from the backup storage location,
+			// fails with "backup is still in progress" until Velero restarts.
+			b.backupTracker.Delete(request.Namespace, request.Name)
+			return
+		}
 		switch request.Status.Phase {
 		case velerov1api.BackupPhaseCompleted, velerov1api.BackupPhasePartiallyFailed, velerov1api.BackupPhaseFailed, velerov1api.BackupPhaseFailedValidation:
 			b.backupTracker.Delete(request.Namespace, request.Name)
@@ -387,8 +397,16 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// BackupPhaseFinalizing -> backup_finalizer_controller.go will now reconcile
 	// BackupPhaseFinalizingPartiallyFailed -> backup_finalizer_controller.go will now reconcile
 	// BackupPhaseFailed
-	if err := kubeutil.PatchResourceWithRetriesOnErrors(b.resourceTimeout, original, request.Backup, b.kbClient); err != nil {
-		log.WithError(err).Errorf("error updating backup's status from %v to %v", original.Status.Phase, request.Backup.Status.Phase)
+	// A missing backup will not come back, so NotFound is not retried.
+	if err := kubeutil.PatchResourceWithRetries(b.resourceTimeout, original, request.Backup, b.kbClient, func(err error) bool {
+		return err != nil && !apierrors.IsNotFound(err)
+	}); err != nil {
+		if apierrors.IsNotFound(err) {
+			backupDeleted = true
+			log.Warn("Backup was deleted while it was running, skipping status update")
+		} else {
+			log.WithError(err).Errorf("error updating backup's status from %v to %v", original.Status.Phase, request.Backup.Status.Phase)
+		}
 	}
 	return ctrl.Result{}, nil
 }
