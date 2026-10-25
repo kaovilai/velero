@@ -66,6 +66,10 @@ const (
 
 type backupDeletionReconciler struct {
 	client.Client
+	// crClient is not limited to the Velero namespace like the controller
+	// manager's cached client, so it can reach the CSI VolumeSnapshots that
+	// a backup created in the workload namespaces.
+	crClient          client.Client
 	logger            logrus.FieldLogger
 	backupTracker     BackupTracker
 	repoMgr           repomanager.Manager
@@ -82,6 +86,7 @@ type backupDeletionReconciler struct {
 func NewBackupDeletionReconciler(
 	logger logrus.FieldLogger,
 	client client.Client,
+	crClient client.Client,
 	backupTracker BackupTracker,
 	repoMgr repomanager.Manager,
 	metrics *metrics.ServerMetrics,
@@ -93,6 +98,7 @@ func NewBackupDeletionReconciler(
 ) *backupDeletionReconciler {
 	return &backupDeletionReconciler{
 		Client:            client,
+		crClient:          crClient,
 		logger:            logger,
 		backupTracker:     backupTracker,
 		repoMgr:           repoMgr,
@@ -530,7 +536,7 @@ func (r *backupDeletionReconciler) deleteExistingDeletionRequests(ctx context.Co
 // when it's running, e.g. due to velero pod restart, and the backup.tar is failed to be downloaded from storage.
 func (r *backupDeletionReconciler) deleteCSIVolumeSnapshotsIfAny(ctx context.Context, backup *velerov1api.Backup, log logrus.FieldLogger) {
 	vsList := snapshotv1api.VolumeSnapshotList{}
-	if err := r.Client.List(ctx, &vsList, &client.ListOptions{
+	if err := r.crClient.List(ctx, &vsList, &client.ListOptions{
 		LabelSelector: labels.SelectorFromSet(map[string]string{
 			velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
 		}),
@@ -540,7 +546,7 @@ func (r *backupDeletionReconciler) deleteCSIVolumeSnapshotsIfAny(ctx context.Con
 	}
 	for _, item := range vsList.Items {
 		vs := item
-		csi.CleanupVolumeSnapshot(ctx, &vs, r.Client, log)
+		csi.CleanupVolumeSnapshot(ctx, &vs, r.crClient, log)
 	}
 }
 
