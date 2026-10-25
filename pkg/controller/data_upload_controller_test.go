@@ -631,6 +631,12 @@ func TestReconcile(t *testing.T) {
 			expectDataPath:     true,
 			expectCancelRecord: true,
 		},
+		{
+			name:           "release data path of du in terminal state",
+			du:             dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseCanceled).Node("test-node").Result(),
+			needCreateFSBR: true,
+			expected:       dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseCanceled).Result(),
+		},
 	}
 
 	for _, test := range tests {
