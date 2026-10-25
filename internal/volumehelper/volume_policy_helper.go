@@ -372,8 +372,29 @@ func (v volumeHelperImpl) shouldPerformFSBackupLegacy(
 			}
 		}
 
+		// fs-backup can't back up block volumes. Don't select them by default, so that
+		// they are handled by the snapshot path (e.g. CSI snapshot data movement)
+		// instead of being skipped by fs-backup and left out of the backup.
+		if isBlockVolumeOfPod(volume.Name, pod) {
+			return false
+		}
+
 		return true
 	}
+}
+
+// isBlockVolumeOfPod returns true if any container of the pod attaches the volume as a raw block device.
+func isBlockVolumeOfPod(volumeName string, pod corev1api.Pod) bool {
+	for _, containers := range [][]corev1api.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for _, container := range containers {
+			for _, device := range container.VolumeDevices {
+				if device.Name == volumeName {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (v *volumeHelperImpl) ShouldPerformCustomAction(obj runtime.Unstructured, groupResource schema.GroupResource, matchParams map[string]any) (bool, error) {

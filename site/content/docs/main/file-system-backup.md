@@ -195,6 +195,7 @@ In this approach, Velero will back up all pod volumes using FSB with the excepti
 
 - Volumes mounting the default service account token, Kubernetes Secrets, and ConfigMaps
 - Hostpath volumes
+- Raw block volumes (attached to a container through `volumeDevices`), which FSB can't back up. They are backed up using volume snapshots instead (if configured), the same way as excluded volumes
 - **Volumes explicitly excluded using annotations** (see below)
 
 **Important:** When you exclude a volume from FSB using annotations, Velero will attempt to back it up using volume snapshots instead (if CSI snapshots are enabled and the volume is a CSI volume or if properly configured with a compatible VolumeSnapshotLocation).
@@ -616,7 +617,7 @@ When Velero encounters a volume during backup, it follows this decision flow:
    - Yes → Skip FSB, attempt volume snapshot (if configured)
    - No → Continue to step 2
 
-2. **Is the volume opted in for FSB?** (via `backup.velero.io/backup-volumes` or `--default-volumes-to-fs-backup`)
+2. **Is the volume opted in for FSB?** (via `backup.velero.io/backup-volumes`, or `--default-volumes-to-fs-backup` for volumes that are not raw block volumes)
    - Yes → Perform FSB, skip volume snapshot
    - No → Attempt volume snapshot (if configured)
 

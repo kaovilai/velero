@@ -202,6 +202,54 @@ func TestVolumeHelperImpl_ShouldPerformSnapshot(t *testing.T) {
 			expectedErr:              false,
 		},
 		{
+			name:          "No VolumePolicy, block volume not selected by fs-backup as opt-out way, snapshotVolumes is true, returns true and no error",
+			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp3-csi").ClaimRef("ns", "pvc-1").Result(),
+			groupResource: kuberesource.PersistentVolumes,
+			pod: builder.ForPod("ns", "pod-1").
+				Containers(&corev1api.Container{
+					Name:          "c",
+					VolumeDevices: []corev1api.VolumeDevice{{Name: "volume", DevicePath: "/dev/xvda"}},
+				}).
+				Volumes(
+					&corev1api.Volume{
+						Name: "volume",
+						VolumeSource: corev1api.VolumeSource{
+							PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+								ClaimName: "pvc-1",
+							},
+						},
+					},
+				).Result(),
+			snapshotVolumesFlag:      ptr.To(true),
+			defaultVolumesToFSBackup: true,
+			shouldSnapshot:           true,
+			expectedErr:              false,
+		},
+		{
+			name:          "No VolumePolicy, mounted volume selected by fs-backup as opt-out way, snapshotVolumes is true, returns false and no error",
+			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp3-csi").ClaimRef("ns", "pvc-1").Result(),
+			groupResource: kuberesource.PersistentVolumes,
+			pod: builder.ForPod("ns", "pod-1").
+				Containers(&corev1api.Container{
+					Name:         "c",
+					VolumeMounts: []corev1api.VolumeMount{{Name: "volume", MountPath: "/data"}},
+				}).
+				Volumes(
+					&corev1api.Volume{
+						Name: "volume",
+						VolumeSource: corev1api.VolumeSource{
+							PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+								ClaimName: "pvc-1",
+							},
+						},
+					},
+				).Result(),
+			snapshotVolumesFlag:      ptr.To(true),
+			defaultVolumesToFSBackup: true,
+			shouldSnapshot:           false,
+			expectedErr:              false,
+		},
+		{
 			name:          "VolumePolicy not match, not selected by fs-backup as opt-in way, snapshotVolumes is true, returns false and no error",
 			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp3-csi").ClaimRef("ns", "pvc-1").Result(),
 			groupResource: kuberesource.PersistentVolumes,
@@ -725,6 +773,110 @@ func TestVolumeHelperImpl_ShouldPerformFSBackup(t *testing.T) {
 			defaultVolumesToFSBackup: true,
 			shouldFSBackup:           false,
 			expectedErr:              false,
+		},
+		{
+			name: "No VolumePolicy, block volume is not selected by opt-out way, return false and no error",
+			pod: builder.ForPod("ns", "pod-1").
+				Containers(&corev1api.Container{
+					Name:          "c",
+					VolumeDevices: []corev1api.VolumeDevice{{Name: "pvc-1", DevicePath: "/dev/xvda"}},
+				}).
+				Volumes(
+					&corev1api.Volume{
+						Name: "pvc-1",
+						VolumeSource: corev1api.VolumeSource{
+							PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+								ClaimName: "pvc-1",
+							},
+						},
+					}).Result(),
+			resources: []runtime.Object{
+				builder.ForPersistentVolumeClaim("ns", "pvc-1").
+					VolumeName("pv-1").
+					StorageClass("gp2-csi").Phase(corev1api.ClaimBound).Result(),
+				builder.ForPersistentVolume("pv-1").StorageClass("gp2-csi").Result(),
+			},
+			defaultVolumesToFSBackup: true,
+			shouldFSBackup:           false,
+			expectedErr:              false,
+		},
+		{
+			name: "No VolumePolicy, block volume of init container is not selected by opt-out way, return false and no error",
+			pod: builder.ForPod("ns", "pod-1").
+				InitContainers(&corev1api.Container{
+					Name:          "init",
+					VolumeDevices: []corev1api.VolumeDevice{{Name: "pvc-1", DevicePath: "/dev/xvda"}},
+				}).
+				Volumes(
+					&corev1api.Volume{
+						Name: "pvc-1",
+						VolumeSource: corev1api.VolumeSource{
+							PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+								ClaimName: "pvc-1",
+							},
+						},
+					}).Result(),
+			resources: []runtime.Object{
+				builder.ForPersistentVolumeClaim("ns", "pvc-1").
+					VolumeName("pv-1").
+					StorageClass("gp2-csi").Phase(corev1api.ClaimBound).Result(),
+				builder.ForPersistentVolume("pv-1").StorageClass("gp2-csi").Result(),
+			},
+			defaultVolumesToFSBackup: true,
+			shouldFSBackup:           false,
+			expectedErr:              false,
+		},
+		{
+			name: "No VolumePolicy, mounted volume is selected by opt-out way, return true and no error",
+			pod: builder.ForPod("ns", "pod-1").
+				Containers(&corev1api.Container{
+					Name:         "c",
+					VolumeMounts: []corev1api.VolumeMount{{Name: "pvc-1", MountPath: "/data"}},
+				}).
+				Volumes(
+					&corev1api.Volume{
+						Name: "pvc-1",
+						VolumeSource: corev1api.VolumeSource{
+							PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+								ClaimName: "pvc-1",
+							},
+						},
+					}).Result(),
+			resources: []runtime.Object{
+				builder.ForPersistentVolumeClaim("ns", "pvc-1").
+					VolumeName("pv-1").
+					StorageClass("gp2-csi").Phase(corev1api.ClaimBound).Result(),
+				builder.ForPersistentVolume("pv-1").StorageClass("gp2-csi").Result(),
+			},
+			defaultVolumesToFSBackup: true,
+			shouldFSBackup:           true,
+			expectedErr:              false,
+		},
+		{
+			name: "No VolumePolicy, block volume selected by opt-in way, return true and no error",
+			pod: builder.ForPod("ns", "pod-1").
+				ObjectMeta(builder.WithAnnotations(velerov1api.VolumesToBackupAnnotation, "pvc-1")).
+				Containers(&corev1api.Container{
+					Name:          "c",
+					VolumeDevices: []corev1api.VolumeDevice{{Name: "pvc-1", DevicePath: "/dev/xvda"}},
+				}).
+				Volumes(
+					&corev1api.Volume{
+						Name: "pvc-1",
+						VolumeSource: corev1api.VolumeSource{
+							PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+								ClaimName: "pvc-1",
+							},
+						},
+					}).Result(),
+			resources: []runtime.Object{
+				builder.ForPersistentVolumeClaim("ns", "pvc-1").
+					VolumeName("pv-1").
+					StorageClass("gp2-csi").Phase(corev1api.ClaimBound).Result(),
+				builder.ForPersistentVolume("pv-1").StorageClass("gp2-csi").Result(),
+			},
+			shouldFSBackup: true,
+			expectedErr:    false,
 		},
 	}
 
