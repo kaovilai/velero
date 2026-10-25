@@ -197,7 +197,7 @@ func (e *csiSnapshotExposer) Expose(ctx context.Context, ownerObject corev1api.O
 		}
 	}()
 
-	backupVSC, err := e.createBackupVSC(ctx, ownerObject, vsc, backupVS)
+	backupVSC, err := e.createBackupVSC(ctx, ownerObject, vsc, backupVS, csiExposeParam.DataMover)
 	if err != nil {
 		return errors.Wrap(err, "error to create backup volume snapshot content")
 	}
@@ -560,7 +560,7 @@ func (e *csiSnapshotExposer) createBackupVS(ctx context.Context, ownerObject cor
 	return e.csiSnapshotClient.VolumeSnapshots(vs.Namespace).Create(ctx, vs, metav1.CreateOptions{})
 }
 
-func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject corev1api.ObjectReference, snapshotVSC *snapshotv1api.VolumeSnapshotContent, vs *snapshotv1api.VolumeSnapshot) (*snapshotv1api.VolumeSnapshotContent, error) {
+func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject corev1api.ObjectReference, snapshotVSC *snapshotv1api.VolumeSnapshotContent, vs *snapshotv1api.VolumeSnapshot, dataMover string) (*snapshotv1api.VolumeSnapshotContent, error) {
 	backupVSCName := ownerObject.Name
 
 	anno := make(map[string]string)
@@ -583,21 +583,7 @@ func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject co
 			Source: snapshotv1api.VolumeSnapshotContentSource{
 				SnapshotHandle: snapshotVSC.Status.SnapshotHandle,
 			},
-			// The backup VSC is statically provisioned against the same
-			// snapshot handle as the source VSC, so both objects refer to one
-			// physical snapshot. Inherit the source's deletion policy instead
-			// of forcing Delete, otherwise a user who configured Retain on the
-			// VolumeSnapshotClass still loses the snapshot when the backup VSC
-			// is cleaned up.
-			//
-			// For Case 2 storages per the design (design/block-data-mover/block-data-mover.md,
-			// e.g. Ceph RBD), inheriting Retain is not just an option but a requirement for
-			// incrementals to work at all: rbd snap diff needs the base and target snapshots
-			// in the same clone chain, so Delete destroys the base as soon as this backup
-			// completes. The next incremental's delta query then fails and degrades to an
-			// allocated-blocks backup (see the CBT tier ladder) or, without that fix, a full
-			// whole-device transfer.
-			DeletionPolicy:          snapshotVSC.Spec.DeletionPolicy,
+			DeletionPolicy:          backupVSCDeletionPolicy(snapshotVSC, dataMover),
 			Driver:                  snapshotVSC.Spec.Driver,
 			VolumeSnapshotClassName: snapshotVSC.Spec.VolumeSnapshotClassName,
 		},
@@ -615,6 +601,24 @@ func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject co
 	}
 
 	return e.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, vsc, metav1.CreateOptions{})
+}
+
+// backupVSCDeletionPolicy returns the deletion policy of the backup VSC, which is
+// statically provisioned against the same snapshot handle as the source VSC.
+//
+// The block data mover keeps the snapshot when the VolumeSnapshotClass has
+// deletionPolicy Retain. Some storages, e.g. Ceph RBD, need the snapshot of the
+// previous backup to calculate the changed blocks of the next incremental backup
+// (see "Volume Snapshot Retention" in design/block-data-mover/block-data-mover.md),
+// so with Delete the next incremental backup can't use it as the base.
+//
+// Other data movers never use the snapshot after the backup, so the snapshot is
+// always deleted when the backup VSC is cleaned up.
+func backupVSCDeletionPolicy(snapshotVSC *snapshotv1api.VolumeSnapshotContent, dataMover string) snapshotv1api.DeletionPolicy {
+	if datamover.IsVeleroBlockDataMover(dataMover) {
+		return snapshotVSC.Spec.DeletionPolicy
+	}
+	return snapshotv1api.VolumeSnapshotContentDelete
 }
 
 func (e *csiSnapshotExposer) createBackupPVC(ctx context.Context, ownerObject corev1api.ObjectReference, backupVS, storageClass, accessMode string, resource resource.Quantity, readOnly bool, readWriteOncePod bool, annotations map[string]string, dataMover string) (*corev1api.PersistentVolumeClaim, error) {

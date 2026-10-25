@@ -150,6 +150,9 @@ func TestExpose(t *testing.T) {
 		"snapshot.storage.kubernetes.io/managed-by": "worker",
 	}
 
+	vscObjRetain := vscObj.DeepCopy()
+	vscObjRetain.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
+
 	daemonSet := &appsv1api.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "velero",
@@ -225,6 +228,7 @@ func TestExpose(t *testing.T) {
 		expectedBackupPVCStorageClass string
 		expectedAffinity              *corev1api.Affinity
 		expectedPVCAnnotation         map[string]string
+		expectedBackupVSCPolicy       snapshotv1api.DeletionPolicy
 	}{
 		{
 			name:        "get volume topology fail",
@@ -1163,6 +1167,86 @@ func TestExpose(t *testing.T) {
 					},
 				},
 			},
+		}, {
+			name:        "block data mover keeps the snapshot under a Retain policy",
+			ownerBackup: backup,
+			exposeParam: CSISnapshotExposeParam{
+				SnapshotName:     "fake-vs",
+				SourceNamespace:  "fake-ns",
+				AccessMode:       AccessModeFileSystem,
+				OperationTimeout: time.Millisecond,
+				ExposeTimeout:    time.Millisecond,
+				StorageClass:     "fake-sc",
+				SourcePVName:     "fake-pv",
+				DataMover:        datamover.DataMoverTypeVeleroBlock,
+			},
+			snapshotClientObj: []runtime.Object{
+				vsObject,
+				vscObjRetain,
+			},
+			expectedBackupVSCPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+			kubeClientObj: []runtime.Object{
+				daemonSet,
+				scObj,
+				sourcePV,
+			},
+			expectedAffinity: &corev1api.Affinity{
+				NodeAffinity: &corev1api.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1api.NodeSelector{
+						NodeSelectorTerms: []corev1api.NodeSelectorTerm{
+							{
+								MatchExpressions: []corev1api.NodeSelectorRequirement{
+									{
+										Key:      corev1api.LabelOSStable,
+										Operator: corev1api.NodeSelectorOpNotIn,
+										Values:   []string{"windows"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}, {
+			name:        "fs data mover deletes the snapshot under a Retain policy",
+			ownerBackup: backup,
+			exposeParam: CSISnapshotExposeParam{
+				SnapshotName:     "fake-vs",
+				SourceNamespace:  "fake-ns",
+				AccessMode:       AccessModeFileSystem,
+				OperationTimeout: time.Millisecond,
+				ExposeTimeout:    time.Millisecond,
+				StorageClass:     "fake-sc",
+				SourcePVName:     "fake-pv",
+				DataMover:        datamover.DataMoverTypeVeleroFs,
+			},
+			snapshotClientObj: []runtime.Object{
+				vsObject,
+				vscObjRetain,
+			},
+			expectedBackupVSCPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+			kubeClientObj: []runtime.Object{
+				daemonSet,
+				scObj,
+				sourcePV,
+			},
+			expectedAffinity: &corev1api.Affinity{
+				NodeAffinity: &corev1api.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1api.NodeSelector{
+						NodeSelectorTerms: []corev1api.NodeSelectorTerm{
+							{
+								MatchExpressions: []corev1api.NodeSelectorRequirement{
+									{
+										Key:      corev1api.LabelOSStable,
+										Operator: corev1api.NodeSelectorOpNotIn,
+										Values:   []string{"windows"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -1222,7 +1306,11 @@ func TestExpose(t *testing.T) {
 
 				assert.Equal(t, anno, backupVSC.Annotations)
 				assert.Equal(t, vscObj.Labels, backupVSC.Labels)
-				assert.Equal(t, vscObj.Spec.DeletionPolicy, backupVSC.Spec.DeletionPolicy)
+				if test.expectedBackupVSCPolicy != "" {
+					assert.Equal(t, test.expectedBackupVSCPolicy, backupVSC.Spec.DeletionPolicy)
+				} else {
+					assert.Equal(t, vscObj.Spec.DeletionPolicy, backupVSC.Spec.DeletionPolicy)
+				}
 				assert.Equal(t, vscObj.Spec.Driver, backupVSC.Spec.Driver)
 				assert.Equal(t, *vscObj.Spec.VolumeSnapshotClassName, *backupVSC.Spec.VolumeSnapshotClassName)
 
@@ -2571,21 +2659,41 @@ func TestBackupPodCBTServiceSAFlagMatchesDatamoverBackupFlags(t *testing.T) {
 func TestCreateBackupVSCDeletionPolicy(t *testing.T) {
 	tests := []struct {
 		name           string
+		dataMover      string
 		sourcePolicy   snapshotv1api.DeletionPolicy
 		expectedPolicy snapshotv1api.DeletionPolicy
 	}{
 		{
-			name:           "Delete policy is inherited",
+			name:           "block data mover inherits Delete policy",
+			dataMover:      datamover.DataMoverTypeVeleroBlock,
 			sourcePolicy:   snapshotv1api.VolumeSnapshotContentDelete,
 			expectedPolicy: snapshotv1api.VolumeSnapshotContentDelete,
 		},
 		{
-			// The backup VSC points at the same snapshot handle as the source
-			// VSC, so forcing Delete here would destroy a snapshot the user
-			// asked to keep.
-			name:           "Retain policy is inherited",
+			// The next incremental backup of the block data mover may need the
+			// snapshot as its base, so it is kept as the VolumeSnapshotClass asks.
+			name:           "block data mover inherits Retain policy",
+			dataMover:      datamover.DataMoverTypeVeleroBlock,
 			sourcePolicy:   snapshotv1api.VolumeSnapshotContentRetain,
 			expectedPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+		},
+		{
+			name:           "fs data mover deletes the snapshot under a Retain policy",
+			dataMover:      datamover.DataMoverTypeVeleroFs,
+			sourcePolicy:   snapshotv1api.VolumeSnapshotContentRetain,
+			expectedPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+		},
+		{
+			name:           "default data mover deletes the snapshot under a Retain policy",
+			dataMover:      "",
+			sourcePolicy:   snapshotv1api.VolumeSnapshotContentRetain,
+			expectedPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+		},
+		{
+			name:           "fs data mover deletes the snapshot under a Delete policy",
+			dataMover:      datamover.DataMoverTypeVeleroFs,
+			sourcePolicy:   snapshotv1api.VolumeSnapshotContentDelete,
+			expectedPolicy: snapshotv1api.VolumeSnapshotContentDelete,
 		},
 	}
 
@@ -2619,7 +2727,7 @@ func TestCreateBackupVSCDeletionPolicy(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "fake-du", Namespace: "velero"},
 			}
 
-			backupVSC, err := exposer.createBackupVSC(t.Context(), ownerObject, sourceVSC, vs)
+			backupVSC, err := exposer.createBackupVSC(t.Context(), ownerObject, sourceVSC, vs, test.dataMover)
 			require.NoError(t, err)
 			assert.Equal(t, test.expectedPolicy, backupVSC.Spec.DeletionPolicy)
 			assert.Equal(t, handle, *backupVSC.Spec.Source.SnapshotHandle)
