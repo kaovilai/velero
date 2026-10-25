@@ -1,0 +1,1 @@
+Bound block data mover memory: cap concurrent block writes and derive the Go memory limit from the data mover pod memory limit

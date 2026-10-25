@@ -43,6 +43,7 @@ import (
 	"github.com/velero-io/velero/pkg/util/filesystem"
 	"github.com/velero-io/velero/pkg/util/kube"
 	"github.com/velero-io/velero/pkg/util/logging"
+	"github.com/velero-io/velero/pkg/util/memlimit"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -81,6 +82,8 @@ func NewBackupCommand(f client.Factory) *cobra.Command {
 
 			logger := logging.DefaultLogger(logLevel, formatFlag.Parse())
 			logger.Infof("Starting Velero data-mover backup %s (%s)", buildinfo.Version, buildinfo.FormattedGitSHA())
+
+			memlimit.SetFromContainerLimit(logger)
 
 			f.SetBasename(fmt.Sprintf("%s-%s", c.Parent().Name(), c.Name()))
 			s, err := newDataMoverBackup(logger, f, config)

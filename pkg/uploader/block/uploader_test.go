@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,28 @@ func TestNewUploader(t *testing.T) {
 	assert.Equal(t, repoWriter, blkup.repoWriter)
 	assert.Equal(t, progress, blkup.progress)
 	assert.Equal(t, log, blkup.log)
+}
+
+func TestAsyncWrites(t *testing.T) {
+	tests := []struct {
+		name       string
+		gomaxprocs int
+		expected   int
+	}{
+		{name: "single cpu", gomaxprocs: 1, expected: 1},
+		{name: "below cap", gomaxprocs: 4, expected: 4},
+		{name: "at cap", gomaxprocs: maxAsyncWrites, expected: maxAsyncWrites},
+		{name: "large node", gomaxprocs: 96, expected: maxAsyncWrites},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := runtime.GOMAXPROCS(tc.gomaxprocs)
+			defer runtime.GOMAXPROCS(prev)
+
+			assert.Equal(t, tc.expected, asyncWrites())
+		})
+	}
 }
 
 func TestGetObjectName(t *testing.T) {
@@ -360,7 +383,7 @@ func TestBlockUploaderBackup(t *testing.T) {
 				}
 
 				repoWriter.On("NewObjectWriter", mock.Anything, mock.MatchedBy(func(opt udmrepo.ObjectWriteOptions) bool {
-					return strings.HasPrefix(opt.Description, "BDEV:data-volume1-") && opt.BackupMode == backupMode
+					return strings.HasPrefix(opt.Description, "BDEV:data-volume1-") && opt.BackupMode == backupMode && opt.AsyncWrites == asyncWrites()
 				})).Return(objWriter, tc.createObjErr)
 			}
 

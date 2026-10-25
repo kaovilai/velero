@@ -46,6 +46,7 @@ import (
 	"github.com/velero-io/velero/pkg/util/filesystem"
 	"github.com/velero-io/velero/pkg/util/kube"
 	"github.com/velero-io/velero/pkg/util/logging"
+	"github.com/velero-io/velero/pkg/util/memlimit"
 
 	ctlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	ctlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -79,6 +80,8 @@ func NewRestoreCommand(f client.Factory) *cobra.Command {
 
 			logger := logging.DefaultLogger(logLevel, formatFlag.Parse())
 			logger.Infof("Starting Velero data-mover restore %s (%s)", buildinfo.Version, buildinfo.FormattedGitSHA())
+
+			memlimit.SetFromContainerLimit(logger)
 
 			f.SetBasename(fmt.Sprintf("%s-%s", c.Parent().Name(), c.Name()))
 			s, err := newdataMoverRestore(logger, f, config)
