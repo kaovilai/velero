@@ -224,6 +224,43 @@ func TestBackupDeletionControllerReconcile(t *testing.T) {
 		assert.Equal(t, "backup deletion failed: backup is still in progress", res.Status.Errors[0])
 	})
 
+	for _, phase := range []velerov1api.RestorePhase{
+		"",
+		velerov1api.RestorePhaseNew,
+		velerov1api.RestorePhaseInProgress,
+		velerov1api.RestorePhaseWaitingForPluginOperations,
+		velerov1api.RestorePhaseWaitingForPluginOperationsPartiallyFailed,
+		velerov1api.RestorePhaseFinalizing,
+		velerov1api.RestorePhaseFinalizingPartiallyFailed,
+	} {
+		t.Run(fmt.Sprintf("deleting a backup with a restore in phase %q isn't allowed", phase), func(t *testing.T) {
+			backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
+			location := builder.ForBackupStorageLocation("velero", "default").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+			running := builder.ForRestore(velerov1api.DefaultNamespace, "restore-running").Phase(phase).Backup("foo").Result()
+			done := builder.ForRestore(velerov1api.DefaultNamespace, "restore-done").Phase(velerov1api.RestorePhaseCompleted).Backup("foo").Result()
+			other := builder.ForRestore(velerov1api.DefaultNamespace, "restore-other").Phase(velerov1api.RestorePhaseInProgress).Backup("some-other-backup").Result()
+
+			td := setupBackupDeletionControllerTest(t, defaultTestDbr(), location, backup, running, done, other)
+
+			_, err := td.controller.Reconcile(t.Context(), td.req)
+			require.NoError(t, err)
+
+			res := &velerov1api.DeleteBackupRequest{}
+			require.NoError(t, td.fakeClient.Get(ctx, td.req.NamespacedName, res))
+			assert.Equal(t, "Processed", string(res.Status.Phase))
+			require.Len(t, res.Status.Errors, 1)
+			assert.Equal(t, "backup deletion failed: backup is being restored by in-progress restore(s) restore-running, retry after they finish", res.Status.Errors[0])
+
+			// the backup and its restores are kept
+			b := &velerov1api.Backup{}
+			require.NoError(t, td.fakeClient.Get(ctx, types.NamespacedName{Namespace: backup.Namespace, Name: backup.Name}, b))
+			assert.NotEqual(t, velerov1api.BackupPhaseDeleting, b.Status.Phase)
+			for _, name := range []string{"restore-running", "restore-done"} {
+				assert.NoError(t, td.fakeClient.Get(ctx, types.NamespacedName{Namespace: velerov1api.DefaultNamespace, Name: name}, &velerov1api.Restore{}))
+			}
+		})
+	}
+
 	t.Run("unable to find backup", func(t *testing.T) {
 		td := setupBackupDeletionControllerTest(t, defaultTestDbr())
 

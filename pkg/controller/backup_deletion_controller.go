@@ -183,6 +183,17 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	} else if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error getting backup")
 	}
+
+	// Don't allow deleting a backup while a restore from it is still running. Deleting the
+	// backup deletes its restores, so the running restore would be removed together with its
+	// DataDownloads, leaving a partially restored namespace and no record of what happened.
+	if restoresInProgress, err := r.restoresInProgress(ctx, backup); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "error listing restores of backup")
+	} else if len(restoresInProgress) > 0 {
+		err := r.patchDeleteBackupRequestWithError(ctx, dbr, fmt.Errorf("backup is being restored by in-progress restore(s) %s, retry after they finish", strings.Join(restoresInProgress, ", ")))
+		return ctrl.Result{}, err
+	}
+
 	// Don't allow deleting backups in read-only storage locations
 	location := &velerov1api.BackupStorageLocation{}
 	if err := r.Get(context.Background(), client.ObjectKey{
@@ -639,6 +650,31 @@ func (r *backupDeletionReconciler) patchDeleteBackupRequestWithError(ctx context
 		r.Status.Errors = []string{errors.WithMessage(err, "backup deletion failed").Error()}
 	})
 	return err
+}
+
+// restoresInProgress returns the names of the restores of the backup that have not reached a
+// terminal phase.
+func (r *backupDeletionReconciler) restoresInProgress(ctx context.Context, backup *velerov1api.Backup) ([]string, error) {
+	restoreList := &velerov1api.RestoreList{}
+	if err := r.List(ctx, restoreList, &client.ListOptions{Namespace: backup.Namespace}); err != nil {
+		return nil, err
+	}
+
+	var names []string
+	for _, restore := range restoreList.Items {
+		if restore.Spec.BackupName != backup.Name {
+			continue
+		}
+		switch restore.Status.Phase {
+		case velerov1api.RestorePhaseCompleted,
+			velerov1api.RestorePhasePartiallyFailed,
+			velerov1api.RestorePhaseFailed,
+			velerov1api.RestorePhaseFailedValidation:
+			continue
+		}
+		names = append(names, restore.Name)
+	}
+	return names, nil
 }
 
 func (r *backupDeletionReconciler) patchBackup(ctx context.Context, backup *velerov1api.Backup, mutate func(*velerov1api.Backup)) (*velerov1api.Backup, error) {
