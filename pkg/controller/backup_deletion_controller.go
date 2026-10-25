@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -190,7 +191,9 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if restoresInProgress, err := r.restoresInProgress(ctx, backup); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error listing restores of backup")
 	} else if len(restoresInProgress) > 0 {
-		err := r.patchDeleteBackupRequestWithError(ctx, dbr, fmt.Errorf("backup is being restored by in-progress restore(s) %s, retry after they finish", strings.Join(restoresInProgress, ", ")))
+		err := r.patchDeleteBackupRequestWithError(ctx, dbr, fmt.Errorf(
+			"backup is being restored by in-progress restore(s) %s; wait for them to finish or delete them with \"velero restore delete %s\", then retry",
+			strings.Join(restoresInProgress, ", "), strings.Join(restoresInProgress, " ")))
 		return ctrl.Result{}, err
 	}
 
@@ -674,6 +677,7 @@ func (r *backupDeletionReconciler) restoresInProgress(ctx context.Context, backu
 		}
 		names = append(names, restore.Name)
 	}
+	sort.Strings(names)
 	return names, nil
 }
 

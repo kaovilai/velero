@@ -249,7 +249,7 @@ func TestBackupDeletionControllerReconcile(t *testing.T) {
 			require.NoError(t, td.fakeClient.Get(ctx, td.req.NamespacedName, res))
 			assert.Equal(t, "Processed", string(res.Status.Phase))
 			require.Len(t, res.Status.Errors, 1)
-			assert.Equal(t, "backup deletion failed: backup is being restored by in-progress restore(s) restore-running, retry after they finish", res.Status.Errors[0])
+			assert.Equal(t, `backup deletion failed: backup is being restored by in-progress restore(s) restore-running; wait for them to finish or delete them with "velero restore delete restore-running", then retry`, res.Status.Errors[0])
 
 			// the backup and its restores are kept
 			b := &velerov1api.Backup{}
@@ -260,6 +260,23 @@ func TestBackupDeletionControllerReconcile(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("deleting a backup with several in-progress restores lists all of them", func(t *testing.T) {
+		backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
+		location := builder.ForBackupStorageLocation("velero", "default").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+		restoreB := builder.ForRestore(velerov1api.DefaultNamespace, "restore-b").Phase(velerov1api.RestorePhaseFinalizing).Backup("foo").Result()
+		restoreA := builder.ForRestore(velerov1api.DefaultNamespace, "restore-a").Phase(velerov1api.RestorePhaseInProgress).Backup("foo").Result()
+
+		td := setupBackupDeletionControllerTest(t, defaultTestDbr(), location, backup, restoreB, restoreA)
+
+		_, err := td.controller.Reconcile(t.Context(), td.req)
+		require.NoError(t, err)
+
+		res := &velerov1api.DeleteBackupRequest{}
+		require.NoError(t, td.fakeClient.Get(ctx, td.req.NamespacedName, res))
+		require.Len(t, res.Status.Errors, 1)
+		assert.Equal(t, `backup deletion failed: backup is being restored by in-progress restore(s) restore-a, restore-b; wait for them to finish or delete them with "velero restore delete restore-a restore-b", then retry`, res.Status.Errors[0])
+	})
 
 	t.Run("unable to find backup", func(t *testing.T) {
 		td := setupBackupDeletionControllerTest(t, defaultTestDbr())

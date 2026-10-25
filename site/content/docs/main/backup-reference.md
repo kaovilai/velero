@@ -169,6 +169,6 @@ Use the following commands to delete Velero backups:
 
 Velero backup deletion needs extra spaces in the backup storage, so make sure the backup storage is not full during the backup deletion, otherwise, the backup deletion or the following backup repository maintenance jobs may fail.  
 
-The restores of a backup are deleted together with the backup. A backup can't be deleted while it is still in progress or while a restore from it has not finished; the deletion request fails with an error and has to be retried after the backup or restore finishes (backups expired by TTL are retried automatically).  
+The restores of a backup are deleted together with the backup. A backup can't be deleted while it is still in progress or while a restore from it has not finished; the deletion request fails with an error that lists those restores and has to be retried after they finish (backups expired by TTL are retried automatically). If such a restore is stuck and will not finish, delete it with `velero restore delete <restoreName>` and then retry the backup deletion.  
 
 `kubectl delete backup <backupName> -n <veleroNamespace>`: this command will delete the backup custom resource only and will not delete any associated data from the backup storage. So it is used for limited purposes only, e.g., all the backup data has been deleted in the backup storage, you just need to clear the orphaned CRs in the cluster.  
