@@ -637,16 +637,18 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 }
 
 // Lifecycle of the volume snapshot of a CSI DataUpload, by how the DataUpload ends
-// and the deletionPolicy of its backup VolumeSnapshotContent, which comes from the
-// VolumeSnapshotClass:
+// and the deletionPolicy of its backup VolumeSnapshotContent (the VSC the exposer
+// creates for the DataUpload). That VSC inherits the deletionPolicy of the source
+// VSC, which comes from the VolumeSnapshotClass:
 //
 //	DataUpload ends        | Delete                          | Retain
 //	-----------------------+---------------------------------+------------------------------------------
 //	Completed              | the CSI driver deletes it when  | kept in the storage and recorded in
 //	                       | the node-agent cleans up the    | status.retainedSnapshot; deleted here
 //	                       | exposed snapshot                | when the backup is deleted
-//	Failed, Canceled, or   | same as Completed               | the node-agent sets the backup VSC to
-//	timed out in prepare   |                                 | Delete before the cleanup, so the CSI
+//	Failed, Canceled, or   | same as Completed               | the node-agent patches the deletionPolicy
+//	timed out in prepare   |                                 | of the backup VSC (not the class) to
+//	                       |                                 | Delete before the cleanup, so the CSI
 //	                       |                                 | driver deletes it then; nothing recorded
 //
 // When the backup is deleted, a retained snapshot is deleted after the other data
