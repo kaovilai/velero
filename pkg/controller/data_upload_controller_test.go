@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1049,6 +1050,9 @@ func TestOnDuPrepareTimeout(t *testing.T) {
 		du       *velerov2alpha1api.DataUpload
 		needErrs []error
 		expected *velerov2alpha1api.DataUpload
+		// exposePod, when set, is created as the hosting pod of the expose
+		exposePod   bool
+		expectedMsg string
 	}{
 		{
 			name:     "update fail",
@@ -1068,6 +1072,14 @@ func TestOnDuPrepareTimeout(t *testing.T) {
 			needErrs: []error{nil, nil, nil, nil},
 			expected: dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseFailed).Result(),
 		},
+		{
+			name:        "succeed with expose diagnose",
+			du:          dataUploadBuilder().Result(),
+			needErrs:    []error{nil, nil, nil, nil},
+			expected:    dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseFailed).Result(),
+			exposePod:   true,
+			expectedMsg: "timeout on preparing data upload: " + unschedulableExposePodDiagnose,
+		},
 	}
 	for _, test := range tests {
 		ctx := t.Context()
@@ -1076,6 +1088,11 @@ func TestOnDuPrepareTimeout(t *testing.T) {
 
 		err = r.client.Create(ctx, test.du)
 		require.NoError(t, err)
+
+		if test.exposePod {
+			_, err = r.kubeClient.CoreV1().Pods(test.du.Namespace).Create(ctx, unschedulableExposePod(test.du.Namespace, test.du.Name), metav1.CreateOptions{})
+			require.NoError(t, err)
+		}
 
 		r.onPrepareTimeout(ctx, test.du)
 
@@ -1086,6 +1103,28 @@ func TestOnDuPrepareTimeout(t *testing.T) {
 		}, &du)
 
 		assert.Equal(t, test.expected.Status.Phase, du.Status.Phase)
+		if test.expectedMsg != "" {
+			assert.True(t, strings.HasPrefix(du.Status.Message, test.expectedMsg), "unexpected message %q", du.Status.Message)
+		}
+	}
+}
+
+const unschedulableExposePodDiagnose = "Pod condition PodScheduled, status False, reason Unschedulable, message 0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector"
+
+func unschedulableExposePod(namespace, name string) *corev1api.Pod {
+	return &corev1api.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Status: corev1api.PodStatus{
+			Phase: corev1api.PodPending,
+			Conditions: []corev1api.PodCondition{
+				{
+					Type:    corev1api.PodScheduled,
+					Status:  corev1api.ConditionFalse,
+					Reason:  "Unschedulable",
+					Message: "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector",
+				},
+			},
+		},
 	}
 }
 

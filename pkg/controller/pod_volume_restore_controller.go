@@ -491,7 +491,7 @@ func (r *PodVolumeRestoreReconciler) onPrepareTimeout(ctx context.Context, pvr *
 
 	succeeded, err := funcExclusiveUpdatePodVolumeRestore(ctx, r.client, pvr, func(pvr *velerov1api.PodVolumeRestore) {
 		pvr.Status.Phase = velerov1api.PodVolumeRestorePhaseFailed
-		pvr.Status.Message = "timeout on preparing PVR"
+		pvr.Status.Message = pvrPrepareTimeoutMessage
 
 		delete(pvr.Labels, exposer.ExposeOnGoingLabel)
 	})
@@ -506,14 +506,40 @@ func (r *PodVolumeRestoreReconciler) onPrepareTimeout(ctx context.Context, pvr *
 		return
 	}
 
-	diags := strings.Split(r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr)), "\n")
-	for _, diag := range diags {
-		log.Warnf("[Diagnose PVR expose]%s", diag)
+	diag := r.exposer.DiagnoseExpose(ctx, getPVROwnerObject(pvr))
+	for _, line := range strings.Split(diag, "\n") {
+		log.Warnf("[Diagnose PVR expose]%s", line)
 	}
+
+	r.addPrepareTimeoutDiagnose(ctx, pvr, diag)
 
 	r.exposer.CleanUp(ctx, getPVROwnerObject(pvr))
 
 	log.Info("PVR has been cleaned up")
+}
+
+const pvrPrepareTimeoutMessage = "timeout on preparing PVR"
+
+// addPrepareTimeoutDiagnose appends the key lines of the expose diagnose to the
+// message of a PVR that failed on prepare timeout, so the cause is visible
+// without reading the node-agent log.
+func (r *PodVolumeRestoreReconciler) addPrepareTimeoutDiagnose(ctx context.Context, pvr *velerov1api.PodVolumeRestore, diag string) {
+	summary := exposer.SummarizeDiagnose(diag)
+	if summary == "" {
+		return
+	}
+
+	log := r.logger.WithField("PVR", pvr.Name)
+	if err := UpdatePVRWithRetry(ctx, r.client, types.NamespacedName{Namespace: pvr.Namespace, Name: pvr.Name}, log, func(pvr *velerov1api.PodVolumeRestore) bool {
+		if pvr.Status.Phase != velerov1api.PodVolumeRestorePhaseFailed || pvr.Status.Message != pvrPrepareTimeoutMessage {
+			return false
+		}
+
+		pvr.Status.Message = fmt.Sprintf("%s: %s", pvrPrepareTimeoutMessage, summary)
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("Failed to add expose diagnose to PVR message")
+	}
 }
 
 func (r *PodVolumeRestoreReconciler) initCancelableDataPath(ctx context.Context, asyncBR datapath.AsyncBR, res *exposer.ExposeResult, log logrus.FieldLogger) error {

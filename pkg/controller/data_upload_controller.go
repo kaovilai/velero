@@ -875,7 +875,7 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 
 	succeeded, err := funcExclusiveUpdateDataUpload(ctx, r.client, du, func(du *velerov2alpha1api.DataUpload) {
 		du.Status.Phase = velerov2alpha1api.DataUploadPhaseFailed
-		du.Status.Message = "timeout on preparing data upload"
+		du.Status.Message = dataUploadPrepareTimeoutMessage
 
 		delete(du.Labels, exposer.ExposeOnGoingLabel)
 	})
@@ -900,10 +900,12 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 			volumeSnapshotName = du.Spec.CSISnapshot.VolumeSnapshot
 		}
 
-		diags := strings.Split(ep.DiagnoseExpose(ctx, getOwnerObject(du)), "\n")
-		for _, diag := range diags {
-			log.Warnf("[Diagnose DU expose]%s", diag)
+		diag := ep.DiagnoseExpose(ctx, getOwnerObject(du))
+		for _, line := range strings.Split(diag, "\n") {
+			log.Warnf("[Diagnose DU expose]%s", line)
 		}
+
+		r.addPrepareTimeoutDiagnose(ctx, du, diag)
 
 		ep.CleanUp(ctx, getOwnerObject(du), volumeSnapshotName, du.Spec.SourceNamespace)
 
@@ -911,6 +913,30 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 	}
 
 	r.metrics.RegisterDataUploadFailure(r.nodeName)
+}
+
+const dataUploadPrepareTimeoutMessage = "timeout on preparing data upload"
+
+// addPrepareTimeoutDiagnose appends the key lines of the expose diagnose to the
+// message of a DU that failed on prepare timeout, so the cause is visible
+// without reading the node-agent log.
+func (r *DataUploadReconciler) addPrepareTimeoutDiagnose(ctx context.Context, du *velerov2alpha1api.DataUpload, diag string) {
+	summary := exposer.SummarizeDiagnose(diag)
+	if summary == "" {
+		return
+	}
+
+	log := r.logger.WithField("Dataupload", du.Name)
+	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
+		if du.Status.Phase != velerov2alpha1api.DataUploadPhaseFailed || du.Status.Message != dataUploadPrepareTimeoutMessage {
+			return false
+		}
+
+		du.Status.Message = fmt.Sprintf("%s: %s", dataUploadPrepareTimeoutMessage, summary)
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("Failed to add expose diagnose to dataupload message")
+	}
 }
 
 var funcExclusiveUpdateDataUpload = exclusiveUpdateDataUpload

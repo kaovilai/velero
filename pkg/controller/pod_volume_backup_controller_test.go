@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -831,6 +832,9 @@ func TestOnPvbPrepareTimeout(t *testing.T) {
 		pvb      *velerov1api.PodVolumeBackup
 		needErrs []error
 		expected *velerov1api.PodVolumeBackup
+		// exposePod, when set, is created as the hosting pod of the expose
+		exposePod   bool
+		expectedMsg string
 	}{
 		{
 			name:     "update fail",
@@ -850,6 +854,14 @@ func TestOnPvbPrepareTimeout(t *testing.T) {
 			needErrs: []error{nil, nil, nil, nil},
 			expected: pvbBuilder().Phase(velerov1api.PodVolumeBackupPhaseFailed).Result(),
 		},
+		{
+			name:        "succeed with expose diagnose",
+			pvb:         pvbBuilder().Result(),
+			needErrs:    []error{nil, nil, nil, nil},
+			expected:    pvbBuilder().Phase(velerov1api.PodVolumeBackupPhaseFailed).Result(),
+			exposePod:   true,
+			expectedMsg: "timeout on preparing PVB: " + unschedulableExposePodDiagnose,
+		},
 	}
 	for _, test := range tests {
 		ctx := t.Context()
@@ -858,6 +870,11 @@ func TestOnPvbPrepareTimeout(t *testing.T) {
 
 		err = r.client.Create(ctx, test.pvb)
 		require.NoError(t, err)
+
+		if test.exposePod {
+			_, err = r.kubeClient.CoreV1().Pods(test.pvb.Namespace).Create(ctx, unschedulableExposePod(test.pvb.Namespace, test.pvb.Name), metav1.CreateOptions{})
+			require.NoError(t, err)
+		}
 
 		r.onPrepareTimeout(ctx, test.pvb)
 
@@ -868,6 +885,9 @@ func TestOnPvbPrepareTimeout(t *testing.T) {
 		}, &pvb)
 
 		assert.Equal(t, test.expected.Status.Phase, pvb.Status.Phase)
+		if test.expectedMsg != "" {
+			assert.True(t, strings.HasPrefix(pvb.Status.Message, test.expectedMsg), "unexpected message %q", pvb.Status.Message)
+		}
 	}
 }
 

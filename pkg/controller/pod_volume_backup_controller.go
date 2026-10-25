@@ -473,7 +473,7 @@ func (r *PodVolumeBackupReconciler) onPrepareTimeout(ctx context.Context, pvb *v
 
 	succeeded, err := funcExclusiveUpdatePodVolumeBackup(ctx, r.client, pvb, func(pvb *velerov1api.PodVolumeBackup) {
 		pvb.Status.Phase = velerov1api.PodVolumeBackupPhaseFailed
-		pvb.Status.Message = "timeout on preparing PVB"
+		pvb.Status.Message = pvbPrepareTimeoutMessage
 
 		delete(pvb.Labels, exposer.ExposeOnGoingLabel)
 	})
@@ -488,14 +488,40 @@ func (r *PodVolumeBackupReconciler) onPrepareTimeout(ctx context.Context, pvb *v
 		return
 	}
 
-	diags := strings.Split(r.exposer.DiagnoseExpose(ctx, getPVBOwnerObject(pvb)), "\n")
-	for _, diag := range diags {
-		log.Warnf("[Diagnose PVB expose]%s", diag)
+	diag := r.exposer.DiagnoseExpose(ctx, getPVBOwnerObject(pvb))
+	for _, line := range strings.Split(diag, "\n") {
+		log.Warnf("[Diagnose PVB expose]%s", line)
 	}
+
+	r.addPrepareTimeoutDiagnose(ctx, pvb, diag)
 
 	r.exposer.CleanUp(ctx, getPVBOwnerObject(pvb))
 
 	log.Info("PVB has been cleaned up")
+}
+
+const pvbPrepareTimeoutMessage = "timeout on preparing PVB"
+
+// addPrepareTimeoutDiagnose appends the key lines of the expose diagnose to the
+// message of a PVB that failed on prepare timeout, so the cause is visible
+// without reading the node-agent log.
+func (r *PodVolumeBackupReconciler) addPrepareTimeoutDiagnose(ctx context.Context, pvb *velerov1api.PodVolumeBackup, diag string) {
+	summary := exposer.SummarizeDiagnose(diag)
+	if summary == "" {
+		return
+	}
+
+	log := r.logger.WithField("PVB", pvb.Name)
+	if err := UpdatePVBWithRetry(ctx, r.client, types.NamespacedName{Namespace: pvb.Namespace, Name: pvb.Name}, log, func(pvb *velerov1api.PodVolumeBackup) bool {
+		if pvb.Status.Phase != velerov1api.PodVolumeBackupPhaseFailed || pvb.Status.Message != pvbPrepareTimeoutMessage {
+			return false
+		}
+
+		pvb.Status.Message = fmt.Sprintf("%s: %s", pvbPrepareTimeoutMessage, summary)
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("Failed to add expose diagnose to PVB message")
+	}
 }
 
 func (r *PodVolumeBackupReconciler) initCancelableDataPath(ctx context.Context, asyncBR datapath.AsyncBR, res *exposer.ExposeResult, log logrus.FieldLogger) error {

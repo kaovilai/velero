@@ -834,7 +834,7 @@ func (r *DataDownloadReconciler) onPrepareTimeout(ctx context.Context, dd *veler
 	log.Info("Timeout happened for preparing datadownload")
 	succeeded, err := funcExclusiveUpdateDataDownload(ctx, r.client, dd, func(dd *velerov2alpha1api.DataDownload) {
 		dd.Status.Phase = velerov2alpha1api.DataDownloadPhaseFailed
-		dd.Status.Message = "timeout on preparing data download"
+		dd.Status.Message = dataDownloadPrepareTimeoutMessage
 
 		delete(dd.Labels, exposer.ExposeOnGoingLabel)
 	})
@@ -849,10 +849,12 @@ func (r *DataDownloadReconciler) onPrepareTimeout(ctx context.Context, dd *veler
 		return
 	}
 
-	diags := strings.Split(r.restoreExposer.DiagnoseExpose(ctx, getDataDownloadOwnerObject(dd)), "\n")
-	for _, diag := range diags {
-		log.Warnf("[Diagnose DD expose]%s", diag)
+	diag := r.restoreExposer.DiagnoseExpose(ctx, getDataDownloadOwnerObject(dd))
+	for _, line := range strings.Split(diag, "\n") {
+		log.Warnf("[Diagnose DD expose]%s", line)
 	}
+
+	r.addPrepareTimeoutDiagnose(ctx, dd, diag)
 
 	r.restoreExposer.CleanUp(ctx, getDataDownloadOwnerObject(dd), &exposer.GenericRestoreCleanUpParam{
 		Snapshot: dd.Spec.CSISnapshot,
@@ -861,6 +863,30 @@ func (r *DataDownloadReconciler) onPrepareTimeout(ctx context.Context, dd *veler
 	log.Info("Datadownload has been cleaned up")
 
 	r.metrics.RegisterDataDownloadFailure(r.nodeName)
+}
+
+const dataDownloadPrepareTimeoutMessage = "timeout on preparing data download"
+
+// addPrepareTimeoutDiagnose appends the key lines of the expose diagnose to the
+// message of a DD that failed on prepare timeout, so the cause is visible
+// without reading the node-agent log.
+func (r *DataDownloadReconciler) addPrepareTimeoutDiagnose(ctx context.Context, dd *velerov2alpha1api.DataDownload, diag string) {
+	summary := exposer.SummarizeDiagnose(diag)
+	if summary == "" {
+		return
+	}
+
+	log := r.logger.WithField("DataDownload", dd.Name)
+	if err := UpdateDataDownloadWithRetry(ctx, r.client, types.NamespacedName{Namespace: dd.Namespace, Name: dd.Name}, log, func(dd *velerov2alpha1api.DataDownload) bool {
+		if dd.Status.Phase != velerov2alpha1api.DataDownloadPhaseFailed || dd.Status.Message != dataDownloadPrepareTimeoutMessage {
+			return false
+		}
+
+		dd.Status.Message = fmt.Sprintf("%s: %s", dataDownloadPrepareTimeoutMessage, summary)
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("Failed to add expose diagnose to datadownload message")
+	}
 }
 
 var funcExclusiveUpdateDataDownload = exclusiveUpdateDataDownload

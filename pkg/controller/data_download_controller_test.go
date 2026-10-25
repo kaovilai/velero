@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -967,6 +968,9 @@ func TestOnDdPrepareTimeout(t *testing.T) {
 		dd       *velerov2alpha1api.DataDownload
 		needErrs []error
 		expected *velerov2alpha1api.DataDownload
+		// exposePod, when set, is created as the hosting pod of the expose
+		exposePod   bool
+		expectedMsg string
 	}{
 		{
 			name:     "update fail",
@@ -986,6 +990,14 @@ func TestOnDdPrepareTimeout(t *testing.T) {
 			needErrs: []error{nil, nil, nil, nil},
 			expected: dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseFailed).Result(),
 		},
+		{
+			name:        "succeed with expose diagnose",
+			dd:          dataDownloadBuilder().Result(),
+			needErrs:    []error{nil, nil, nil, nil},
+			expected:    dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseFailed).Result(),
+			exposePod:   true,
+			expectedMsg: "timeout on preparing data download: " + unschedulableExposePodDiagnose,
+		},
 	}
 	for _, test := range tests {
 		ctx := t.Context()
@@ -994,6 +1006,11 @@ func TestOnDdPrepareTimeout(t *testing.T) {
 
 		err = r.client.Create(ctx, test.dd)
 		require.NoError(t, err)
+
+		if test.exposePod {
+			_, err = r.kubeClient.CoreV1().Pods(test.dd.Namespace).Create(ctx, unschedulableExposePod(test.dd.Namespace, test.dd.Name), metav1.CreateOptions{})
+			require.NoError(t, err)
+		}
 
 		r.onPrepareTimeout(ctx, test.dd)
 
@@ -1004,6 +1021,9 @@ func TestOnDdPrepareTimeout(t *testing.T) {
 		}, &dd)
 
 		assert.Equal(t, test.expected.Status.Phase, dd.Status.Phase)
+		if test.expectedMsg != "" {
+			assert.True(t, strings.HasPrefix(dd.Status.Message, test.expectedMsg), "unexpected message %q", dd.Status.Message)
+		}
 	}
 }
 
