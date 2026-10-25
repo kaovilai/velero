@@ -63,7 +63,6 @@ func mockBackupOperationsReconciler(fakeClient kbclient.Client, fakeClock *testc
 		NewFakeSingleObjectBackupStoreGetter(backupStore),
 		metrics.NewServerMetrics(),
 		itemoperationmap.NewBackupItemOperationsMap(),
-		NewBackupTracker(),
 		10*time.Minute,
 	)
 	abor.clock = fakeClock
@@ -390,8 +389,6 @@ func TestBackupOperationsReconcile_PersistFailureTimeout(t *testing.T) {
 	localPluginManager := &pluginmocks.Manager{}
 	localBackupStore := &persistencemocks.BackupStore{}
 	localBIA := &biav2mocks.BackupItemAction{}
-	tracker := NewBackupTracker()
-	tracker.AddPostProcessing(backup.Namespace, backup.Name)
 
 	reconciler := NewBackupOperationsReconciler(
 		logrus.StandardLogger(),
@@ -401,7 +398,6 @@ func TestBackupOperationsReconcile_PersistFailureTimeout(t *testing.T) {
 		NewFakeSingleObjectBackupStoreGetter(localBackupStore),
 		metrics.NewServerMetrics(),
 		itemoperationmap.NewBackupItemOperationsMap(),
-		tracker,
 		resourceTimeout,
 	)
 	reconciler.clock = fakeClock
@@ -424,7 +420,6 @@ func TestBackupOperationsReconcile_PersistFailureTimeout(t *testing.T) {
 	_, err := reconciler.Reconcile(t.Context(), req)
 	require.Error(t, err)
 	assert.Equal(t, velerov1api.BackupPhaseWaitingForPluginOperationsPartiallyFailed, getBackup().Status.Phase)
-	assert.True(t, tracker.Contains(backup.Namespace, backup.Name))
 
 	// Still within the resource timeout: still retried.
 	fakeClock.Step(resourceTimeout / 2)
@@ -441,5 +436,4 @@ func TestBackupOperationsReconcile_PersistFailureTimeout(t *testing.T) {
 	assert.Contains(t, backupAfter.Status.FailureReason, `backup storage location "default"`)
 	assert.Contains(t, backupAfter.Status.FailureReason, "QuotaExceeded")
 	assert.NotNil(t, backupAfter.Status.CompletionTimestamp)
-	assert.False(t, tracker.Contains(backup.Namespace, backup.Name))
 }

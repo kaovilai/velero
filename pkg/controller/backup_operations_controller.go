@@ -59,9 +59,10 @@ type backupOperationsReconciler struct {
 	newPluginManager  func(logger logrus.FieldLogger) clientmgmt.Manager
 	backupStoreGetter persistence.ObjectBackupStoreGetter
 	metrics           *metrics.ServerMetrics
-	backupTracker     BackupTracker
-	resourceTimeout   time.Duration
-	persistFailures   *persistFailureTracker
+	// persistTimeout is how long writing the backup metadata to the backup
+	// storage location may keep failing before the backup is marked Failed.
+	persistTimeout  time.Duration
+	persistFailures *persistFailureTracker
 }
 
 func NewBackupOperationsReconciler(
@@ -72,7 +73,6 @@ func NewBackupOperationsReconciler(
 	backupStoreGetter persistence.ObjectBackupStoreGetter,
 	metrics *metrics.ServerMetrics,
 	itemOperationsMap *itemoperationmap.BackupItemOperationsMap,
-	backupTracker BackupTracker,
 	resourceTimeout time.Duration,
 ) *backupOperationsReconciler {
 	abor := &backupOperationsReconciler{
@@ -84,15 +84,14 @@ func NewBackupOperationsReconciler(
 		newPluginManager:  newPluginManager,
 		backupStoreGetter: backupStoreGetter,
 		metrics:           metrics,
-		backupTracker:     backupTracker,
-		resourceTimeout:   resourceTimeout,
+		persistTimeout:    resourceTimeout,
 		persistFailures:   newPersistFailureTracker(),
 	}
 	if abor.frequency <= 0 {
 		abor.frequency = defaultBackupOperationsFrequency
 	}
-	if abor.resourceTimeout <= 0 {
-		abor.resourceTimeout = serverconfig.DefaultResourceTimeout
+	if abor.persistTimeout <= 0 {
+		abor.persistTimeout = serverconfig.DefaultResourceTimeout
 	}
 	return abor
 }
@@ -286,12 +285,6 @@ func (c *backupOperationsReconciler) updateBackupAndOperationsJSON(
 			removeIfComplete = false
 			return errors.Wrapf(err, "error updating Backup %s", backup.Name)
 		}
-		switch backup.Status.Phase {
-		case velerov1api.BackupPhaseCompleted, velerov1api.BackupPhasePartiallyFailed, velerov1api.BackupPhaseFailed:
-			// The finalizer controller won't process this backup, so release
-			// it here; otherwise it can't be deleted until the server restarts.
-			c.backupTracker.Delete(backup.Namespace, backup.Name)
-		}
 	} else if completionChanges {
 		// If backup is still incomplete and no new errors are found but there are some new operations
 		// completed, patch backup to reflect new completion numbers, but don't upload detailed json file
@@ -328,9 +321,9 @@ func (c *backupOperationsReconciler) failOnPersistTimeout(backup *velerov1api.Ba
 	now := c.clock.Now()
 	failingFor := c.persistFailures.failingFor(backup.UID, now)
 	log := c.logger.WithField("backup", kube.NamespaceAndName(backup))
-	if failingFor < c.resourceTimeout {
+	if failingFor < c.persistTimeout {
 		log.WithError(err).Warnf("Unable to write backup metadata to backup storage location %q, will retry; the backup will be marked Failed if this persists for %s",
-			backup.Spec.StorageLocation, c.resourceTimeout)
+			backup.Spec.StorageLocation, c.persistTimeout)
 		return false
 	}
 	c.persistFailures.clear(backup.UID)

@@ -77,6 +77,7 @@ func TestBackupFinalizerReconcileRunsTerminalVGSCleanup(t *testing.T) {
 		client:         client,
 		globalCRClient: velerotest.NewFakeControllerRuntimeClient(t, backup),
 		log:            logrus.New(),
+		backupTracker:  NewBackupTracker(),
 	}
 
 	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{
@@ -127,6 +128,7 @@ func TestBackupFinalizerReconcileCleansVGSAfterFailedBackup(t *testing.T) {
 		client:         client,
 		globalCRClient: globalClient,
 		log:            logrus.New(),
+		backupTracker:  NewBackupTracker(),
 	}
 
 	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{
@@ -565,6 +567,29 @@ func TestBackupFinalizerReconcile_PutBackupContentsFail(t *testing.T) {
 				"backup phase should remain %s when PutBackupContents fails", test.initialPhase)
 			assert.Nil(t, backupAfter.Status.CompletionTimestamp,
 				"CompletionTimestamp should not be set when PutBackupContents fails")
+		})
+	}
+}
+
+// A backup that reaches a terminal phase outside the finalizer controller (e.g.
+// failed by the backup operations controller because its metadata can't be
+// written to the backup storage location) is released from the backup tracker
+// when the finalizer controller sees it.
+func TestBackupFinalizerReconcileReleasesTerminalBackupFromTracker(t *testing.T) {
+	for _, phase := range []velerov1api.BackupPhase{
+		velerov1api.BackupPhaseCompleted,
+		velerov1api.BackupPhasePartiallyFailed,
+		velerov1api.BackupPhaseFailed,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-1").Phase(phase).Result()
+			fakeClient := velerotest.NewFakeControllerRuntimeClient(t, backup)
+			reconciler, _ := mockBackupFinalizerReconciler(fakeClient, fakeClient, testclocks.NewFakeClock(time.Now()))
+			reconciler.backupTracker.AddPostProcessing(backup.Namespace, backup.Name)
+
+			_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backup.Namespace, Name: backup.Name}})
+			require.NoError(t, err)
+			assert.False(t, reconciler.backupTracker.Contains(backup.Namespace, backup.Name))
 		})
 	}
 }

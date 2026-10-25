@@ -71,7 +71,10 @@ type backupFinalizerReconciler struct {
 	backupStoreGetter persistence.ObjectBackupStoreGetter
 	log               logrus.FieldLogger
 	resourceTimeout   time.Duration
-	persistFailures   *persistFailureTracker
+	// persistTimeout is how long writing the finalized backup to the backup
+	// storage location may keep failing before the backup is marked Failed.
+	persistTimeout  time.Duration
+	persistFailures *persistFailureTracker
 }
 
 // NewBackupFinalizerReconciler initializes and returns backupFinalizerReconciler struct.
@@ -87,8 +90,9 @@ func NewBackupFinalizerReconciler(
 	metrics *metrics.ServerMetrics,
 	resourceTimeout time.Duration,
 ) *backupFinalizerReconciler {
-	if resourceTimeout <= 0 {
-		resourceTimeout = serverconfig.DefaultResourceTimeout
+	persistTimeout := resourceTimeout
+	if persistTimeout <= 0 {
+		persistTimeout = serverconfig.DefaultResourceTimeout
 	}
 	return &backupFinalizerReconciler{
 		client:            client,
@@ -100,7 +104,7 @@ func NewBackupFinalizerReconciler(
 		backupStoreGetter: backupStoreGetter,
 		log:               log,
 		metrics:           metrics,
-		resourceTimeout:   resourceTimeout,
+		persistTimeout:    persistTimeout,
 		persistFailures:   newPersistFailureTracker(),
 	}
 }
@@ -128,6 +132,12 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	switch backup.Status.Phase {
 	case velerov1api.BackupPhaseCompleted, velerov1api.BackupPhasePartiallyFailed, velerov1api.BackupPhaseFailed:
+		// A backup can reach a terminal phase outside this controller, e.g. the
+		// backup operations controller fails it when its metadata can't be written
+		// to the backup storage location. Release it from the tracker here so this
+		// controller stays the one that releases backups after post-processing;
+		// otherwise the backup can't be deleted until the server restarts.
+		r.backupTracker.Delete(backup.Namespace, backup.Name)
 		// Terminal status is persisted only after the finalized archive has been
 		// uploaded. Run group cleanup on this subsequent reconciliation so a
 		// cleanup failure/restart retries deletion, not archive generation using
@@ -323,7 +333,7 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 func (r *backupFinalizerReconciler) handlePersistError(backup *velerov1api.Backup, err error, log logrus.FieldLogger) (ctrl.Result, error) {
 	now := r.clock.Now()
 	failingFor := r.persistFailures.failingFor(backup.UID, now)
-	if failingFor < r.resourceTimeout {
+	if failingFor < r.persistTimeout {
 		return ctrl.Result{}, err
 	}
 	r.persistFailures.clear(backup.UID)
