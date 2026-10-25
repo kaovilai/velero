@@ -1,0 +1,1 @@
+Store --resource-timeout in the backup finalizer controller so its final status patch retry is bounded instead of blocking a worker for hours when the patch keeps failing
