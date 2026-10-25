@@ -1899,3 +1899,244 @@ func TestInvalidateBackupReposForBSL(t *testing.T) {
 		require.Empty(t, reqs)
 	})
 }
+
+func TestDueForMaintenance(t *testing.T) {
+	now := time.Now().Round(time.Second)
+
+	failedAt := func(start time.Time, complete *time.Time) velerov1api.BackupRepositoryMaintenanceStatus {
+		status := velerov1api.BackupRepositoryMaintenanceStatus{
+			StartTimestamp: &metav1.Time{Time: start},
+			Result:         velerov1api.BackupRepositoryMaintenanceFailed,
+		}
+		if complete != nil {
+			status.CompleteTimestamp = &metav1.Time{Time: *complete}
+		}
+		return status
+	}
+	succeededAt := func(start time.Time) velerov1api.BackupRepositoryMaintenanceStatus {
+		return velerov1api.BackupRepositoryMaintenanceStatus{
+			StartTimestamp:    &metav1.Time{Time: start},
+			CompleteTimestamp: &metav1.Time{Time: start.Add(time.Minute)},
+			Result:            velerov1api.BackupRepositoryMaintenanceSucceeded,
+		}
+	}
+	ptr := func(t time.Time) *time.Time { return &t }
+
+	tests := []struct {
+		name                string
+		frequency           time.Duration
+		lastMaintenanceTime *time.Time
+		history             []velerov1api.BackupRepositoryMaintenanceStatus
+		expected            bool
+	}{
+		{
+			name:      "never maintained",
+			frequency: time.Hour,
+			expected:  true,
+		},
+		{
+			name:                "frequency not elapsed",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-30 * time.Minute)),
+			expected:            false,
+		},
+		{
+			name:                "frequency elapsed, no failure",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-61 * time.Minute)),
+			history:             []velerov1api.BackupRepositoryMaintenanceStatus{succeededAt(now.Add(-62 * time.Minute))},
+			expected:            true,
+		},
+		{
+			name:                "frequency elapsed, failure followed by success",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-61 * time.Minute)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				failedAt(now.Add(-3*time.Hour), nil),
+				succeededAt(now.Add(-62 * time.Minute)),
+			},
+			expected: true,
+		},
+		{
+			name:                "one failure, within base backoff",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-2 * time.Hour)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				succeededAt(now.Add(-2 * time.Hour)),
+				failedAt(now.Add(-4*time.Minute), ptr(now.Add(-3*time.Minute))),
+			},
+			expected: false,
+		},
+		{
+			name:                "one failure, base backoff elapsed",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-2 * time.Hour)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				succeededAt(now.Add(-2 * time.Hour)),
+				failedAt(now.Add(-7*time.Minute), ptr(now.Add(-6*time.Minute))),
+			},
+			expected: true,
+		},
+		{
+			name:                "failure to start the job uses the start time",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-2 * time.Hour)),
+			history:             []velerov1api.BackupRepositoryMaintenanceStatus{failedAt(now.Add(-4*time.Minute), nil)},
+			expected:            false,
+		},
+		{
+			name:                "three failures, within doubled backoff",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-2 * time.Hour)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				failedAt(now.Add(-40*time.Minute), nil),
+				failedAt(now.Add(-30*time.Minute), nil),
+				failedAt(now.Add(-15*time.Minute), nil),
+			},
+			expected: false,
+		},
+		{
+			name:                "three failures, doubled backoff elapsed",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-2 * time.Hour)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				failedAt(now.Add(-60*time.Minute), nil),
+				failedAt(now.Add(-50*time.Minute), nil),
+				failedAt(now.Add(-21*time.Minute), nil),
+			},
+			expected: true,
+		},
+		{
+			name:                "many failures, backoff capped by frequency, not elapsed",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-10 * time.Hour)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				failedAt(now.Add(-5*time.Hour), nil),
+				failedAt(now.Add(-4*time.Hour), nil),
+				failedAt(now.Add(-3*time.Hour), nil),
+				failedAt(now.Add(-2*time.Hour), nil),
+				failedAt(now.Add(-59*time.Minute), nil),
+			},
+			expected: false,
+		},
+		{
+			name:                "many failures, backoff capped by frequency, elapsed",
+			frequency:           time.Hour,
+			lastMaintenanceTime: ptr(now.Add(-10 * time.Hour)),
+			history: []velerov1api.BackupRepositoryMaintenanceStatus{
+				failedAt(now.Add(-5*time.Hour), nil),
+				failedAt(now.Add(-4*time.Hour), nil),
+				failedAt(now.Add(-3*time.Hour), nil),
+				failedAt(now.Add(-2*time.Hour), nil),
+				failedAt(now.Add(-61*time.Minute), nil),
+			},
+			expected: true,
+		},
+		{
+			name:                "frequency shorter than base backoff",
+			frequency:           2 * time.Minute,
+			lastMaintenanceTime: ptr(now.Add(-time.Hour)),
+			history:             []velerov1api.BackupRepositoryMaintenanceStatus{failedAt(now.Add(-3*time.Minute), nil)},
+			expected:            true,
+		},
+		{
+			name:      "never maintained, within backoff",
+			frequency: time.Hour,
+			history:   []velerov1api.BackupRepositoryMaintenanceStatus{failedAt(now.Add(-time.Minute), nil)},
+			expected:  false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo := mockBackupRepositoryCR()
+			repo.Spec.MaintenanceFrequency = metav1.Duration{Duration: test.frequency}
+			if test.lastMaintenanceTime != nil {
+				repo.Status.LastMaintenanceTime = &metav1.Time{Time: *test.lastMaintenanceTime}
+			}
+			repo.Status.RecentMaintenance = test.history
+
+			assert.Equal(t, test.expected, dueForMaintenance(repo, now))
+		})
+	}
+}
+
+func TestMaintenanceRetryBackoff(t *testing.T) {
+	tests := []struct {
+		failures  int
+		frequency time.Duration
+		expected  time.Duration
+	}{
+		{failures: 1, frequency: time.Hour, expected: 5 * time.Minute},
+		{failures: 2, frequency: time.Hour, expected: 10 * time.Minute},
+		{failures: 4, frequency: time.Hour, expected: 40 * time.Minute},
+		{failures: 5, frequency: time.Hour, expected: time.Hour},
+		{failures: 25, frequency: time.Hour, expected: time.Hour},
+		{failures: 1, frequency: 2 * time.Minute, expected: 2 * time.Minute},
+		{failures: 25, frequency: 0, expected: defaultMaintainFrequency},
+	}
+
+	for _, test := range tests {
+		assert.Equal(t, test.expected, maintenanceRetryBackoff(test.failures, test.frequency), "failures %d, frequency %v", test.failures, test.frequency)
+	}
+}
+
+func TestReconcileSkipsMaintenanceForUnavailableBSL(t *testing.T) {
+	now := time.Now().Round(time.Second)
+
+	tests := []struct {
+		name          string
+		bslPhase      velerov1api.BackupStorageLocationPhase
+		expectStarted bool
+	}{
+		{
+			name:          "BSL unavailable",
+			bslPhase:      velerov1api.BackupStorageLocationPhaseUnavailable,
+			expectStarted: false,
+		},
+		{
+			name:          "BSL available",
+			bslPhase:      velerov1api.BackupStorageLocationPhaseAvailable,
+			expectStarted: true,
+		},
+		{
+			name:          "BSL not validated yet",
+			expectStarted: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bsl := &velerov1api.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: velerov1api.DefaultNamespace,
+					Name:      "default",
+				},
+				Status: velerov1api.BackupStorageLocationStatus{
+					Phase: test.bslPhase,
+				},
+			}
+			repo := mockBackupRepositoryCR()
+			repo.Spec.BackupStorageLocation = bsl.Name
+			repo.Spec.RepositoryType = velerov1api.BackupRepositoryTypeKopia
+			repo.Status.Phase = velerov1api.BackupRepositoryPhaseReady
+			repo.Status.LastMaintenanceTime = &metav1.Time{Time: now.Add(-time.Hour)}
+
+			reconciler := mockBackupRepoReconciler(t, "UnlockRepo", mock.Anything, nil)
+			reconciler.clock = &fakeClock{now}
+			require.NoError(t, reconciler.Client.Create(t.Context(), bsl))
+			require.NoError(t, reconciler.Client.Create(t.Context(), repo))
+
+			started := false
+			funcStartMaintenanceJob = func(client.Client, context.Context, *velerov1api.BackupRepository, string, logrus.Level, *logging.FormatFlag, logrus.FieldLogger) (string, error) {
+				started = true
+				return "", errors.New("fake-start-error")
+			}
+			defer func() { funcStartMaintenanceJob = maintenance.StartNewJob }()
+
+			_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: repo.Namespace, Name: repo.Name}})
+			require.NoError(t, err)
+			assert.Equal(t, test.expectStarted, started)
+		})
+	}
+}

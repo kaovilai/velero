@@ -53,6 +53,9 @@ const (
 	repoSyncPeriod                      = 5 * time.Minute
 	defaultMaintainFrequency            = 7 * 24 * time.Hour
 	defaultMaintenanceStatusQueueLength = 25
+	// maintenanceRetryBaseInterval is the retry interval after the first failed maintenance attempt,
+	// it doubles for each further consecutive failure and is capped by the maintenance frequency
+	maintenanceRetryBaseInterval = repoSyncPeriod
 )
 
 var maintenanceStatusQueueLength = defaultMaintenanceStatusQueueLength
@@ -285,7 +288,9 @@ func (r *BackupRepoReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, errors.Wrap(err, "error handling incomplete repo maintenance jobs")
 		}
 
-		if err := r.runMaintenanceIfDue(ctx, backupRepo, log); err != nil {
+		if bsl.Status.Phase == velerov1api.BackupStorageLocationPhaseUnavailable {
+			log.Debugf("Skip running maintenance for BackupRepository, because its BSL %s is unavailable.", bsl.Name)
+		} else if err := r.runMaintenanceIfDue(ctx, backupRepo, log); err != nil {
 			return ctrl.Result{}, errors.Wrap(err, "error check and run repo maintenance jobs")
 		}
 
@@ -546,8 +551,60 @@ func updateRepoMaintenanceHistory(repo *velerov1api.BackupRepository, result vel
 	repo.Status.RecentMaintenance = append(repo.Status.RecentMaintenance[startingPos:], latest)
 }
 
+// dueForMaintenance returns true if the maintenance frequency has elapsed since the last successful maintenance
+// and, when the latest maintenance attempts failed, the retry backoff has elapsed since the latest failed attempt.
+// Without the backoff, a repo whose maintenance keeps failing would run a new maintenance job on every resync.
 func dueForMaintenance(req *velerov1api.BackupRepository, now time.Time) bool {
-	return req.Status.LastMaintenanceTime == nil || req.Status.LastMaintenanceTime.Add(req.Spec.MaintenanceFrequency.Duration).Before(now)
+	if req.Status.LastMaintenanceTime != nil && !req.Status.LastMaintenanceTime.Add(req.Spec.MaintenanceFrequency.Duration).Before(now) {
+		return false
+	}
+
+	failures, lastFailure := consecutiveMaintenanceFailures(req.Status.RecentMaintenance)
+	if failures == 0 {
+		return true
+	}
+
+	return lastFailure.Add(maintenanceRetryBackoff(failures, req.Spec.MaintenanceFrequency.Duration)).Before(now)
+}
+
+// consecutiveMaintenanceFailures returns the number of failed attempts at the end of the maintenance history
+// and the time of the latest one
+func consecutiveMaintenanceFailures(history []velerov1api.BackupRepositoryMaintenanceStatus) (int, time.Time) {
+	failures := 0
+	lastFailure := time.Time{}
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Result != velerov1api.BackupRepositoryMaintenanceFailed {
+			break
+		}
+
+		failures++
+
+		attemptTime := history[i].CompleteTimestamp
+		if attemptTime == nil {
+			attemptTime = history[i].StartTimestamp
+		}
+
+		if attemptTime != nil && attemptTime.After(lastFailure) {
+			lastFailure = attemptTime.Time
+		}
+	}
+
+	return failures, lastFailure
+}
+
+// maintenanceRetryBackoff returns the interval to wait after the given number of consecutive failed maintenance attempts,
+// it starts from maintenanceRetryBaseInterval, doubles for each further failure and never exceeds the maintenance frequency
+func maintenanceRetryBackoff(failures int, frequency time.Duration) time.Duration {
+	if frequency <= 0 {
+		frequency = defaultMaintainFrequency
+	}
+
+	backoff := maintenanceRetryBaseInterval
+	for i := 1; i < failures && backoff < frequency; i++ {
+		backoff *= 2
+	}
+
+	return min(backoff, frequency)
 }
 
 func (r *BackupRepoReconciler) checkNotReadyRepo(ctx context.Context, req *velerov1api.BackupRepository, log logrus.FieldLogger) (bool, error) {

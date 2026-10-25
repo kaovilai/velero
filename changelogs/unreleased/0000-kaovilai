@@ -1,0 +1,1 @@
+Back off repository maintenance retries after failures and skip maintenance while the BSL is unavailable, instead of starting a new maintenance job on every repository resync
