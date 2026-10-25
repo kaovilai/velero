@@ -640,6 +640,28 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 	return errs
 }
 
+// Lifecycle of the volume snapshot of a CSI DataUpload, by how the DataUpload ends
+// and the deletionPolicy of its backup VolumeSnapshotContent, which comes from the
+// VolumeSnapshotClass:
+//
+//	DataUpload ends        | Delete                          | Retain
+//	-----------------------+---------------------------------+------------------------------------------
+//	Completed              | the CSI driver deletes it when  | kept in the storage and recorded in
+//	                       | the node-agent cleans up the    | status.retainedSnapshot; deleted here
+//	                       | exposed snapshot                | when the backup is deleted
+//	Failed, Canceled, or   | same as Completed               | the node-agent sets the backup VSC to
+//	timed out in prepare   |                                 | Delete before the cleanup, so the CSI
+//	                       |                                 | driver deletes it then; nothing recorded
+//
+// When the backup is deleted, a retained snapshot is deleted after the other data
+// of the backup:
+//   - An earlier deletion step fails: the snapshot and its configmap are kept, and a
+//     retry of the backup deletion deletes them.
+//   - The CSI driver reports a failure (SnapshotDeleteError event): the backup
+//     deletion fails and the configmap is kept for a retry.
+//   - The CSI driver is not done within 30 seconds: the backup deletion completes
+//     with a warning, and the temp VSC stays until the driver deletes the snapshot.
+//
 // deleteRetainedSnapshots has the CSI driver delete the volume snapshots that the
 // DataUploads of the backup retained in the storage. The configmaps that pass the
 // snapshots from the DataUpload DeleteItemAction are the only record of the
