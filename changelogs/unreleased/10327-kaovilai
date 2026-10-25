@@ -1,0 +1,1 @@
+Fail the DataUpload/DataDownload/PodVolumeBackup/PodVolumeRestore when its data mover pod is deleted or evicted (e.g. node drain) instead of leaving it InProgress, and release the node data path concurrency slot on every terminal path

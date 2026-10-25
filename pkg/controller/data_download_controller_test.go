@@ -488,6 +488,13 @@ func TestDataDownloadReconcile(t *testing.T) {
 			expectCancelRecord: true,
 		},
 		{
+			name:           "release data path of dd in terminal state",
+			dd:             dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseCanceled).Node("test-node").Result(),
+			needCreateFSBR: true,
+			mockClose:      true,
+			expected:       dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseCanceled).Result(),
+		},
+		{
 			name:      "pvc StorageClass is nil",
 			dd:        dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Result(),
 			targetPVC: builder.ForPersistentVolumeClaim("test-ns", "test-pvc").Result(),

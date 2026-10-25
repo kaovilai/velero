@@ -152,9 +152,10 @@ func (ms *microServiceBRWatcher) Init(ctx context.Context, param any) error {
 				}
 
 				if pod.Status.Phase == corev1api.PodSucceeded || pod.Status.Phase == corev1api.PodFailed {
-					ms.podCh <- pod
+					ms.notifyPod(pod)
 				}
 			},
+			DeleteFunc: ms.onPodDeleted,
 		},
 	)
 	if err != nil {
@@ -243,11 +244,47 @@ func (ms *microServiceBRWatcher) reEnsureThisPod(ctx context.Context) error {
 	}
 
 	if thisPod.Status.Phase == corev1api.PodSucceeded || thisPod.Status.Phase == corev1api.PodFailed {
-		ms.podCh <- thisPod
+		ms.notifyPod(thisPod)
 		ms.log.WithField("this pod", ms.thisPod).Infof("This pod comes to terminital status %s before watch start", thisPod.Status.Phase)
 	}
 
 	return nil
+}
+
+// notifyPod hands the data path pod over to the watch loop. The watch loop only consumes the first pod,
+// so the send never blocks; otherwise a later pod update or delete would block the informer handler forever.
+func (ms *microServiceBRWatcher) notifyPod(pod *corev1api.Pod) {
+	select {
+	case ms.podCh <- pod:
+	default:
+	}
+}
+
+// onPodDeleted handles the deletion of the data path pod. Data path pods are created with
+// terminationGracePeriodSeconds 0, so when they are deleted or evicted (e.g., by a node drain, a force delete,
+// or the node controller removing pods of a node that is gone) the pod object may disappear while its phase is
+// still Running and no update to Succeeded/Failed is ever received.
+func (ms *microServiceBRWatcher) onPodDeleted(obj any) {
+	pod, ok := obj.(*corev1api.Pod)
+	if !ok {
+		// a delete event missed by the watch and recovered by a relist comes as a tombstone wrapping the last known object
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+
+		if pod, ok = tombstone.Obj.(*corev1api.Pod); !ok {
+			return
+		}
+	}
+
+	if pod.Namespace != ms.namespace || pod.Name != ms.thisPod {
+		return
+	}
+
+	ms.log.WithField("this pod", ms.thisPod).Infof("Data path pod %s of %s task %s is deleted in phase %s", pod.Name, ms.taskType, ms.taskName, pod.Status.Phase)
+
+	ms.notifyPod(pod)
 }
 
 var funcGetPodTerminationMessage = kube.GetPodContainerTerminateMessage
@@ -323,20 +360,36 @@ func (ms *microServiceBRWatcher) startWatch() {
 
 		logger.Info("Calling callback on data path pod termination")
 
+		// only onPodDeleted delivers a pod that is in neither the Succeeded nor the Failed phase
+		podDeleted := lastPod.Status.Phase != corev1api.PodSucceeded && lastPod.Status.Phase != corev1api.PodFailed
+
 		if lastPod.Status.Phase == corev1api.PodSucceeded {
 			result := funcGetResultFromMessage(ms.taskType, terminateMessage, ms.log)
 			ms.callbacks.OnProgress(ms.ctx, ms.namespace, ms.taskName, getCompletionProgressFromResult(ms.taskType, result))
 			ms.callbacks.OnCompleted(ms.ctx, ms.namespace, ms.taskName, result)
-		} else {
-			if strings.HasSuffix(terminateMessage, ErrCancelled) {
-				ms.callbacks.OnCancelled(ms.ctx, ms.namespace, ms.taskName)
-			} else if terminateMessage != "" {
-				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New(terminateMessage))
-			} else if msg, evicted := ms.eventMessages.Load(EventReasonEvicted); evicted {
-				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New(msg.(string)))
-			} else {
-				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New(lastPod.Status.Message))
+		} else if strings.HasSuffix(terminateMessage, ErrCancelled) {
+			if podDeleted {
+				logger.Warnf("Data path pod %s was deleted in phase %s, canceling %s task %s through the pod deletion path", lastPod.Name, lastPod.Status.Phase, ms.taskType, ms.taskName)
 			}
+
+			ms.callbacks.OnCancelled(ms.ctx, ms.namespace, ms.taskName)
+		} else {
+			var err error
+			if terminateMessage != "" {
+				err = errors.New(terminateMessage)
+			} else if msg, evicted := ms.eventMessages.Load(EventReasonEvicted); evicted {
+				err = errors.New(msg.(string))
+			} else if podDeleted {
+				err = errors.Errorf("data path pod %s was deleted in phase %s before it completed", lastPod.Name, lastPod.Status.Phase)
+			} else {
+				err = errors.New(lastPod.Status.Message)
+			}
+
+			if podDeleted {
+				logger.WithError(err).Warnf("Data path pod %s was deleted in phase %s, failing %s task %s through the pod deletion path", lastPod.Name, lastPod.Status.Phase, ms.taskType, ms.taskName)
+			}
+
+			ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, err)
 		}
 
 		logger.Info("Complete callback on data path pod termination")

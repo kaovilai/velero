@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	kubeclientfake "k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -180,6 +182,7 @@ func TestStartWatch(t *testing.T) {
 		expectFail           bool
 		expectFailMsg        string
 		expectProgress       int
+		expectLog            string
 	}{
 		{
 			name:          "exit from ctx",
@@ -395,6 +398,44 @@ func TestStartWatch(t *testing.T) {
 			expectFail:           true,
 			expectFailMsg:        "data path pod was evicted, message: fake-evicted-message",
 		},
+		{
+			name:          "deleted while running",
+			thisPod:       "fak-pod-1",
+			thisContainer: "fake-container-1",
+			insertPod:     builder.ForPod("velero", "fake-pod-1").Phase(corev1api.PodRunning).Result(),
+			insertEventsBefore: []insertEvent{
+				{
+					event: &corev1api.Event{Reason: EventReasonStarted},
+				},
+				{
+					event: &corev1api.Event{Reason: EventReasonStopped},
+				},
+			},
+			expectStartEvent:     true,
+			expectTerminateEvent: true,
+			expectFail:           true,
+			expectFailMsg:        "data path pod fake-pod-1 was deleted in phase Running before it completed",
+			expectLog:            "Data path pod fake-pod-1 was deleted in phase Running, failing backup task fake-du-name through the pod deletion path",
+		},
+		{
+			name:          "deleted while running after cancel",
+			thisPod:       "fak-pod-1",
+			thisContainer: "fake-container-1",
+			insertPod:     builder.ForPod("velero", "fake-pod-1").Phase(corev1api.PodRunning).Result(),
+			insertEventsBefore: []insertEvent{
+				{
+					event: &corev1api.Event{Reason: EventReasonStarted},
+				},
+				{
+					event: &corev1api.Event{Reason: EventReasonStopped},
+				},
+			},
+			terminationMessage:   fmt.Sprintf("Failed to init data path service for DataUpload %s: %v", "fake-du-name", errors.New(ErrCancelled)),
+			expectStartEvent:     true,
+			expectTerminateEvent: true,
+			expectCancel:         true,
+			expectLog:            "Data path pod fake-pod-1 was deleted in phase Running, canceling backup task fake-du-name through the pod deletion path",
+		},
 	}
 
 	for _, test := range tests {
@@ -410,14 +451,18 @@ func TestStartWatch(t *testing.T) {
 			funcRedirectLog = sw.redirectDataMoverLogs
 			funcGetResultFromMessage = sw.getResultFromMessage
 
+			logger, logHook := logrustest.NewNullLogger()
+
 			ms := &microServiceBRWatcher{
 				ctx:           ctx,
 				namespace:     test.namespace,
+				taskType:      TaskTypeBackup,
+				taskName:      "fake-du-name",
 				thisPod:       test.thisPod,
 				thisContainer: test.thisContainer,
 				podCh:         make(chan *corev1api.Pod, 2),
 				eventCh:       make(chan *corev1api.Event, 10),
-				log:           velerotest.NewLogger(),
+				log:           logger,
 				callbacks: Callbacks{
 					OnCompleted: sw.OnCompleted,
 					OnFailed:    sw.OnFailed,
@@ -472,7 +517,105 @@ func TestStartWatch(t *testing.T) {
 			}
 			assert.Equal(t, test.expectProgress, sw.progress)
 
+			if test.expectLog != "" {
+				found := false
+				for _, entry := range logHook.AllEntries() {
+					if entry.Message == test.expectLog {
+						found = true
+						break
+					}
+				}
+				assert.True(t, found, "expected log %q not found", test.expectLog)
+			}
+
 			cancel()
+		})
+	}
+}
+
+func TestOnPodDeleted(t *testing.T) {
+	thisPod := builder.ForPod("velero", "fake-pod-1").Phase(corev1api.PodRunning).Result()
+
+	tests := []struct {
+		name      string
+		obj       any
+		podChLen  int
+		expectPod bool
+	}{
+		{
+			name:      "this pod is deleted",
+			obj:       thisPod,
+			expectPod: true,
+		},
+		{
+			name:      "this pod is deleted with final state unknown",
+			obj:       cache.DeletedFinalStateUnknown{Key: "velero/fake-pod-1", Obj: thisPod},
+			expectPod: true,
+		},
+		{
+			name: "other pod is deleted",
+			obj:  builder.ForPod("velero", "fake-pod-2").Phase(corev1api.PodRunning).Result(),
+		},
+		{
+			name: "pod in other namespace is deleted",
+			obj:  builder.ForPod("fake-ns", "fake-pod-1").Phase(corev1api.PodRunning).Result(),
+		},
+		{
+			name: "other pod is deleted with final state unknown",
+			obj:  cache.DeletedFinalStateUnknown{Key: "velero/fake-pod-2", Obj: builder.ForPod("velero", "fake-pod-2").Phase(corev1api.PodRunning).Result()},
+		},
+		{
+			name: "final state unknown with unexpected object",
+			obj:  cache.DeletedFinalStateUnknown{Key: "velero/fake-pod-1", Obj: &corev1api.Event{}},
+		},
+		{
+			name: "unexpected object",
+			obj:  &corev1api.Event{},
+		},
+		{
+			name:      "pod channel is full",
+			obj:       thisPod,
+			podChLen:  2,
+			expectPod: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			logger, logHook := logrustest.NewNullLogger()
+
+			ms := &microServiceBRWatcher{
+				namespace: "velero",
+				taskType:  TaskTypeBackup,
+				taskName:  "fake-du-name",
+				thisPod:   "fake-pod-1",
+				podCh:     make(chan *corev1api.Pod, 2),
+				log:       logger,
+			}
+
+			for range test.podChLen {
+				ms.podCh <- builder.ForPod("velero", "fake-pod-1").Phase(corev1api.PodFailed).Result()
+			}
+
+			ms.onPodDeleted(test.obj)
+
+			if !test.expectPod {
+				assert.Empty(t, ms.podCh)
+				assert.Empty(t, logHook.AllEntries())
+				return
+			}
+
+			require.NotNil(t, logHook.LastEntry())
+			assert.Equal(t, "Data path pod fake-pod-1 of backup task fake-du-name is deleted in phase Running", logHook.LastEntry().Message)
+
+			if test.podChLen > 0 {
+				assert.Len(t, ms.podCh, test.podChLen)
+				return
+			}
+
+			require.Len(t, ms.podCh, 1)
+			pod := <-ms.podCh
+			assert.Equal(t, corev1api.PodRunning, pod.Status.Phase)
 		})
 	}
 }
