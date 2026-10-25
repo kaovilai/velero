@@ -57,6 +57,9 @@ import (
 	"github.com/velero-io/velero/pkg/util/kube"
 )
 
+// exposePendingRequeueInterval is the interval to retry the expose of a data download whose target PVC is not consumed yet
+const exposePendingRequeueInterval = time.Second * 5
+
 // DataDownloadReconciler reconciles a DataDownload object
 type DataDownloadReconciler struct {
 	client                         client.Client
@@ -76,6 +79,7 @@ type DataDownloadReconciler struct {
 	preparingTimeout               time.Duration
 	metrics                        *metrics.ServerMetrics
 	cancelledDataDownload          sync.Map
+	exposePendingDataDownload      sync.Map
 	dataMovePriorityClass          string
 	repoConfigMgr                  repository.ConfigManager
 	podLabels                      map[string]string
@@ -151,6 +155,7 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Name}, dd); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Warn("DataDownload not found, skip")
+			r.exposePendingDataDownload.Delete(req.Name)
 			return ctrl.Result{}, nil
 		}
 		log.WithError(err).Error("Unable to get the DataDownload")
@@ -206,6 +211,7 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	} else {
 		r.cancelledDataDownload.Delete(dd.Name)
+		r.exposePendingDataDownload.Delete(dd.Name)
 
 		// put the finalizer remove action here for all cr will goes to the final status, we could check finalizer and do remove action in final status
 		// instead of intermediate state.
@@ -282,22 +288,30 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 		log.Info("Data download is accepted")
 
-		exposeParam, err := r.setupExposeParam(dd)
-		if err != nil {
-			return r.errorOut(ctx, dd, err, "failed to set exposer parameters", log)
-		}
-
-		// Expose() will trigger to create one pod whose volume is restored by a given volume snapshot,
-		// but the pod maybe is not in the same node of the current controller, so we need to return it here.
-		// And then only the controller who is in the same node could do the rest work.
-		err = r.restoreExposer.Expose(ctx, getDataDownloadOwnerObject(dd), exposeParam)
-		if err != nil {
-			return r.errorOut(ctx, dd, err, "error to expose snapshot", log)
-		}
-		log.Info("Restore is exposed")
-
-		return ctrl.Result{}, nil
+		return r.exposeDataDownload(ctx, dd, log)
 	} else if dd.Status.Phase == velerov2alpha1api.DataDownloadPhaseAccepted {
+		if _, pending := r.exposePendingDataDownload.Load(dd.Name); pending {
+			// The expose is waiting for the target PVC to be consumed and nothing has been created yet
+			if dd.Spec.Cancel {
+				log.Debugf("Data download is canceled in Phase %s before it is exposed", dd.Status.Phase)
+
+				if r.tryCancelDataDownload(ctx, dd, "") {
+					r.exposePendingDataDownload.Delete(dd.Name)
+				}
+
+				return ctrl.Result{}, nil
+			}
+
+			if dd.Status.AcceptedTimestamp != nil && time.Since(dd.Status.AcceptedTimestamp.Time) >= r.preparingTimeout {
+				r.exposePendingDataDownload.Delete(dd.Name)
+				r.onPrepareTimeout(ctx, dd)
+
+				return ctrl.Result{}, nil
+			}
+
+			return r.exposeDataDownload(ctx, dd, log)
+		}
+
 		if peekErr := r.restoreExposer.PeekExposed(ctx, getDataDownloadOwnerObject(dd)); peekErr != nil {
 			log.Errorf("Cancel dd %s/%s because of expose error %s", dd.Namespace, dd.Name, peekErr)
 
@@ -467,6 +481,68 @@ func (r *DataDownloadReconciler) startCancelableDataPath(asyncBR datapath.AsyncB
 
 	log.Infof("Async restore started for pod %s, volume %s", res.ByPod.HostingPod.Name, res.ByPod.VolumeName)
 	return nil
+}
+
+// exposeDataDownload exposes the data download accepted by the current node.
+// If the target PVC is not consumed yet, it requeues the data download instead of waiting in the reconcile, because
+// the consuming may depend on other data downloads handled by the same controller, e.g., a pod mounting a
+// WaitForFirstConsumer volume and an Immediate volume could not be scheduled until both volumes are restored.
+func (r *DataDownloadReconciler) exposeDataDownload(ctx context.Context, dd *velerov2alpha1api.DataDownload, log logrus.FieldLogger) (ctrl.Result, error) {
+	exposeParam, err := r.setupExposeParam(dd)
+	if err != nil {
+		r.exposePendingDataDownload.Delete(dd.Name)
+		return r.errorOut(ctx, dd, err, "failed to set exposer parameters", log)
+	}
+
+	// Expose() will trigger to create one pod whose volume is restored by a given volume snapshot,
+	// but the pod maybe is not in the same node of the current controller, so we need to return it here.
+	// And then only the controller who is in the same node could do the rest work.
+	err = r.restoreExposer.Expose(ctx, getDataDownloadOwnerObject(dd), exposeParam)
+	if errors.Is(err, exposer.ErrTargetPVCNotConsumed) {
+		if _, loaded := r.exposePendingDataDownload.LoadOrStore(dd.Name, true); !loaded {
+			log.Info("Target PVC is not consumed yet, requeue later")
+			r.updateExposePendingMessage(ctx, dd, waitTargetPVCConsumedMessage(dd), log)
+		}
+
+		return ctrl.Result{RequeueAfter: exposePendingRequeueInterval}, nil
+	}
+
+	_, pending := r.exposePendingDataDownload.LoadAndDelete(dd.Name)
+
+	if err != nil {
+		return r.errorOut(ctx, dd, err, "error to expose snapshot", log)
+	}
+	log.Info("Restore is exposed")
+
+	if pending {
+		r.updateExposePendingMessage(ctx, dd, "", log)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func waitTargetPVCConsumedMessage(dd *velerov2alpha1api.DataDownload) string {
+	return fmt.Sprintf("waiting for target PVC %s/%s to be consumed by a pod", dd.Spec.TargetVolume.Namespace, dd.Spec.TargetVolume.PVC)
+}
+
+// updateExposePendingMessage sets the message of an accepted data download while its expose is pending, or clears the
+// message once the expose is done
+func (r *DataDownloadReconciler) updateExposePendingMessage(ctx context.Context, dd *velerov2alpha1api.DataDownload, message string, log logrus.FieldLogger) {
+	if err := UpdateDataDownloadWithRetry(ctx, r.client, types.NamespacedName{Namespace: dd.Namespace, Name: dd.Name}, log, func(dd *velerov2alpha1api.DataDownload) bool {
+		if message == "" {
+			if dd.Status.Message != waitTargetPVCConsumedMessage(dd) {
+				return false
+			}
+		} else if dd.Status.Phase != velerov2alpha1api.DataDownloadPhaseAccepted || dd.Status.Message == message {
+			return false
+		}
+
+		dd.Status.Message = message
+
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("Failed to update message of datadownload")
+	}
 }
 
 func (r *DataDownloadReconciler) OnDataDownloadCompleted(ctx context.Context, namespace string, ddName string, result datapath.Result) {

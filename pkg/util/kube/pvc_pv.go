@@ -487,6 +487,40 @@ func SetPVReclaimPolicy(ctx context.Context, pvGetter corev1client.CoreV1Interfa
 	return updated, nil
 }
 
+// IsPVCConsumed checks whether a PVC is consumed by a pod so that the selected node is set by the pod scheduling; it always
+// returns true if the consuming doesn't affect the PV provision.
+// It doesn't wait, so it is safe to call from a controller's reconcile loop. The latest PVC and the selected node are returned
+// together with the result.
+func IsPVCConsumed(
+	ctx context.Context,
+	pvcGetter corev1client.CoreV1Interface,
+	pvc string, namespace string,
+	storageClient storagev1.StorageV1Interface,
+	ignoreConsume bool,
+) (bool, string, *corev1api.PersistentVolumeClaim, error) {
+	tmpPVC, err := pvcGetter.PersistentVolumeClaims(namespace).Get(ctx, pvc, metav1.GetOptions{})
+	if err != nil {
+		return false, "", nil, errors.Wrapf(err, "error to get pvc %s/%s", namespace, pvc)
+	}
+
+	selectedNode := ""
+	if !ignoreConsume && tmpPVC.Spec.StorageClassName != nil {
+		storageClass, err := storageClient.StorageClasses().Get(ctx, *tmpPVC.Spec.StorageClassName, metav1.GetOptions{})
+		if err != nil {
+			return false, "", nil, errors.Wrapf(err, "error to get storage class %s", *tmpPVC.Spec.StorageClassName)
+		}
+
+		if storageClass.VolumeBindingMode != nil && *storageClass.VolumeBindingMode == storagev1api.VolumeBindingWaitForFirstConsumer {
+			selectedNode = tmpPVC.Annotations[KubeAnnSelectedNode]
+			if selectedNode == "" {
+				return false, "", tmpPVC, nil
+			}
+		}
+	}
+
+	return true, selectedNode, tmpPVC, nil
+}
+
 // WaitPVCConsumed waits for a PVC to be consumed by a pod so that the selected node is set by the pod scheduling; or does
 // nothing if the consuming doesn't affect the PV provision.
 // The latest PVC and the selected node will be returned.
@@ -500,32 +534,14 @@ func WaitPVCConsumed(
 ) (string, *corev1api.PersistentVolumeClaim, error) {
 	selectedNode := ""
 	var updated *corev1api.PersistentVolumeClaim
-	var storageClass *storagev1api.StorageClass
 
 	err := wait.PollUntilContextTimeout(ctx, waitInternal, timeout, true, func(ctx context.Context) (bool, error) {
-		tmpPVC, err := pvcGetter.PersistentVolumeClaims(namespace).Get(ctx, pvc, metav1.GetOptions{})
-		if err != nil {
-			return false, errors.Wrapf(err, "error to get pvc %s/%s", namespace, pvc)
+		consumed, node, tmpPVC, err := IsPVCConsumed(ctx, pvcGetter, pvc, namespace, storageClient, ignoreConsume)
+		if err != nil || !consumed {
+			return false, err
 		}
 
-		if !ignoreConsume {
-			if tmpPVC.Spec.StorageClassName != nil && storageClass == nil {
-				storageClass, err = storageClient.StorageClasses().Get(ctx, *tmpPVC.Spec.StorageClassName, metav1.GetOptions{})
-				if err != nil {
-					return false, errors.Wrapf(err, "error to get storage class %s", *tmpPVC.Spec.StorageClassName)
-				}
-			}
-
-			if storageClass != nil {
-				if storageClass.VolumeBindingMode != nil && *storageClass.VolumeBindingMode == storagev1api.VolumeBindingWaitForFirstConsumer {
-					selectedNode = tmpPVC.Annotations[KubeAnnSelectedNode]
-					if selectedNode == "" {
-						return false, nil
-					}
-				}
-			}
-		}
-
+		selectedNode = node
 		updated = tmpPVC
 
 		return true, nil

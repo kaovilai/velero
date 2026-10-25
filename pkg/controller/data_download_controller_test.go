@@ -200,6 +200,11 @@ func TestDataDownloadReconcile(t *testing.T) {
 		isNilExposer             bool
 		notNilExpose             bool
 		mockExpose               bool
+		exposeNotConsumed        bool
+		mockCleanUpOnly          bool
+		exposePending            bool
+		expectExposePending      bool
+		expectExactMessage       bool
 		notMockCleanUp           bool
 		mockInit                 bool
 		mockInitErr              error
@@ -366,6 +371,70 @@ func TestDataDownloadReconcile(t *testing.T) {
 			mockExpose:     true,
 			notMockCleanUp: true,
 			notNilExpose:   true,
+		},
+		{
+			name:              "dd expose is pending for target PVC not consumed",
+			dd:                dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Result(),
+			targetPVC:         builder.ForPersistentVolumeClaim("test-ns", "test-pvc").StorageClass("sc").Result(),
+			exposeNotConsumed: true,
+			notMockCleanUp:    true,
+			expected: dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataDownloadPhaseAccepted).
+				Message("waiting for target PVC test-ns/test-pvc to be consumed by a pod").Result(),
+			expectExactMessage:  true,
+			expectedResult:      &ctrl.Result{RequeueAfter: exposePendingRequeueInterval},
+			expectExposePending: true,
+		},
+		{
+			name: "expose pending dd is still not consumed",
+			dd: dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseAccepted).Finalizers([]string{DataUploadDownloadFinalizer}).
+				Labels(map[string]string{exposer.ExposeOnGoingLabel: "true"}).AcceptedTimestamp(&metav1.Time{Time: time.Now()}).
+				Message("waiting for target PVC test-ns/test-pvc to be consumed by a pod").Result(),
+			exposePending:     true,
+			exposeNotConsumed: true,
+			notMockCleanUp:    true,
+			expected: dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataDownloadPhaseAccepted).
+				Message("waiting for target PVC test-ns/test-pvc to be consumed by a pod").Result(),
+			expectExactMessage:  true,
+			expectedResult:      &ctrl.Result{RequeueAfter: exposePendingRequeueInterval},
+			expectExposePending: true,
+		},
+		{
+			name: "expose pending dd is exposed",
+			dd: dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseAccepted).Finalizers([]string{DataUploadDownloadFinalizer}).
+				Labels(map[string]string{exposer.ExposeOnGoingLabel: "true"}).AcceptedTimestamp(&metav1.Time{Time: time.Now()}).
+				Message("waiting for target PVC test-ns/test-pvc to be consumed by a pod").Result(),
+			exposePending:      true,
+			mockExpose:         true,
+			notMockCleanUp:     true,
+			expected:           dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataDownloadPhaseAccepted).Result(),
+			expectExactMessage: true,
+			expectedResult:     &ctrl.Result{},
+		},
+		{
+			name: "expose pending dd fails to expose",
+			dd: dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseAccepted).Finalizers([]string{DataUploadDownloadFinalizer}).
+				Labels(map[string]string{exposer.ExposeOnGoingLabel: "true"}).AcceptedTimestamp(&metav1.Time{Time: time.Now()}).
+				Message("waiting for target PVC test-ns/test-pvc to be consumed by a pod").Result(),
+			exposePending: true,
+			isExposeErr:   true,
+			expected:      dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataDownloadPhaseFailed).Message("error to expose snapshot").Result(),
+			expectedErr:   "Error to expose restore exposer",
+		},
+		{
+			name: "expose pending dd is canceled",
+			dd: dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseAccepted).Finalizers([]string{DataUploadDownloadFinalizer}).Cancel(true).
+				Labels(map[string]string{exposer.ExposeOnGoingLabel: "true"}).AcceptedTimestamp(&metav1.Time{Time: time.Now()}).Result(),
+			exposePending:      true,
+			mockCleanUpOnly:    true,
+			expected:           dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataDownloadPhaseCanceled).Cancel(true).Result(),
+			expectCancelRecord: true,
+		},
+		{
+			name: "expose pending dd times out",
+			dd: dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseAccepted).Finalizers([]string{DataUploadDownloadFinalizer}).
+				Labels(map[string]string{exposer.ExposeOnGoingLabel: "true"}).AcceptedTimestamp(&metav1.Time{Time: time.Now().Add(-time.Minute * 30)}).Result(),
+			exposePending: true,
+			expected:      dataDownloadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataDownloadPhaseFailed).Message("timeout on preparing data download").Result(),
 		},
 		{
 			name:     "prepare timeout on accepted",
@@ -563,7 +632,11 @@ func TestDataDownloadReconcile(t *testing.T) {
 				return asyncBR
 			}
 
-			if test.isExposeErr || test.isGetExposeErr || test.isGetExposeNil || test.isPeekExposeErr || test.isNilExposer || test.notNilExpose || test.mockExpose {
+			if test.exposePending {
+				r.exposePendingDataDownload.Store(test.dd.Name, true)
+			}
+
+			if test.isExposeErr || test.isGetExposeErr || test.isGetExposeNil || test.isPeekExposeErr || test.isNilExposer || test.notNilExpose || test.mockExpose || test.exposeNotConsumed || test.mockCleanUpOnly {
 				if test.isNilExposer {
 					r.restoreExposer = nil
 				} else {
@@ -573,6 +646,8 @@ func TestDataDownloadReconcile(t *testing.T) {
 							ep.On("Expose", mock.Anything, mock.Anything, mock.Anything).Return(errors.New("Error to expose restore exposer"))
 						} else if test.mockExpose {
 							ep.On("Expose", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+						} else if test.exposeNotConsumed {
+							ep.On("Expose", mock.Anything, mock.Anything, mock.Anything).Return(errors.Wrap(exposer.ErrTargetPVCNotConsumed, "test-ns/test-pvc"))
 						} else if test.notNilExpose {
 							hostingPod := builder.ForPod("test-ns", "test-name").Volumes(&corev1api.Volume{Name: "test-pvc"}).Result()
 							hostingPod.ObjectMeta.SetUID("test-uid")
@@ -634,6 +709,9 @@ func TestDataDownloadReconcile(t *testing.T) {
 
 					assert.Equal(t, test.expected.Status.Phase, dd.Status.Phase)
 					assert.Contains(t, dd.Status.Message, test.expected.Status.Message)
+					if test.expectExactMessage {
+						assert.Equal(t, test.expected.Status.Message, dd.Status.Message)
+					}
 					assert.Equal(t, dd.Finalizers, test.expected.Finalizers)
 					assert.Equal(t, dd.Spec.Cancel, test.expected.Spec.Cancel)
 				}
@@ -644,6 +722,9 @@ func TestDataDownloadReconcile(t *testing.T) {
 			} else {
 				assert.NotNil(t, r.dataPathMgr.GetAsyncBR(test.dd.Name))
 			}
+
+			_, exposePending := r.exposePendingDataDownload.Load(test.dd.Name)
+			assert.Equal(t, test.expectExposePending, exposePending)
 
 			if test.expectCancelRecord {
 				_, ok := r.cancelledDataDownload.Load(test.dd.Name)

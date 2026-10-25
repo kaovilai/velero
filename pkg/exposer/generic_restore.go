@@ -123,9 +123,15 @@ type GenericRestoreCleanUpParam struct {
 	Snapshot *velerov2alpha1api.CSISnapshotSpec
 }
 
+// ErrTargetPVCNotConsumed is returned by GenericRestoreExposer.Expose when the target PVC's storage class uses
+// WaitForFirstConsumer binding and no pod has consumed the target PVC yet. Nothing is created in this case and the
+// caller is expected to call Expose again later.
+var ErrTargetPVCNotConsumed = errors.New("target PVC is not consumed by any pod yet")
+
 // GenericRestoreExposer is the interfaces for a generic restore exposer
 type GenericRestoreExposer interface {
-	// Expose starts the process to a restore expose, the expose process may take long time
+	// Expose starts the process to a restore expose, the expose process may take long time.
+	// It returns ErrTargetPVCNotConsumed without creating anything if the target PVC needs to be consumed first.
 	Expose(context.Context, corev1api.ObjectReference, GenericRestoreExposeParam) error
 
 	// GetExposed polls the status of the expose.
@@ -172,18 +178,23 @@ func (e *genericRestoreExposer) Expose(ctx context.Context, ownerObject corev1ap
 		"target namespace": param.TargetNamespace,
 	})
 
-	curLog.Info("Waiting for target PVC to be consumed")
-	selectedNode, targetPVC, err := kube.WaitPVCConsumed(
+	// Don't wait for the target PVC to be consumed here, the caller may be a controller's worker and the consuming may
+	// depend on other volumes restored by the same worker. Return ErrTargetPVCNotConsumed so that the caller retries later.
+	consumed, selectedNode, targetPVC, err := kube.IsPVCConsumed(
 		ctx,
 		e.kubeClient.CoreV1(),
 		param.TargetPVCName,
 		param.TargetNamespace,
 		e.kubeClient.StorageV1(),
-		param.ExposeTimeout,
 		param.RestorePVCConfig.IgnoreDelayBinding,
 	)
 	if err != nil {
-		return errors.Wrapf(err, "error to wait target PVC consumed, %s/%s", param.TargetNamespace, param.TargetPVCName)
+		return errors.Wrapf(err, "error to check target PVC consumed, %s/%s", param.TargetNamespace, param.TargetPVCName)
+	}
+
+	if !consumed {
+		curLog.Debug("Target PVC is not consumed yet")
+		return errors.Wrapf(ErrTargetPVCNotConsumed, "%s/%s", param.TargetNamespace, param.TargetPVCName)
 	}
 
 	curLog.WithField("target PVC", param.TargetPVCName).WithField("selected node", selectedNode).Info("Target PVC is consumed")

@@ -207,14 +207,43 @@ func TestRestoreExpose(t *testing.T) {
 		expectBackupPV       bool
 		expectedNodeSelector map[string]string
 		expectedNodeAffinity *corev1api.NodeAffinity
+		ignoreDelayBinding   bool
 		err                  string
+		expectNotConsumed    bool
 	}{
 		{
-			name:            "wait target pvc consumed fail",
+			name:            "check target pvc consumed fail",
 			targetPVCName:   "fake-target-pvc",
 			targetNamespace: "fake-ns",
 			ownerRestore:    restore,
-			err:             "error to wait target PVC consumed, fake-ns/fake-target-pvc: error to wait for PVC: error to get pvc fake-ns/fake-target-pvc: persistentvolumeclaims \"fake-target-pvc\" not found",
+			err:             "error to check target PVC consumed, fake-ns/fake-target-pvc: error to get pvc fake-ns/fake-target-pvc: persistentvolumeclaims \"fake-target-pvc\" not found",
+		},
+		{
+			name:            "target pvc with WaitForFirstConsumer is not consumed",
+			targetPVCName:   "fake-target-pvc",
+			targetNamespace: "fake-ns",
+			ownerRestore:    restore,
+			kubeClientObj: []runtime.Object{
+				targetPVCObj,
+				daemonSet,
+				storageClassWaitForFirstConsumer,
+			},
+			err:               "fake-ns/fake-target-pvc: target PVC is not consumed by any pod yet",
+			expectNotConsumed: true,
+		},
+		{
+			name:            "target pvc with WaitForFirstConsumer is not consumed but delay binding is ignored",
+			targetPVCName:   "fake-target-pvc",
+			targetNamespace: "fake-ns",
+			ownerRestore:    restore,
+			kubeClientObj: []runtime.Object{
+				targetPVCObj,
+				daemonSet,
+				storageClassWaitForFirstConsumer,
+			},
+			ignoreDelayBinding: true,
+			expectBackupPod:    true,
+			expectBackupPVC:    true,
 		},
 		{
 			name:            "target pvc is already bound",
@@ -577,8 +606,11 @@ func TestRestoreExpose(t *testing.T) {
 					LoadAffinity:     nil,
 					CacheVolume:      test.cacheVolume,
 					DataMover:        test.dataMover,
+					RestorePVCConfig: velerotypes.RestorePVC{IgnoreDelayBinding: test.ignoreDelayBinding},
 				},
 			)
+
+			assert.Equal(t, test.expectNotConsumed, errors.Is(err, ErrTargetPVCNotConsumed))
 
 			if test.err != "" {
 				require.EqualError(t, err, test.err)
