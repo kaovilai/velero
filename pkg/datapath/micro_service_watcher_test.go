@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	kubeclientfake "k8s.io/client-go/kubernetes/fake"
@@ -180,6 +181,7 @@ func TestStartWatch(t *testing.T) {
 		expectFail           bool
 		expectFailMsg        string
 		expectProgress       int
+		expectNoEpilogWait   bool
 	}{
 		{
 			name:          "exit from ctx",
@@ -395,6 +397,53 @@ func TestStartWatch(t *testing.T) {
 			expectFail:           true,
 			expectFailMsg:        "data path pod was evicted, message: fake-evicted-message",
 		},
+		{
+			name:          "oom killed",
+			thisPod:       "fak-pod-1",
+			thisContainer: "fake-container-1",
+			insertPod: builder.ForPod("velero", "fake-pod-1").Phase(corev1api.PodFailed).
+				Containers(&corev1api.Container{
+					Name: "fake-container-1",
+					Resources: corev1api.ResourceRequirements{
+						Limits: corev1api.ResourceList{corev1api.ResourceMemory: resource.MustParse("512Mi")},
+					},
+				}).
+				ContainerStatuses(&corev1api.ContainerStatus{
+					Name:  "fake-container-1",
+					State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}},
+				}).Result(),
+			insertEventsBefore: []insertEvent{
+				{
+					event: &corev1api.Event{Reason: EventReasonStarted},
+				},
+			},
+			expectStartEvent:   true,
+			expectFail:         true,
+			expectFailMsg:      "data path pod container fake-container-1 terminated with reason OOMKilled, exit code 137, memory limit 512Mi",
+			expectNoEpilogWait: true,
+		},
+		{
+			name:          "container exited with error and no termination message",
+			thisPod:       "fak-pod-1",
+			thisContainer: "fake-container-1",
+			insertPod: builder.ForPod("velero", "fake-pod-1").Phase(corev1api.PodFailed).
+				ContainerStatuses(&corev1api.ContainerStatus{
+					Name:  "fake-container-1",
+					State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "Error", ExitCode: 1}},
+				}).Result(),
+			insertEventsBefore: []insertEvent{
+				{
+					event: &corev1api.Event{Reason: EventReasonStarted},
+				},
+				{
+					event: &corev1api.Event{Reason: EventReasonStopped},
+				},
+			},
+			expectStartEvent:     true,
+			expectTerminateEvent: true,
+			expectFail:           true,
+			expectFailMsg:        "data path pod container fake-container-1 terminated with reason Error, exit code 1",
+		},
 	}
 
 	for _, test := range tests {
@@ -426,6 +475,7 @@ func TestStartWatch(t *testing.T) {
 				},
 			}
 
+			watchStart := time.Now()
 			ms.startWatch()
 
 			if test.ctxCancel {
@@ -462,6 +512,9 @@ func TestStartWatch(t *testing.T) {
 
 			ms.wgWatcher.Wait()
 
+			if test.expectNoEpilogWait {
+				assert.Less(t, time.Since(watchStart), eventWaitTimeout)
+			}
 			assert.Equal(t, test.expectStartEvent, ms.startedFromEvent.Load())
 			assert.Equal(t, test.expectTerminateEvent, ms.terminatedFromEvent.Load())
 			assert.Equal(t, test.expectComplete, sw.complete)

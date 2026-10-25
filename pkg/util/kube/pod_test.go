@@ -32,6 +32,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -542,6 +543,29 @@ func TestGetPodTerminateMessage(t *testing.T) {
 				},
 			},
 			message: "message-1/message-2/message-3/",
+		},
+		{
+			name: "with termination reason when no termination message",
+			pod: &corev1api.Pod{
+				Spec: corev1api.PodSpec{
+					Containers: []corev1api.Container{
+						{
+							Name: "container-1",
+							Resources: corev1api.ResourceRequirements{
+								Limits: corev1api.ResourceList{corev1api.ResourceMemory: resource.MustParse("512Mi")},
+							},
+						},
+					},
+				},
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
+						{Name: "container-2", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "Error", ExitCode: 1, Message: "message-2"}}},
+						{Name: "container-3", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "Completed"}}},
+					},
+				},
+			},
+			message: "container container-1 terminated with reason OOMKilled, exit code 137, memory limit 512Mi/message-2/",
 		},
 	}
 
@@ -1646,4 +1670,132 @@ func TestGetLoadAffinityByStorageClassReturnsCopy(t *testing.T) {
 			assert.Equal(t, newAffinityList(), affinityList)
 		})
 	}
+}
+
+func TestGetPodContainerTerminateReason(t *testing.T) {
+	memoryLimit := corev1api.ResourceRequirements{
+		Limits: corev1api.ResourceList{corev1api.ResourceMemory: resource.MustParse("1Gi")},
+	}
+
+	tests := []struct {
+		name      string
+		pod       *corev1api.Pod
+		container string
+		reason    string
+	}{
+		{
+			name: "empty reason when no container status",
+			pod: &corev1api.Pod{
+				Status: corev1api.PodStatus{
+					Phase: corev1api.PodFailed,
+				},
+			},
+			container: "container-1",
+		},
+		{
+			name: "empty reason when not terminated",
+			pod: &corev1api.Pod{
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Running: &corev1api.ContainerStateRunning{}}},
+					},
+				},
+			},
+			container: "container-1",
+		},
+		{
+			name: "empty reason when exit code is 0",
+			pod: &corev1api.Pod{
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "Completed"}}},
+					},
+				},
+			},
+			container: "container-1",
+		},
+		{
+			name: "not matched container name",
+			pod: &corev1api.Pod{
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
+					},
+				},
+			},
+			container: "container-0",
+		},
+		{
+			name: "OOMKilled with memory limit",
+			pod: &corev1api.Pod{
+				Spec: corev1api.PodSpec{
+					Containers: []corev1api.Container{
+						{Name: "container-1"},
+						{Name: "container-2", Resources: memoryLimit},
+					},
+				},
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Running: &corev1api.ContainerStateRunning{}}},
+						{Name: "container-2", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
+					},
+				},
+			},
+			container: "container-2",
+			reason:    "container container-2 terminated with reason OOMKilled, exit code 137, memory limit 1Gi",
+		},
+		{
+			name: "OOMKilled without memory limit",
+			pod: &corev1api.Pod{
+				Spec: corev1api.PodSpec{
+					Containers: []corev1api.Container{{Name: "container-1"}},
+				},
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
+					},
+				},
+			},
+			container: "container-1",
+			reason:    "container container-1 terminated with reason OOMKilled, exit code 137",
+		},
+		{
+			name: "non-zero exit code without reason",
+			pod: &corev1api.Pod{
+				Spec: corev1api.PodSpec{
+					Containers: []corev1api.Container{{Name: "container-1", Resources: memoryLimit}},
+				},
+				Status: corev1api.PodStatus{
+					ContainerStatuses: []corev1api.ContainerStatus{
+						{Name: "container-1", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{ExitCode: 2}}},
+					},
+				},
+			},
+			container: "container-1",
+			reason:    "container container-1 terminated with exit code 2",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.reason, GetPodContainerTerminateReason(test.pod, test.container))
+		})
+	}
+}
+
+func TestIsPodContainerOOMKilled(t *testing.T) {
+	pod := &corev1api.Pod{
+		Status: corev1api.PodStatus{
+			ContainerStatuses: []corev1api.ContainerStatus{
+				{Name: "container-1", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
+				{Name: "container-2", State: corev1api.ContainerState{Terminated: &corev1api.ContainerStateTerminated{Reason: "Error", ExitCode: 137}}},
+				{Name: "container-3", State: corev1api.ContainerState{Running: &corev1api.ContainerStateRunning{}}},
+			},
+		},
+	}
+
+	assert.True(t, IsPodContainerOOMKilled(pod, "container-1"))
+	assert.False(t, IsPodContainerOOMKilled(pod, "container-2"))
+	assert.False(t, IsPodContainerOOMKilled(pod, "container-3"))
+	assert.False(t, IsPodContainerOOMKilled(pod, "container-0"))
 }

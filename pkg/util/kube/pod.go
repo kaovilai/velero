@@ -195,11 +195,66 @@ func GetPodTerminateMessage(pod *corev1api.Pod) string {
 		if containerStatus.State.Terminated != nil {
 			if containerStatus.State.Terminated.Message != "" {
 				message.WriteString(containerStatus.State.Terminated.Message + "/")
+			} else if reason := getContainerTerminateReason(pod, containerStatus); reason != "" {
+				message.WriteString(reason + "/")
 			}
 		}
 	}
 
 	return message.String()
+}
+
+// GetPodContainerTerminateReason returns a description of the abnormal termination
+// of a specific container of a pod, e.g. OOMKilled, or an empty string if the
+// container is not terminated or exited with code 0
+func GetPodContainerTerminateReason(pod *corev1api.Pod, container string) string {
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.Name == container {
+			return getContainerTerminateReason(pod, containerStatus)
+		}
+	}
+
+	return ""
+}
+
+// IsPodContainerOOMKilled returns true if a specific container of a pod is terminated as OOMKilled
+func IsPodContainerOOMKilled(pod *corev1api.Pod, container string) bool {
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.Name == container {
+			return containerStatus.State.Terminated != nil && containerStatus.State.Terminated.Reason == containerReasonOOMKilled
+		}
+	}
+
+	return false
+}
+
+const containerReasonOOMKilled = "OOMKilled"
+
+func getContainerTerminateReason(pod *corev1api.Pod, containerStatus corev1api.ContainerStatus) string {
+	terminated := containerStatus.State.Terminated
+	if terminated == nil || terminated.ExitCode == 0 {
+		return ""
+	}
+
+	reason := fmt.Sprintf("container %s terminated with exit code %d", containerStatus.Name, terminated.ExitCode)
+	if terminated.Reason != "" {
+		reason = fmt.Sprintf("container %s terminated with reason %s, exit code %d", containerStatus.Name, terminated.Reason, terminated.ExitCode)
+	}
+
+	if terminated.Reason != containerReasonOOMKilled {
+		return reason
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if container.Name == containerStatus.Name {
+			if limit, found := container.Resources.Limits[corev1api.ResourceMemory]; found {
+				return reason + ", memory limit " + limit.String()
+			}
+			break
+		}
+	}
+
+	return reason
 }
 
 func getPodLogReader(ctx context.Context, podGetter corev1client.CoreV1Interface, pod string, namespace string, logOptions *corev1api.PodLogOptions) (io.ReadCloser, error) {

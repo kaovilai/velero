@@ -288,8 +288,11 @@ func (ms *microServiceBRWatcher) startWatch() {
 			return
 		}
 
+		// An OOMKilled data mover process cannot send the termination event, so don't wait for it
+		oomKilled := kube.IsPodContainerOOMKilled(lastPod, ms.thisContainer)
+
 	epilogLoop:
-		for !ms.startedFromEvent.Load() || !ms.terminatedFromEvent.Load() {
+		for !oomKilled && (!ms.startedFromEvent.Load() || !ms.terminatedFromEvent.Load()) {
 			select {
 			case <-ms.ctx.Done():
 				ms.log.Warn("Watch loop is canceled on waiting final event")
@@ -334,6 +337,8 @@ func (ms *microServiceBRWatcher) startWatch() {
 				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New(terminateMessage))
 			} else if msg, evicted := ms.eventMessages.Load(EventReasonEvicted); evicted {
 				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New(msg.(string)))
+			} else if reason := kube.GetPodContainerTerminateReason(lastPod, ms.thisContainer); reason != "" {
+				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New("data path pod "+reason))
 			} else {
 				ms.callbacks.OnFailed(ms.ctx, ms.namespace, ms.taskName, errors.New(lastPod.Status.Message))
 			}
