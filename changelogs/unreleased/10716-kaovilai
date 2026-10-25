@@ -1,0 +1,1 @@
+Retain the backup snapshot under a Retain VolumeSnapshotClass only for the block data mover, and document the snapshot retention
