@@ -34,6 +34,7 @@ Velero Built-in Data Mover (VBDM) provides two data movers:
      - **True incremental backups via CBT**: Only transfers changed blocks since the previous snapshot, substantially minimizing network transfer, backup storage footprint, and backup duration (lowering TCO).
      - **Volume mode flexibility**: Works at the block level for both `FileSystem` and `Block` mode volumes (as long as they are backed by block storage), so `FileSystem` mode volumes also get block-level throughput and CBT incremental backups. On restore, it writes the raw block data to a `Block` mode volume and then rebinds that volume to the target PVC in the backed-up volume's mode. Changing the volume mode on restore (for example from `Block` to `FileSystem` with resource modifiers) has not been validated.
      - **OS independence**: Does not require host filesystem drivers for the volume's filesystem format.
+   - Is used through CSI snapshot data movement. With `defaultVolumesToFsBackup: true`, volumes are selected for fs-backup instead, and `Block` mode volumes are skipped with a warning. To back them up with the block data mover, use a [volume policy][26] with the `pvcVolumeMode: Block` condition and the `snapshot` action.
    - For more technical details, see the [Block Data Mover Design][24].
 
 Both built-in data movers read/write snapshot data from/to the Unified Repository.
