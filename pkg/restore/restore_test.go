@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/velero-io/velero/internal/resourcemodifiers"
 	"github.com/velero-io/velero/internal/resourcepolicies"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	"github.com/velero-io/velero/pkg/util/collections"
@@ -45,6 +46,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/dynamic"
 	kubetesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/velero-io/velero/internal/volume"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -5542,4 +5544,87 @@ func TestRestoreInplaceSourceSizeCarrierAnnotation(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, got.GetAnnotations(), velerov1api.InplaceRestoreSourceSizeAnnotation)
 	})
+}
+
+func TestRestoreWarnsWhenResourceModifierChangesPVCVolumeModeFromBlock(t *testing.T) {
+	pvc := func(volumeMode *corev1api.PersistentVolumeMode) *corev1api.PersistentVolumeClaim {
+		p := builder.ForPersistentVolumeClaim("ns-1", "pvc-1").StorageClass("sc-1").Result()
+		p.Spec.VolumeMode = volumeMode
+		return p
+	}
+	modifier := func(patches ...resourcemodifiers.JSONPatch) *resourcemodifiers.ResourceModifiers {
+		return &resourcemodifiers.ResourceModifiers{
+			Version: "v1",
+			ResourceModifierRules: []resourcemodifiers.ResourceModifierRule{
+				{
+					Conditions: resourcemodifiers.Conditions{GroupResource: "persistentvolumeclaims"},
+					Patches:    patches,
+				},
+			},
+		}
+	}
+	wantWarning := Result{
+		Namespaces: map[string][]string{
+			"ns-1": {"resource modifiers changed the volumeMode of PersistentVolumeClaim ns-1/pvc-1 from Block to Filesystem"},
+		},
+	}
+
+	tests := []struct {
+		name         string
+		pvc          *corev1api.PersistentVolumeClaim
+		modifiers    *resourcemodifiers.ResourceModifiers
+		wantWarnings Result
+	}{
+		{
+			name:         "Block changed to Filesystem warns",
+			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
+			modifiers:    modifier(resourcemodifiers.JSONPatch{Operation: "replace", Path: "/spec/volumeMode", Value: "Filesystem"}),
+			wantWarnings: wantWarning,
+		},
+		{
+			name:         "Block volumeMode removed warns",
+			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
+			modifiers:    modifier(resourcemodifiers.JSONPatch{Operation: "remove", Path: "/spec/volumeMode"}),
+			wantWarnings: wantWarning,
+		},
+		{
+			name:      "Block kept while other fields change doesn't warn",
+			pvc:       pvc(ptr.To(corev1api.PersistentVolumeBlock)),
+			modifiers: modifier(resourcemodifiers.JSONPatch{Operation: "replace", Path: "/spec/storageClassName", Value: "sc-2"}),
+		},
+		{
+			name:      "Filesystem changed to Block doesn't warn",
+			pvc:       pvc(ptr.To(corev1api.PersistentVolumeFilesystem)),
+			modifiers: modifier(resourcemodifiers.JSONPatch{Operation: "replace", Path: "/spec/volumeMode", Value: "Block"}),
+		},
+		{
+			name:      "unset volumeMode changed to Filesystem doesn't warn",
+			pvc:       pvc(nil),
+			modifiers: modifier(resourcemodifiers.JSONPatch{Operation: "add", Path: "/spec/volumeMode", Value: "Filesystem"}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.AddItems(t, test.PVCs())
+
+			data := &Request{
+				Log:               h.log,
+				Restore:           defaultRestore().Result(),
+				Backup:            defaultBackup().Result(),
+				BackupReader:      test.NewTarWriter(t).AddItems("persistentvolumeclaims", tc.pvc).Done(),
+				RestoredItems:     map[itemKey]restoredItemStatus{},
+				ResourceModifiers: tc.modifiers,
+			}
+			warnings, errs := h.restorer.Restore(data, nil, nil)
+
+			assertEmptyResults(t, errs)
+			if tc.wantWarnings.IsEmpty() {
+				assertEmptyResults(t, warnings)
+			} else {
+				assertWantErrsOrWarnings(t, tc.wantWarnings, warnings)
+			}
+		})
+	}
 }

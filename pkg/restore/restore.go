@@ -1852,9 +1852,21 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	}
 
 	if ctx.resourceModifiers != nil {
+		volumeModeBeforeModify := pvcVolumeMode(obj, groupResource)
 		if errList := ctx.resourceModifiers.ApplyResourceModifierRules(obj, groupResource.String(), ctx.kbClient.Scheme(), restoreLogger); errList != nil {
 			for _, err := range errList {
 				errs.Add(namespace, err)
+			}
+		}
+		// The backed-up data of a Block volume is raw device content. If it is restored into a
+		// Filesystem volume, the CSI driver may format the volume when it is first mounted,
+		// destroying the restored data, so make the change visible.
+		if volumeModeBeforeModify == corev1api.PersistentVolumeBlock {
+			if volumeMode := pvcVolumeMode(obj, groupResource); volumeMode != corev1api.PersistentVolumeBlock {
+				msg := fmt.Sprintf("resource modifiers changed the volumeMode of PersistentVolumeClaim %s/%s from %s to %s: the volume data backed up from a %s volume is raw device content, the volume may be formatted when it is first mounted and the restored data lost",
+					namespace, obj.GetName(), corev1api.PersistentVolumeBlock, volumeMode, corev1api.PersistentVolumeBlock)
+				restoreLogger.Warn(msg)
+				warnings.Add(namespace, errors.New(msg))
 			}
 		}
 	}
@@ -2524,6 +2536,19 @@ func hasPodVolumeBackup(unstructuredPV *unstructured.Unstructured, ctx *restoreC
 func hasDeleteReclaimPolicy(obj map[string]any) bool {
 	policy, _, _ := unstructured.NestedString(obj, "spec", "persistentVolumeReclaimPolicy")
 	return policy == string(corev1api.PersistentVolumeReclaimDelete)
+}
+
+// pvcVolumeMode returns the volume mode of a PersistentVolumeClaim, defaulting to Filesystem
+// when it is not set, or an empty string if the object is not a PersistentVolumeClaim.
+func pvcVolumeMode(obj *unstructured.Unstructured, groupResource schema.GroupResource) corev1api.PersistentVolumeMode {
+	if groupResource != kuberesource.PersistentVolumeClaims {
+		return ""
+	}
+	volumeMode, _, _ := unstructured.NestedString(obj.Object, "spec", "volumeMode")
+	if volumeMode == "" {
+		return corev1api.PersistentVolumeFilesystem
+	}
+	return corev1api.PersistentVolumeMode(volumeMode)
 }
 
 // resetVolumeBindingInfo clears any necessary metadata out of a PersistentVolume

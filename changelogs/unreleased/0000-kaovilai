@@ -1,0 +1,1 @@
+Warn when resource modifiers change a restored PVC's volumeMode from Block
