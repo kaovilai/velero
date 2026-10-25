@@ -1,0 +1,1 @@
+Fail backups whose metadata cannot be written to the backup storage location for longer than --resource-timeout (e.g. bucket over quota) instead of leaving them in WaitingForPluginOperations or Finalizing forever, and record the error in status.failureReason

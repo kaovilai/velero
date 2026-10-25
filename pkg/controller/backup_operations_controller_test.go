@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -62,6 +63,8 @@ func mockBackupOperationsReconciler(fakeClient kbclient.Client, fakeClock *testc
 		NewFakeSingleObjectBackupStoreGetter(backupStore),
 		metrics.NewServerMetrics(),
 		itemoperationmap.NewBackupItemOperationsMap(),
+		NewBackupTracker(),
+		10*time.Minute,
 	)
 	abor.clock = fakeClock
 	return abor
@@ -346,4 +349,97 @@ func TestWrapErrMsg(t *testing.T) {
 			assert.Equal(t, test.expect, got)
 		})
 	}
+}
+
+// When velero-backup.json can't be written to the backup storage location
+// (e.g. the bucket is over quota), the backup must not stay in
+// WaitingForPluginOperations forever: it is retried until the failure has
+// lasted for the resource timeout, then marked Failed with the error.
+func TestBackupOperationsReconcile_PersistFailureTimeout(t *testing.T) {
+	fakeClock := testclocks.NewFakeClock(time.Now())
+	metav1Now := metav1.NewTime(fakeClock.Now())
+	resourceTimeout := time.Minute
+
+	backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-persist-fail").
+		StorageLocation("default").
+		ItemOperationTimeout(60 * time.Minute).
+		ObjectMeta(builder.WithUID("foo-persist")).
+		Phase(velerov1api.BackupPhaseWaitingForPluginOperationsPartiallyFailed).Result()
+	location := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "default").Result()
+	operations := []*itemoperation.BackupOperation{
+		{
+			Spec: itemoperation.BackupOperationSpec{
+				BackupName:       backup.Name,
+				BackupUID:        "foo-persist",
+				BackupItemAction: "foo-persist",
+				ResourceIdentifier: velero.ResourceIdentifier{
+					GroupResource: kuberesource.Pods,
+					Namespace:     "ns-1",
+					Name:          "pod-1",
+				},
+				OperationID: "operation-persist",
+			},
+			Status: itemoperation.OperationStatus{
+				Phase:   itemoperation.OperationPhaseNew,
+				Created: &metav1Now,
+			},
+		},
+	}
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, backup, location)
+	localPluginManager := &pluginmocks.Manager{}
+	localBackupStore := &persistencemocks.BackupStore{}
+	localBIA := &biav2mocks.BackupItemAction{}
+	tracker := NewBackupTracker()
+	tracker.AddPostProcessing(backup.Namespace, backup.Name)
+
+	reconciler := NewBackupOperationsReconciler(
+		logrus.StandardLogger(),
+		fakeClient,
+		defaultBackupOperationsFrequency,
+		func(logrus.FieldLogger) clientmgmt.Manager { return localPluginManager },
+		NewFakeSingleObjectBackupStoreGetter(localBackupStore),
+		metrics.NewServerMetrics(),
+		itemoperationmap.NewBackupItemOperationsMap(),
+		tracker,
+		resourceTimeout,
+	)
+	reconciler.clock = fakeClock
+
+	localPluginManager.On("CleanupClients").Return(nil)
+	localPluginManager.On("GetBackupItemActionV2", "foo-persist").Return(localBIA, nil)
+	localBIA.On("Name").Return("test")
+	localBIA.On("Progress", "operation-persist", mock.Anything).Return(velero.OperationProgress{Completed: true, Err: "QuotaExceeded"}, nil)
+	localBackupStore.On("GetBackupItemOperations", backup.Name).Return(operations, nil)
+	localBackupStore.On("PutBackupMetadata", backup.Name, mock.Anything).Return(errors.New("PutObject: 403 QuotaExceeded"))
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backup.Namespace, Name: backup.Name}}
+	getBackup := func() *velerov1api.Backup {
+		b := &velerov1api.Backup{}
+		require.NoError(t, fakeClient.Get(t.Context(), req.NamespacedName, b))
+		return b
+	}
+
+	// First failure: retried, nothing persisted yet.
+	_, err := reconciler.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, velerov1api.BackupPhaseWaitingForPluginOperationsPartiallyFailed, getBackup().Status.Phase)
+	assert.True(t, tracker.Contains(backup.Namespace, backup.Name))
+
+	// Still within the resource timeout: still retried.
+	fakeClock.Step(resourceTimeout / 2)
+	_, err = reconciler.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, velerov1api.BackupPhaseWaitingForPluginOperationsPartiallyFailed, getBackup().Status.Phase)
+
+	// Failing for longer than the resource timeout: the backup is Failed.
+	fakeClock.Step(resourceTimeout)
+	_, err = reconciler.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	backupAfter := getBackup()
+	assert.Equal(t, velerov1api.BackupPhaseFailed, backupAfter.Status.Phase)
+	assert.Contains(t, backupAfter.Status.FailureReason, `backup storage location "default"`)
+	assert.Contains(t, backupAfter.Status.FailureReason, "QuotaExceeded")
+	assert.NotNil(t, backupAfter.Status.CompletionTimestamp)
+	assert.False(t, tracker.Contains(backup.Namespace, backup.Name))
 }

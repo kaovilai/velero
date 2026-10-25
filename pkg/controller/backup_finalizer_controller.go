@@ -35,6 +35,7 @@ import (
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/velero-io/velero/pkg/backup"
 	"github.com/velero-io/velero/pkg/client"
+	serverconfig "github.com/velero-io/velero/pkg/cmd/server/config"
 	"github.com/velero-io/velero/pkg/constant"
 	"github.com/velero-io/velero/pkg/itemoperation"
 	"github.com/velero-io/velero/pkg/kuberesource"
@@ -70,6 +71,7 @@ type backupFinalizerReconciler struct {
 	backupStoreGetter persistence.ObjectBackupStoreGetter
 	log               logrus.FieldLogger
 	resourceTimeout   time.Duration
+	persistFailures   *persistFailureTracker
 }
 
 // NewBackupFinalizerReconciler initializes and returns backupFinalizerReconciler struct.
@@ -85,6 +87,9 @@ func NewBackupFinalizerReconciler(
 	metrics *metrics.ServerMetrics,
 	resourceTimeout time.Duration,
 ) *backupFinalizerReconciler {
+	if resourceTimeout <= 0 {
+		resourceTimeout = serverconfig.DefaultResourceTimeout
+	}
 	return &backupFinalizerReconciler{
 		client:            client,
 		globalCRClient:    globalCRClient,
@@ -95,6 +100,8 @@ func NewBackupFinalizerReconciler(
 		backupStoreGetter: backupStoreGetter,
 		log:               log,
 		metrics:           metrics,
+		resourceTimeout:   resourceTimeout,
+		persistFailures:   newPersistFailureTracker(),
 	}
 }
 
@@ -276,15 +283,16 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err := retry.OnError(objectStorageBackoff, func(err error) bool { return err != nil },
 		func() error { return backupStore.PutBackupMetadata(backup.Name, bytes.NewReader(backupJSON.Bytes())) },
 	); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "error uploading backup json")
+		return r.handlePersistError(backup, errors.Wrap(err, "error uploading backup json"), log)
 	}
 	if len(operations) > 0 {
 		if err := retry.OnError(objectStorageBackoff, func(err error) bool { return err != nil },
 			func() error { return backupStore.PutBackupContents(backup.Name, outBackupFile) },
 		); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "error uploading backup final contents")
+			return r.handlePersistError(backup, errors.Wrap(err, "error uploading backup final contents"), log)
 		}
 	}
+	r.persistFailures.clear(backup.UID)
 
 	// Uploads succeeded — now safe to set the final phase on the in-memory
 	// backup object so the deferred patch writes it to the API server.
@@ -303,6 +311,27 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	recordBackupMetrics(log, backup, outBackupFile, r.metrics, true)
 
+	return ctrl.Result{}, nil
+}
+
+// handlePersistError is called when writing the finalized backup to the
+// backup storage location failed. The backup keeps its Finalizing* phase and
+// the error is returned so the write is retried, until the write has kept
+// failing for longer than the resource timeout; then the backup is marked
+// Failed (persisted by the deferred patch in Reconcile) so it does not stay in
+// Finalizing* forever.
+func (r *backupFinalizerReconciler) handlePersistError(backup *velerov1api.Backup, err error, log logrus.FieldLogger) (ctrl.Result, error) {
+	now := r.clock.Now()
+	failingFor := r.persistFailures.failingFor(backup.UID, now)
+	if failingFor < r.resourceTimeout {
+		return ctrl.Result{}, err
+	}
+	r.persistFailures.clear(backup.UID)
+	markBackupFailedOnPersistError(backup, failingFor, err, now)
+	log.Error(backup.Status.FailureReason)
+	backupScheduleName := backup.GetLabels()[velerov1api.ScheduleNameLabel]
+	r.metrics.RegisterBackupFailed(backupScheduleName)
+	r.metrics.RegisterBackupLastStatus(backupScheduleName, metrics.BackupLastStatusFailure)
 	return ctrl.Result{}, nil
 }
 

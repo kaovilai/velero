@@ -401,6 +401,75 @@ func TestBackupFinalizerReconcile_PutBackupMetadataFail(t *testing.T) {
 	}
 }
 
+// A finalizing backup whose metadata can't be written to the backup storage
+// location keeps its phase and is retried until the failure has lasted for the
+// resource timeout, then it is marked Failed instead of staying Finalizing*
+// forever.
+func TestBackupFinalizerReconcile_PutBackupMetadataFailTimeout(t *testing.T) {
+	origBackoff := objectStorageBackoff
+	objectStorageBackoff = wait.Backoff{Duration: time.Millisecond, Steps: 2}
+	t.Cleanup(func() { objectStorageBackoff = origBackoff })
+
+	fakeClock := testclocks.NewFakeClock(time.Now())
+	resourceTimeout := time.Minute
+	location := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "default").Result()
+	backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-meta-fail-timeout").
+		StorageLocation("default").
+		ObjectMeta(builder.WithUID("foo")).
+		StartTimestamp(fakeClock.Now()).
+		Phase(velerov1api.BackupPhaseFinalizingPartiallyFailed).Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, backup, location)
+	fakeGlobalClient := velerotest.NewFakeControllerRuntimeClient(t, backup, location)
+	localPluginManager := &pluginmocks.Manager{}
+	localBackupStore := &persistencemocks.BackupStore{}
+	tracker := NewBackupTracker()
+	tracker.AddPostProcessing(backup.Namespace, backup.Name)
+
+	reconciler := NewBackupFinalizerReconciler(
+		fakeClient,
+		fakeGlobalClient,
+		fakeClock,
+		new(fakeBackupper),
+		func(logrus.FieldLogger) clientmgmt.Manager { return localPluginManager },
+		tracker,
+		NewFakeSingleObjectBackupStoreGetter(localBackupStore),
+		logrus.StandardLogger(),
+		metrics.NewServerMetrics(),
+		resourceTimeout,
+	)
+
+	localPluginManager.On("CleanupClients").Return(nil)
+	localBackupStore.On("GetBackupItemOperations", backup.Name).Return(nil, nil)
+	localBackupStore.On("PutBackupMetadata", mock.Anything, mock.Anything).Return(fmt.Errorf("PutObject: 403 QuotaExceeded"))
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: backup.Namespace, Name: backup.Name}}
+	getBackup := func() *velerov1api.Backup {
+		b := &velerov1api.Backup{}
+		require.NoError(t, fakeClient.Get(t.Context(), req.NamespacedName, b))
+		return b
+	}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, velerov1api.BackupPhaseFinalizingPartiallyFailed, getBackup().Status.Phase)
+
+	fakeClock.Step(resourceTimeout / 2)
+	_, err = reconciler.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	assert.Equal(t, velerov1api.BackupPhaseFinalizingPartiallyFailed, getBackup().Status.Phase)
+
+	fakeClock.Step(resourceTimeout)
+	_, err = reconciler.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	backupAfter := getBackup()
+	assert.Equal(t, velerov1api.BackupPhaseFailed, backupAfter.Status.Phase)
+	assert.Contains(t, backupAfter.Status.FailureReason, "error uploading backup json")
+	assert.Contains(t, backupAfter.Status.FailureReason, "QuotaExceeded")
+	assert.NotNil(t, backupAfter.Status.CompletionTimestamp)
+	assert.False(t, tracker.Contains(backup.Namespace, backup.Name))
+}
+
 func TestBackupFinalizerReconcile_PutBackupContentsFail(t *testing.T) {
 	origBackoff := objectStorageBackoff
 	objectStorageBackoff = wait.Backoff{Duration: time.Millisecond, Steps: 2}
