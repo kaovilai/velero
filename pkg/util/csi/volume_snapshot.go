@@ -713,6 +713,19 @@ func WaitUntilVSCHandleIsReady(
 	vsc := new(snapshotv1api.VolumeSnapshotContent)
 	var interval time.Duration
 
+	// snapshotErr is the error currently reported on the VSC (or VS) status.
+	// The snapshot controller keeps retrying on such errors, so they are not
+	// terminal, but it is returned if the wait times out.
+	var snapshotErr *snapshotv1api.VolumeSnapshotError
+	recordSnapshotErr := func(kind, name string, snapErr *snapshotv1api.VolumeSnapshotError) {
+		// Only log when the error changes, not on every poll.
+		if snapErr != nil && (snapshotErr == nil ||
+			stringptr.GetString(snapshotErr.Message) != stringptr.GetString(snapErr.Message)) {
+			log.Warnf("%s %s has error: %v", kind, name, stringptr.GetString(snapErr.Message))
+		}
+		snapshotErr = snapErr
+	}
+
 	pollFunc := func(ctx context.Context) (bool, error) {
 		vs := new(snapshotv1api.VolumeSnapshot)
 		if err := crClient.Get(
@@ -729,6 +742,11 @@ func WaitUntilVSCHandleIsReady(
 		}
 
 		if vs.Status == nil || vs.Status.BoundVolumeSnapshotContentName == nil {
+			if vs.Status != nil {
+				recordSnapshotErr("VolumeSnapshot", vs.Namespace+"/"+vs.Name, vs.Status.Error)
+			} else {
+				recordSnapshotErr("VolumeSnapshot", vs.Namespace+"/"+vs.Name, nil)
+			}
 			log.Infof("Waiting for CSI driver to reconcile volumesnapshot %s/%s. Retrying in %ds",
 				volSnap.Namespace, volSnap.Name, interval/time.Second)
 			return false, nil
@@ -741,6 +759,9 @@ func WaitUntilVSCHandleIsReady(
 			},
 			vsc,
 		); err != nil {
+			if vs.Status.Error != nil {
+				recordSnapshotErr("VolumeSnapshot", vs.Namespace+"/"+vs.Name, vs.Status.Error)
+			}
 			return false,
 				errors.Wrapf(
 					err,
@@ -759,10 +780,10 @@ func WaitUntilVSCHandleIsReady(
 			log.Infof(
 				"Waiting for VolumeSnapshotContents %s to have snapshot handle. Retrying in %ds",
 				vsc.Name, interval/time.Second)
-			if vsc.Status != nil &&
-				vsc.Status.Error != nil {
-				log.Warnf("VolumeSnapshotContent %s has error: %v",
-					vsc.Name, stringptr.GetString(vsc.Status.Error.Message))
+			if vsc.Status != nil && vsc.Status.Error != nil {
+				recordSnapshotErr("VolumeSnapshotContent", vsc.Name, vsc.Status.Error)
+			} else {
+				recordSnapshotErr("VolumeSnapshot", vs.Namespace+"/"+vs.Name, vs.Status.Error)
 			}
 			return false, nil
 		}
@@ -771,6 +792,7 @@ func WaitUntilVSCHandleIsReady(
 	}
 
 	var err error
+	var timedOut bool
 	frequentPolling, err := strconv.ParseBool(os.Getenv("CSI_SNAPSHOT_EARLY_FREQUENT_POLLING"))
 
 	if err == nil && frequentPolling {
@@ -780,53 +802,63 @@ func WaitUntilVSCHandleIsReady(
 		// First poll with a short interval and timeout.
 		interval = 1 * time.Second
 		timeout := 10 * time.Second
-		err = wait.PollUntilContextTimeout(
-			context.Background(),
-			interval,
-			timeout,
-			true,
-			pollFunc,
-		)
+		timedOut, err = pollUntilTimeout(interval, timeout, pollFunc)
 
 		if err == nil {
 			return vsc, nil
 		}
-		if !wait.Interrupted(err) {
+		if !timedOut {
 			return nil, err
 		}
 	}
 
 	// If the first poll timed out, poll with a longer interval and the full timeout.
 	interval = 5 * time.Second
-	err = wait.PollUntilContextTimeout(
-		context.Background(),
-		interval,
-		csiSnapshotTimeout,
-		true,
-		pollFunc,
-	)
+	timedOut, err = pollUntilTimeout(interval, csiSnapshotTimeout, pollFunc)
 
 	if err != nil {
-		if wait.Interrupted(err) {
-			if vsc != nil &&
-				vsc.Status != nil &&
-				vsc.Status.Error != nil {
+		if timedOut {
+			if snapshotErr != nil {
 				log.Errorf(
-					"Timed out awaiting reconciliation of VolumeSnapshot, VolumeSnapshotContent %s has error: %v",
-					vsc.Name, stringptr.GetString(vsc.Status.Error.Message))
+					"Timed out awaiting reconciliation of VolumeSnapshot %s/%s, last snapshot error: %v",
+					volSnap.Namespace, volSnap.Name, stringptr.GetString(snapshotErr.Message))
 				return nil,
 					errors.Errorf("CSI got timed out with error: %v",
-						stringptr.GetString(vsc.Status.Error.Message))
-			} else {
-				log.Errorf(
-					"Timed out awaiting reconciliation of volumesnapshot %s/%s",
-					volSnap.Namespace, volSnap.Name)
+						stringptr.GetString(snapshotErr.Message))
 			}
+			log.Errorf(
+				"Timed out awaiting reconciliation of volumesnapshot %s/%s",
+				volSnap.Namespace, volSnap.Name)
+			return nil, errors.Wrapf(err, "timed out awaiting reconciliation of volumesnapshot %s/%s",
+				volSnap.Namespace, volSnap.Name)
 		}
 		return nil, err
 	}
 
 	return vsc, nil
+}
+
+// pollUntilTimeout runs wait.PollUntilContextTimeout and reports whether a
+// returned error means the timeout was reached. wait.Interrupted alone is not
+// enough: a poll that runs at the deadline can fail with a non-context error,
+// e.g. the client rate limiter returns "rate: Wait(n=1) would exceed context
+// deadline" once the deadline has passed, and that error is returned as is.
+func pollUntilTimeout(
+	interval, timeout time.Duration,
+	condition wait.ConditionWithContextFunc,
+) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	err := wait.PollUntilContextCancel(ctx, interval, true, condition)
+	if err == nil {
+		return false, nil
+	}
+	if wait.Interrupted(err) || ctx.Err() != nil {
+		return true, err
+	}
+	deadline, _ := ctx.Deadline()
+	return !time.Now().Before(deadline), err
 }
 
 func DiagnoseVS(vs *snapshotv1api.VolumeSnapshot, events *corev1api.EventList) string {

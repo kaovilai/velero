@@ -37,6 +37,7 @@ import (
 	clientTesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/builder"
@@ -1906,6 +1907,98 @@ func TestWaitUntilVSCHandleIsReady(t *testing.T) {
 				return
 			}
 			assert.Equal(t, tc.exepctedVSC, actualVSC)
+		})
+	}
+}
+
+func TestWaitUntilVSCHandleIsReadyTimeoutError(t *testing.T) {
+	vscName := "fake-vsc"
+	quotaErr := "Failed to check and update snapshot content: failed to take snapshot of the volume: rpc error: code = Internal desc = rbd: ret=-122, Disk quota exceeded"
+	// The client rate limiter returns this error, instead of a context error,
+	// for a request made once the poll deadline has passed.
+	rateLimiterErr := errors.New("client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline")
+
+	snapshotErr := snapshotv1api.VolumeSnapshotError{Message: &quotaErr}
+	boundVS := builder.ForVolumeSnapshot("default", "vs").
+		Status().BoundVolumeSnapshotContentName(vscName).Result()
+	boundVSWithError := builder.ForVolumeSnapshot("default", "vs").
+		Status().BoundVolumeSnapshotContentName(vscName).StatusError(snapshotErr).Result()
+	unboundVSWithError := builder.ForVolumeSnapshot("default", "vs").
+		Status().StatusError(snapshotErr).Result()
+
+	vscWithError := &snapshotv1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: vscName},
+		Status: &snapshotv1api.VolumeSnapshotContentStatus{
+			Error: &snapshotErr,
+		},
+	}
+
+	failGet := func(kind string, err error) interceptor.Funcs {
+		return interceptor.Funcs{
+			Get: func(ctx context.Context, client crclient.WithWatch, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
+				switch obj.(type) {
+				case *snapshotv1api.VolumeSnapshot:
+					if kind == "vs" {
+						return err
+					}
+				case *snapshotv1api.VolumeSnapshotContent:
+					if kind == "vsc" {
+						return err
+					}
+				}
+				return client.Get(ctx, key, obj, opts...)
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		objs        []runtime.Object
+		funcs       interceptor.Funcs
+		timeout     time.Duration
+		expectedErr string
+	}{
+		{
+			name:        "VSC error is returned on timeout",
+			objs:        []runtime.Object{boundVS, vscWithError},
+			expectedErr: "CSI got timed out with error: " + quotaErr,
+		},
+		{
+			name:        "VS error is returned on timeout when the VS is not bound",
+			objs:        []runtime.Object{unboundVSWithError},
+			expectedErr: "CSI got timed out with error: " + quotaErr,
+		},
+		{
+			name:        "snapshot error is returned when a request fails at the deadline",
+			objs:        []runtime.Object{boundVSWithError, vscWithError},
+			funcs:       failGet("vsc", rateLimiterErr),
+			expectedErr: "CSI got timed out with error: " + quotaErr,
+		},
+		{
+			name:        "request failure at the deadline is reported as a timeout",
+			objs:        []runtime.Object{boundVS},
+			funcs:       failGet("vs", rateLimiterErr),
+			expectedErr: "timed out awaiting reconciliation of volumesnapshot default/vs: failed to get volumesnapshot default/vs: " + rateLimiterErr.Error(),
+		},
+		{
+			name:        "request failure before the deadline is returned as is",
+			objs:        []runtime.Object{boundVSWithError, vscWithError},
+			funcs:       failGet("vsc", errors.New("fake-get-error")),
+			timeout:     time.Minute,
+			expectedErr: "failed to get VolumeSnapshotContent fake-vsc for VolumeSnapshot default/vs: fake-get-error",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := velerotest.NewFakeControllerRuntimeClientBuilder(t).
+				WithRuntimeObjects(tc.objs...).
+				WithInterceptorFuncs(tc.funcs).
+				Build()
+
+			vsc, err := WaitUntilVSCHandleIsReady(boundVS, client, logrus.New(), tc.timeout)
+			require.EqualError(t, err, tc.expectedErr)
+			assert.Nil(t, vsc)
 		})
 	}
 }
