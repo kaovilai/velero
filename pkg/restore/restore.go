@@ -1858,13 +1858,14 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				errs.Add(namespace, err)
 			}
 		}
-		// The backed-up data of a Block volume is raw device content. If it is restored into a
-		// Filesystem volume, the CSI driver may format the volume when it is first mounted,
-		// destroying the restored data, so make the change visible.
+		// The backed-up data of a Block volume is raw device content, so restoring it into a
+		// Filesystem volume either fails or may destroy the restored data, so make the change
+		// visible.
 		if volumeModeBeforeModify == corev1api.PersistentVolumeBlock {
 			if volumeMode := pvcVolumeMode(obj, groupResource); volumeMode != corev1api.PersistentVolumeBlock {
-				msg := fmt.Sprintf("resource modifiers changed the volumeMode of PersistentVolumeClaim %s/%s from %s to %s: the volume data backed up from a %s volume is raw device content, the volume may be formatted when it is first mounted and the restored data lost",
-					namespace, obj.GetName(), corev1api.PersistentVolumeBlock, volumeMode, corev1api.PersistentVolumeBlock)
+				info, ok := backupVolumeInfoForPVC(ctx.backupVolumeInfoMap, obj.GetNamespace(), obj.GetName())
+				msg := fmt.Sprintf("resource modifiers changed the volumeMode of PersistentVolumeClaim %s/%s from %s to %s: %s",
+					namespace, obj.GetName(), corev1api.PersistentVolumeBlock, volumeMode, blockVolumeModeChangeConsequence(info, ok))
 				restoreLogger.Warn(msg)
 				warnings.Add(namespace, errors.New(msg))
 			}
@@ -2549,6 +2550,21 @@ func pvcVolumeMode(obj *unstructured.Unstructured, groupResource schema.GroupRes
 		return corev1api.PersistentVolumeFilesystem
 	}
 	return corev1api.PersistentVolumeMode(volumeMode)
+}
+
+// blockVolumeModeChangeConsequence describes what happens when the volume data of a Block mode
+// PVC is restored into a PVC whose volumeMode was changed, depending on how the data was backed up.
+func blockVolumeModeChangeConsequence(info volume.BackupVolumeInfo, found bool) string {
+	const formatted = "the volume may be formatted when it is first mounted and the restored data lost"
+	switch {
+	case found && info.BackupMethod == volume.CSISnapshot && info.SnapshotDataMoved:
+		return "the data mover restores the raw device content of the Block volume; unless that content is a filesystem, " + formatted
+	case found && info.BackupMethod == volume.CSISnapshot:
+		return "the PVC is provisioned from a CSI snapshot of a Block volume; the CSI provisioner normally rejects the volume mode change and leaves the PVC Pending unless the VolumeSnapshotContent has the " +
+			kube.KubeAnnAllowVolumeModeChange + " annotation; if the change is allowed, " + formatted
+	default:
+		return "the backed-up volume data is the raw device content of a Block volume; depending on how it is restored, the PVC may not be provisioned or bound, or " + formatted
+	}
 }
 
 // resetVolumeBindingInfo clears any necessary metadata out of a PersistentVolume

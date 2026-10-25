@@ -5563,29 +5563,59 @@ func TestRestoreWarnsWhenResourceModifierChangesPVCVolumeModeFromBlock(t *testin
 			},
 		}
 	}
-	wantWarning := Result{
-		Namespaces: map[string][]string{
-			"ns-1": {"resource modifiers changed the volumeMode of PersistentVolumeClaim ns-1/pvc-1 from Block to Filesystem"},
-		},
+	wantWarning := func(consequence string) Result {
+		return Result{
+			Namespaces: map[string][]string{
+				"ns-1": {"resource modifiers changed the volumeMode of PersistentVolumeClaim ns-1/pvc-1 from Block to Filesystem: " + consequence},
+			},
+		}
 	}
+	volumeInfos := func(method volume.Method, dataMoved bool) map[string]volume.BackupVolumeInfo {
+		return map[string]volume.BackupVolumeInfo{
+			"pv-1": {PVCName: "pvc-1", PVCNamespace: "ns-1", PVName: "pv-1", BackupMethod: method, SnapshotDataMoved: dataMoved},
+		}
+	}
+	toFilesystem := modifier(resourcemodifiers.JSONPatch{Operation: "replace", Path: "/spec/volumeMode", Value: "Filesystem"})
 
 	tests := []struct {
 		name         string
 		pvc          *corev1api.PersistentVolumeClaim
+		volumeInfos  map[string]volume.BackupVolumeInfo
 		modifiers    *resourcemodifiers.ResourceModifiers
 		wantWarnings Result
 	}{
 		{
-			name:         "Block changed to Filesystem warns",
+			name:         "Block changed to Filesystem without volume info warns",
 			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
-			modifiers:    modifier(resourcemodifiers.JSONPatch{Operation: "replace", Path: "/spec/volumeMode", Value: "Filesystem"}),
-			wantWarnings: wantWarning,
+			modifiers:    toFilesystem,
+			wantWarnings: wantWarning("the backed-up volume data is the raw device content of a Block volume; depending on how it is restored, the PVC may not be provisioned or bound, or the volume may be formatted when it is first mounted"),
 		},
 		{
 			name:         "Block volumeMode removed warns",
 			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
 			modifiers:    modifier(resourcemodifiers.JSONPatch{Operation: "remove", Path: "/spec/volumeMode"}),
-			wantWarnings: wantWarning,
+			wantWarnings: wantWarning("the backed-up volume data is the raw device content of a Block volume"),
+		},
+		{
+			name:         "Block changed to Filesystem with data mover warns about formatting",
+			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
+			volumeInfos:  volumeInfos(volume.CSISnapshot, true),
+			modifiers:    toFilesystem,
+			wantWarnings: wantWarning("the data mover restores the raw device content of the Block volume; unless that content is a filesystem, the volume may be formatted when it is first mounted and the restored data lost"),
+		},
+		{
+			name:         "Block changed to Filesystem with CSI snapshot warns about Pending PVC",
+			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
+			volumeInfos:  volumeInfos(volume.CSISnapshot, false),
+			modifiers:    toFilesystem,
+			wantWarnings: wantWarning("the PVC is provisioned from a CSI snapshot of a Block volume; the CSI provisioner normally rejects the volume mode change and leaves the PVC Pending unless the VolumeSnapshotContent has the snapshot.storage.kubernetes.io/allow-volume-mode-change annotation"),
+		},
+		{
+			name:         "Block changed to Filesystem with native snapshot uses the generic warning",
+			pvc:          pvc(ptr.To(corev1api.PersistentVolumeBlock)),
+			volumeInfos:  volumeInfos(volume.NativeSnapshot, false),
+			modifiers:    toFilesystem,
+			wantWarnings: wantWarning("the backed-up volume data is the raw device content of a Block volume; depending on how it is restored, the PVC may not be provisioned or bound"),
 		},
 		{
 			name:      "Block kept while other fields change doesn't warn",
@@ -5610,12 +5640,13 @@ func TestRestoreWarnsWhenResourceModifierChangesPVCVolumeModeFromBlock(t *testin
 			h.AddItems(t, test.PVCs())
 
 			data := &Request{
-				Log:               h.log,
-				Restore:           defaultRestore().Result(),
-				Backup:            defaultBackup().Result(),
-				BackupReader:      test.NewTarWriter(t).AddItems("persistentvolumeclaims", tc.pvc).Done(),
-				RestoredItems:     map[itemKey]restoredItemStatus{},
-				ResourceModifiers: tc.modifiers,
+				Log:                 h.log,
+				Restore:             defaultRestore().Result(),
+				Backup:              defaultBackup().Result(),
+				BackupReader:        test.NewTarWriter(t).AddItems("persistentvolumeclaims", tc.pvc).Done(),
+				RestoredItems:       map[itemKey]restoredItemStatus{},
+				ResourceModifiers:   tc.modifiers,
+				BackupVolumeInfoMap: tc.volumeInfos,
 			}
 			warnings, errs := h.restorer.Restore(data, nil, nil)
 
