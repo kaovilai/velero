@@ -283,3 +283,97 @@ func TestDataUploadDeleteActionRetainedSnapshot(t *testing.T) {
 		})
 	}
 }
+
+func TestDataUploadDeleteActionUnrecordedRetainedSnapshot(t *testing.T) {
+	retainClass := &snapshotv1api.VolumeSnapshotClass{
+		ObjectMeta:     metav1.ObjectMeta{Name: "retain-class"},
+		Driver:         "rbd.csi.ceph.com",
+		DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+		Parameters: map[string]string{
+			velerov1.PrefixedSecretNameAnnotation:      "rook-csi-rbd-provisioner",
+			velerov1.PrefixedSecretNamespaceAnnotation: "rook-ceph",
+		},
+	}
+	deleteClass := &snapshotv1api.VolumeSnapshotClass{
+		ObjectMeta:     metav1.ObjectMeta{Name: "delete-class"},
+		Driver:         "rbd.csi.ceph.com",
+		DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+	}
+	templateClass := retainClass.DeepCopy()
+	templateClass.Name = "template-class"
+	templateClass.Parameters[velerov1.PrefixedSecretNameAnnotation] = "${volumesnapshotcontent.name}"
+
+	tests := []struct {
+		name     string
+		mutate   func(du *velerov2alpha1.DataUpload)
+		wantData map[string]string
+	}{
+		{
+			name: "completed block data mover upload under a Retain class reads the handle from the repository snapshot",
+			wantData: map[string]string{
+				"snapshotHandle":          "",
+				"driver":                  "rbd.csi.ceph.com",
+				"deletionSecretName":      "rook-csi-rbd-provisioner",
+				"deletionSecretNamespace": "rook-ceph",
+				"volumeNamespace":         "app",
+				"backupStorageLocation":   "default",
+				"snapshotID":              "kopia-snapshot-id",
+				"repositoryType":          "kopia",
+				"uploaderType":            "velero-block",
+				"source":                  "app/my-pvc",
+				"repoIdentifier":          "",
+			},
+		},
+		{
+			name:   "Delete class",
+			mutate: func(du *velerov2alpha1.DataUpload) { du.Spec.CSISnapshot.SnapshotClass = "delete-class" },
+		},
+		{
+			name:   "class no longer exists",
+			mutate: func(du *velerov2alpha1.DataUpload) { du.Spec.CSISnapshot.SnapshotClass = "missing-class" },
+		},
+		{
+			name:   "deletion secret named by a template",
+			mutate: func(du *velerov2alpha1.DataUpload) { du.Spec.CSISnapshot.SnapshotClass = "template-class" },
+		},
+		{
+			name:   "vSphere CSI driver, whose change ID is not the snapshot handle",
+			mutate: func(du *velerov2alpha1.DataUpload) { du.Spec.CSISnapshot.Driver = "csi.vsphere.vmware.com" },
+		},
+		{
+			name:   "file system data mover",
+			mutate: func(du *velerov2alpha1.DataUpload) { du.Spec.DataMover = "velero-fs" },
+		},
+		{
+			name:   "failed upload",
+			mutate: func(du *velerov2alpha1.DataUpload) { du.Status.Phase = velerov2alpha1.DataUploadPhaseFailed },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			crClient := velerotest.NewFakeControllerRuntimeClient(t, retainClass, deleteClass, templateClass)
+			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+
+			du := newCompletedDataUpload("daily-backup-abcde", "daily-backup")
+			du.Spec.DataMover = "velero-block"
+			du.Spec.CSISnapshot = &velerov2alpha1.CSISnapshotSpec{Driver: "rbd.csi.ceph.com", SnapshotClass: "retain-class"}
+			if tc.mutate != nil {
+				tc.mutate(du)
+			}
+			backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
+
+			require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+
+			cms := &corev1api.ConfigMapList{}
+			require.NoError(t, crClient.List(t.Context(), cms, crclient.MatchingLabels{velerov1.DataUploadRetainedSnapshotLabel: "true"}))
+			if tc.wantData == nil {
+				assert.Empty(t, cms.Items)
+				return
+			}
+			require.Len(t, cms.Items, 1)
+			assert.Equal(t, "daily-backup-abcde-retained-snapshot", cms.Items[0].Name)
+			assert.Equal(t, tc.wantData, cms.Items[0].Data)
+		})
+	}
+}

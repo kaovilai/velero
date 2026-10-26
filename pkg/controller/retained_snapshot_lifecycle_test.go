@@ -39,7 +39,9 @@ import (
 	"github.com/velero-io/velero/pkg/builder"
 	"github.com/velero-io/velero/pkg/datamover"
 	"github.com/velero-io/velero/pkg/plugin/velero"
+	repomocks "github.com/velero-io/velero/pkg/repository/mocks"
 	velerotest "github.com/velero-io/velero/pkg/test"
+	"github.com/velero-io/velero/pkg/uploader"
 	"github.com/velero-io/velero/pkg/util/csi"
 )
 
@@ -313,6 +315,69 @@ func TestRetainedSnapshotDeletionIdempotent(t *testing.T) {
 			}
 
 			assert.Equal(t, tc.wantDeleteRPC, backend.deleteCallsTo)
+			vscs := &snapshotv1api.VolumeSnapshotContentList{}
+			require.NoError(t, c.List(t.Context(), vscs))
+			assert.Empty(t, vscs.Items)
+			cms := &corev1api.ConfigMapList{}
+			require.NoError(t, c.List(t.Context(), cms, client.MatchingLabels{velerov1api.DataUploadRetainedSnapshotLabel: "true"}))
+			assert.Empty(t, cms.Items)
+		})
+	}
+}
+
+// TestUnrecordedRetainedSnapshotLifecycle deletes the retained snapshot of a backup
+// taken before Velero recorded retained snapshots. The DataUpload has no record,
+// so the handle comes from the CBT change ID tag of the repository snapshot.
+func TestUnrecordedRetainedSnapshotLifecycle(t *testing.T) {
+	tests := []struct {
+		name              string
+		classPolicy       snapshotv1api.DeletionPolicy
+		snapshotInStorage bool
+		wantDeleteRPC     []string
+	}{
+		{
+			name:              "Retain class: the snapshot is deleted with the backup",
+			classPolicy:       snapshotv1api.VolumeSnapshotContentRetain,
+			snapshotInStorage: true,
+			wantDeleteRPC:     []string{lifecycleHandle},
+		},
+		{
+			// The snapshotter can't find the snapshot, so it removes the temp VSC
+			// without calling DeleteSnapshot, and the deletion still succeeds.
+			name:        "Retain class, snapshot already gone from the storage",
+			classPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+		},
+		{
+			// The backup didn't keep the snapshot, so there is nothing to delete.
+			name:              "Delete class",
+			classPolicy:       snapshotv1api.VolumeSnapshotContentDelete,
+			snapshotInStorage: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			shortenTempVSCStatusWait(t)
+			stubRepoSnapshotTags(t, map[string]string{uploader.CBTChangeIDTag: lifecycleHandle}, nil)
+			backend := &fakeCSIBackend{snapshots: map[string]bool{lifecycleHandle: tc.snapshotInStorage, "snapshot-of-another-backup": true}}
+			class := &snapshotv1api.VolumeSnapshotClass{
+				ObjectMeta:     metav1.ObjectMeta{Name: "rbd-class"},
+				Driver:         lifecycleDriver,
+				DeletionPolicy: tc.classPolicy,
+			}
+			c := backend.client(t, class)
+			backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
+
+			du := lifecycleDataUpload(nil)
+			du.Spec.CSISnapshot = &velerov2alpha1api.CSISnapshotSpec{Driver: lifecycleDriver, SnapshotClass: "rbd-class"}
+			executeDataUploadDeleteAction(t, c, backup, du)
+
+			r := &backupDeletionReconciler{Client: c, logger: velerotest.NewLogger(), repoMgr: repomocks.NewManager(t)}
+			assert.Empty(t, r.resolveUnrecordedRetainedSnapshots(t.Context(), backup, velerotest.NewLogger()))
+			assert.Empty(t, r.deleteRetainedSnapshots(t.Context(), backup, velerotest.NewLogger()))
+
+			assert.Equal(t, tc.wantDeleteRPC, backend.deleteCallsTo)
+			assert.True(t, backend.snapshots["snapshot-of-another-backup"], "snapshots of other backups must stay")
 			vscs := &snapshotv1api.VolumeSnapshotContentList{}
 			require.NoError(t, c.List(t.Context(), vscs))
 			assert.Empty(t, vscs.Items)
