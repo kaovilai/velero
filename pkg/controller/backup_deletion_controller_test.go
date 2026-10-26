@@ -884,7 +884,7 @@ func TestBackupDeletionControllerReconcile(t *testing.T) {
 		assert.Equal(t, "backup deletion failed: backup not found", res.Status.Errors[0])
 	})
 
-	t.Run("CSI VolumeSnapshots in workload namespaces are cleaned up when the backup has no tarball", func(t *testing.T) {
+	t.Run("CSI VolumeSnapshots owned by the backup are cleaned up in workload namespaces when the backup has no tarball", func(t *testing.T) {
 		// A backup that was InProgress when the Velero server restarted is
 		// marked Failed and never uploads a tarball, but the CSI
 		// VolumeSnapshots it created in the workload namespace remain.
@@ -910,15 +910,35 @@ func TestBackupDeletionControllerReconcile(t *testing.T) {
 			},
 		}
 
-		vs := builder.ForVolumeSnapshot("user-ns", "vs-1").ObjectMeta(
-			builder.WithLabelsMap(map[string]string{
-				velerov1api.BackupNameLabel: "foo",
-			})).SourcePVC("some-pvc").Status().BoundVolumeSnapshotContentName("vsc-1").Result()
-		vsc := builder.ForVolumeSnapshotContent("vsc-1").
-			DeletionPolicy(snapshotv1api.VolumeSnapshotContentRetain).
-			VolumeSnapshotRef("user-ns", "vs-1", "").Result()
+		newVS := func(namespace, name string, labels map[string]string) (*snapshotv1api.VolumeSnapshot, *snapshotv1api.VolumeSnapshotContent) {
+			vs := builder.ForVolumeSnapshot(namespace, name).ObjectMeta(builder.WithLabelsMap(labels)).
+				SourcePVC("some-pvc").Status().BoundVolumeSnapshotContentName(name + "-content").Result()
+			vsc := builder.ForVolumeSnapshotContent(name+"-content").
+				DeletionPolicy(snapshotv1api.VolumeSnapshotContentRetain).
+				VolumeSnapshotRef(namespace, name, "").Result()
+			return vs, vsc
+		}
+		// Owned by this backup.
+		ownedVS, ownedVSC := newVS("user-ns", "vs-owned", map[string]string{
+			velerov1api.BackupNameLabel: "foo",
+			velerov1api.BackupUIDLabel:  "uid",
+		})
+		// Owned by a same-named backup of another Velero installation.
+		otherVS, otherVSC := newVS("user-ns", "vs-other", map[string]string{
+			velerov1api.BackupNameLabel: "foo",
+			velerov1api.BackupUIDLabel:  "other-uid",
+		})
+		// No backup UID label in a workload namespace: ownership can't be proven.
+		legacyVS, legacyVSC := newVS("user-ns", "vs-legacy", map[string]string{
+			velerov1api.BackupNameLabel: "foo",
+		})
+		// No backup UID label in the backup's own namespace: cleaned as before.
+		legacyVeleroNsVS, legacyVeleroNsVSC := newVS(velerov1api.DefaultNamespace, "vs-legacy-velero-ns", map[string]string{
+			velerov1api.BackupNameLabel: "foo",
+		})
 
-		td := setupBackupDeletionControllerTest(t, defaultTestDbr(), backup, location, vs, vsc)
+		td := setupBackupDeletionControllerTest(t, defaultTestDbr(), backup, location,
+			ownedVS, ownedVSC, otherVS, otherVSC, legacyVS, legacyVSC, legacyVeleroNsVS, legacyVeleroNsVSC)
 		// The controller manager's client only sees the Velero namespace.
 		td.controller.Client = newNamespaceScopedClient(td.fakeClient.(client.WithWatch), velerov1api.DefaultNamespace)
 
@@ -934,12 +954,28 @@ func TestBackupDeletionControllerReconcile(t *testing.T) {
 		_, err := td.controller.Reconcile(t.Context(), td.req)
 		require.NoError(t, err)
 
-		err = td.fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "user-ns", Name: "vs-1"}, &snapshotv1api.VolumeSnapshot{})
-		assert.True(t, apierrors.IsNotFound(err), "Expected VolumeSnapshot to be deleted, but actual error: %v", err)
+		for _, tc := range []struct {
+			vs      *snapshotv1api.VolumeSnapshot
+			deleted bool
+		}{
+			{vs: ownedVS, deleted: true},
+			{vs: otherVS, deleted: false},
+			{vs: legacyVS, deleted: false},
+			{vs: legacyVeleroNsVS, deleted: true},
+		} {
+			err = td.fakeClient.Get(t.Context(), types.NamespacedName{Namespace: tc.vs.Namespace, Name: tc.vs.Name}, &snapshotv1api.VolumeSnapshot{})
+			expectedPolicy := snapshotv1api.VolumeSnapshotContentRetain
+			if tc.deleted {
+				assert.True(t, apierrors.IsNotFound(err), "Expected VolumeSnapshot %s/%s to be deleted, but actual error: %v", tc.vs.Namespace, tc.vs.Name, err)
+				expectedPolicy = snapshotv1api.VolumeSnapshotContentDelete
+			} else {
+				require.NoError(t, err, "Expected VolumeSnapshot %s/%s to be kept", tc.vs.Namespace, tc.vs.Name)
+			}
 
-		res := &snapshotv1api.VolumeSnapshotContent{}
-		require.NoError(t, td.fakeClient.Get(t.Context(), types.NamespacedName{Name: "vsc-1"}, res))
-		assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, res.Spec.DeletionPolicy)
+			res := &snapshotv1api.VolumeSnapshotContent{}
+			require.NoError(t, td.fakeClient.Get(t.Context(), types.NamespacedName{Name: tc.vs.Name + "-content"}, res))
+			assert.Equal(t, expectedPolicy, res.Spec.DeletionPolicy, "VolumeSnapshotContent of %s/%s", tc.vs.Namespace, tc.vs.Name)
+		}
 	})
 }
 

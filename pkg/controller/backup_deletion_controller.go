@@ -546,8 +546,28 @@ func (r *backupDeletionReconciler) deleteCSIVolumeSnapshotsIfAny(ctx context.Con
 	}
 	for _, item := range vsList.Items {
 		vs := item
+		if !volumeSnapshotOwnedByBackup(&vs, backup) {
+			log.Debugf("Skipping VolumeSnapshot %s/%s: not owned by backup %s/%s (uid %s)",
+				vs.Namespace, vs.Name, backup.Namespace, backup.Name, backup.UID)
+			continue
+		}
 		csi.CleanupVolumeSnapshot(ctx, &vs, r.crClient, log)
 	}
+}
+
+// volumeSnapshotOwnedByBackup reports whether a VolumeSnapshot carrying the
+// backup's name label can be proven to belong to this backup. Backup names
+// are only unique within a Velero namespace, so another Velero installation
+// may have a same-named backup whose snapshots must not be touched.
+// VolumeSnapshots without a backup UID label (created by older Velero
+// versions) are only accepted in the backup's own namespace, which is the
+// scope the cleanup was limited to before it could reach workload namespaces.
+func volumeSnapshotOwnedByBackup(vs *snapshotv1api.VolumeSnapshot, backup *velerov1api.Backup) bool {
+	uid, hasUID := vs.Labels[velerov1api.BackupUIDLabel]
+	if hasUID {
+		return backup.UID != "" && uid == string(backup.UID)
+	}
+	return vs.Namespace == backup.Namespace
 }
 
 func (r *backupDeletionReconciler) deletePodVolumeSnapshots(ctx context.Context, backup *velerov1api.Backup) []error {
