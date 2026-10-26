@@ -1271,9 +1271,11 @@ func retainedSnapshotConfigMap(t *testing.T, backupName string, name string, ret
 func stubTempVSCDeletion(t *testing.T, waitErr error) *[]string {
 	t.Helper()
 	waited := []string{}
-	originalSleep := csi.SleepBetweenTempVSCCreateAndDelete
-	t.Cleanup(func() { csi.SleepBetweenTempVSCCreateAndDelete = originalSleep })
-	csi.SleepBetweenTempVSCCreateAndDelete = func(time.Duration) {}
+	originalStatusWait := csi.WaitTempVSCStatus
+	t.Cleanup(func() { csi.WaitTempVSCStatus = originalStatusWait })
+	csi.WaitTempVSCStatus = func(context.Context, client.Client, *snapshotv1api.VolumeSnapshotContent, time.Duration, logrus.FieldLogger) error {
+		return nil
+	}
 	originalWait := csi.WaitTempVSCDeleted
 	t.Cleanup(func() { csi.WaitTempVSCDeleted = originalWait })
 	csi.WaitTempVSCDeleted = func(_ context.Context, _ client.Client, name string, _ time.Duration, _ logrus.FieldLogger) error {
@@ -1473,4 +1475,31 @@ func TestDeleteRetainedSnapshots(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSnapshotDeletionClientReadsFromAPIServer(t *testing.T) {
+	// The CSI snapshotter records the events of a VolumeSnapshotContent in the
+	// default namespace, which the manager's cache doesn't cover.
+	event := &corev1api.Event{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "vsc-event"},
+		Reason:     "SnapshotDeleteError",
+	}
+	apiReader := velerotest.NewFakeControllerRuntimeClient(t, event)
+	cachedClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	r := &backupDeletionReconciler{Client: cachedClient, apiReader: apiReader}
+	c := r.snapshotDeletionClient()
+
+	events := &corev1api.EventList{}
+	require.NoError(t, c.List(t.Context(), events, client.InNamespace(metav1.NamespaceDefault)))
+	require.Len(t, events.Items, 1)
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(event), &corev1api.Event{}))
+
+	// Writes still go through the client.
+	vsc := &snapshotv1api.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: "vsc-1"}}
+	require.NoError(t, c.Create(t.Context(), vsc))
+	require.NoError(t, cachedClient.Get(t.Context(), client.ObjectKeyFromObject(vsc), &snapshotv1api.VolumeSnapshotContent{}))
+
+	// Without an API reader, e.g. in tests that don't set up the manager, the client is used.
+	assert.Equal(t, cachedClient, (&backupDeletionReconciler{Client: cachedClient}).snapshotDeletionClient())
 }

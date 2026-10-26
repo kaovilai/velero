@@ -39,6 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	clientgofake "k8s.io/client-go/kubernetes/fake"
 	clientTesting "k8s.io/client-go/testing"
@@ -930,13 +931,38 @@ func TestOnDataUploadCompleted(t *testing.T) {
 	assert.Equal(t, "fake-path", updatedDu.Status.Path)
 }
 
+// failRecordClient fails the DataUpload update that records a retained snapshot
+// before the DataUpload is completed.
+type failRecordClient struct {
+	kbclient.Client
+}
+
+func (c *failRecordClient) Update(ctx context.Context, obj kbclient.Object, opts ...kbclient.UpdateOption) error {
+	if du, ok := obj.(*velerov2alpha1api.DataUpload); ok && du.Status.RetainedSnapshot != nil && du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted {
+		return errors.New("fake-update-error")
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func shortenRetainedSnapshotBackoff(t *testing.T) {
+	t.Helper()
+	original := retainedSnapshotBackoff
+	t.Cleanup(func() { retainedSnapshotBackoff = original })
+	retainedSnapshotBackoff = wait.Backoff{Steps: original.Steps, Duration: time.Millisecond, Factor: 1}
+}
+
 func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
+	shortenRetainedSnapshotBackoff(t)
 	handle := "fake-snapshot-handle"
 	tests := []struct {
 		name      string
 		backupVSC *snapshotv1api.VolumeSnapshotContent
 		getErrs   int
+		// recordErr fails the status update that records the retained snapshot.
+		recordErr bool
 		expected  *velerov2alpha1api.RetainedSnapshot
+		// wantReleased is whether the backup VSC is set to Delete before the cleanup.
+		wantReleased bool
 	}{
 		{
 			name: "backup VSC with Retain policy records the retained snapshot",
@@ -978,6 +1004,34 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 			},
 		},
 		{
+			// Without the record, the cleanup must delete the snapshot rather than
+			// leave it in the storage untracked.
+			name:      "failing to record the retained snapshot releases it",
+			recordErr: true,
+			backupVSC: &snapshotv1api.VolumeSnapshotContent{
+				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
+				Spec: snapshotv1api.VolumeSnapshotContentSpec{
+					DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+					Driver:         "rbd.csi.ceph.com",
+					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
+				},
+			},
+			wantReleased: true,
+		},
+		{
+			name:    "failing to get the backup VSC releases it",
+			getErrs: 5,
+			backupVSC: &snapshotv1api.VolumeSnapshotContent{
+				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
+				Spec: snapshotv1api.VolumeSnapshotContentSpec{
+					DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+					Driver:         "rbd.csi.ceph.com",
+					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
+				},
+			},
+			wantReleased: true,
+		},
+		{
 			name: "backup VSC with Delete policy records nothing",
 			backupVSC: &snapshotv1api.VolumeSnapshotContent{
 				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
@@ -1015,6 +1069,18 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 					return true, nil, errors.New("fake-transient-error")
 				})
 			}
+			if test.recordErr {
+				r.client = &failRecordClient{Client: r.client}
+			}
+			// Record what the DataUpload says when the cleanup deletes the backup VSC.
+			var recordedAtCleanup *velerov2alpha1api.RetainedSnapshot
+			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("delete", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+				current := &velerov2alpha1api.DataUpload{}
+				if err := r.client.Get(ctx, types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, current); err == nil {
+					recordedAtCleanup = current.Status.RetainedSnapshot
+				}
+				return false, nil, nil
+			})
 			r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger())}
 
 			r.OnDataUploadCompleted(ctx, du.Namespace, du.Name, datapath.Result{
@@ -1025,6 +1091,19 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 			require.NoError(t, r.client.Get(ctx, types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, updatedDu))
 			assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updatedDu.Status.Phase)
 			assert.Equal(t, test.expected, updatedDu.Status.RetainedSnapshot)
+			if test.backupVSC != nil {
+				// A retained snapshot is recorded before the cleanup deletes the backup VSC.
+				assert.Equal(t, test.expected, recordedAtCleanup)
+			}
+
+			released := false
+			for _, action := range r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).Actions() {
+				if patch, ok := action.(clientTesting.PatchAction); ok && patch.GetResource().Resource == "volumesnapshotcontents" &&
+					strings.Contains(string(patch.GetPatch()), `"deletionPolicy":"Delete"`) {
+					released = true
+				}
+			}
+			assert.Equal(t, test.wantReleased, released)
 
 			// The backup VSC is still cleaned up after its snapshot info is recorded.
 			_, err = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, dataUploadName, metav1.GetOptions{})
@@ -1034,15 +1113,25 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 }
 
 func TestDataUploadNotCompletedReleasesRetainedSnapshot(t *testing.T) {
+	shortenRetainedSnapshotBackoff(t)
 	tests := []struct {
 		name   string
 		finish func(ctx context.Context, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload)
+		// patchErrs fails the first patches of the backup VSC.
+		patchErrs int
 	}{
 		{
 			name: "failed",
 			finish: func(ctx context.Context, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) {
 				_, _ = r.errorOut(ctx, du, errors.New("fake-error"), "fake failure", velerotest.NewLogger())
 			},
+		},
+		{
+			name: "failed, with transient errors releasing the backup VSC",
+			finish: func(ctx context.Context, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) {
+				_, _ = r.errorOut(ctx, du, errors.New("fake-error"), "fake failure", velerotest.NewLogger())
+			},
+			patchErrs: 2,
 		},
 		{
 			name: "canceled",
@@ -1076,13 +1165,23 @@ func TestDataUploadNotCompletedReleasesRetainedSnapshot(t *testing.T) {
 				},
 			}, metav1.CreateOptions{})
 			require.NoError(t, err)
+			if tc.patchErrs > 0 {
+				failures := tc.patchErrs
+				r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(clientTesting.Action) (bool, runtime.Object, error) {
+					if failures == 0 {
+						return false, nil, nil
+					}
+					failures--
+					return true, nil, errors.New("fake-transient-error")
+				})
+			}
 			r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger())}
 
 			tc.finish(ctx, r, du)
 
 			// The deletionPolicy of the backup VSC must be Delete before the
 			// cleanup deletes the VSC, so that the CSI driver deletes the snapshot.
-			var released, deleted int
+			var released, deleted, patches int
 			for i, action := range r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).Actions() {
 				if action.GetResource().Resource != "volumesnapshotcontents" {
 					continue
@@ -1091,6 +1190,7 @@ func TestDataUploadNotCompletedReleasesRetainedSnapshot(t *testing.T) {
 				case clientTesting.PatchAction:
 					if a.GetName() == dataUploadName && strings.Contains(string(a.GetPatch()), `"deletionPolicy":"Delete"`) {
 						released = i
+						patches++
 					}
 				case clientTesting.DeleteAction:
 					if a.GetName() == dataUploadName {
@@ -1101,6 +1201,8 @@ func TestDataUploadNotCompletedReleasesRetainedSnapshot(t *testing.T) {
 			require.NotZero(t, released, "backup VSC deletion policy was not changed to Delete")
 			require.NotZero(t, deleted, "backup VSC was not deleted")
 			assert.Less(t, released, deleted)
+			// Transient errors are retried until the patch succeeds.
+			assert.Equal(t, tc.patchErrs+1, patches)
 
 			updatedDu := &velerov2alpha1api.DataUpload{}
 			require.NoError(t, r.client.Get(ctx, types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, updatedDu))

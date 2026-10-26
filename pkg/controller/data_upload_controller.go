@@ -496,8 +496,27 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 		return
 	}
 
-	// Must run before the cleanup below, which deletes the backup VSC.
-	retainedSnapshot := r.getRetainedSnapshot(ctx, &du, log)
+	// Record a retained snapshot before the cleanup below deletes the backup VSC,
+	// so that the record isn't lost if the node-agent stops before the DataUpload
+	// is completed. If the snapshot can't be recorded, release it instead, so that
+	// the cleanup deletes it rather than leaving it in the storage untracked.
+	retainedSnapshot, err := r.getRetainedSnapshot(ctx, &du, log)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to get backup VSC %s, deleting its snapshot with it", du.Name)
+		r.releaseRetainedSnapshot(ctx, &du, log)
+	} else if retainedSnapshot != nil {
+		if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
+			if isDataUploadInFinalState(du) {
+				return false
+			}
+			du.Status.RetainedSnapshot = retainedSnapshot
+			return true
+		}); err != nil {
+			log.WithError(err).Errorf("Failed to record retained snapshot %s, deleting it with backup VSC %s", retainedSnapshot.SnapshotHandle, du.Name)
+			retainedSnapshot = nil
+			r.releaseRetainedSnapshot(ctx, &du, log)
+		}
+	}
 
 	// cleans up any objects generated during the snapshot expose
 	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
@@ -542,27 +561,33 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 	}
 }
 
+// retainedSnapshotBackoff retries the API calls on the backup VSC of a finished
+// DataUpload for about 15 seconds. It is a variable so that tests can shorten it.
+var retainedSnapshotBackoff = wait.Backoff{Steps: 5, Duration: time.Second, Factor: 2.0, Jitter: 0.1}
+
 // getRetainedSnapshot returns the volume snapshot that stays in the storage after the
 // backup VSC is cleaned up, so that backup deletion can delete it later. It returns nil
-// when the snapshot is deleted with the backup VSC, i.e. the deletion policy is Delete.
-func (r *DataUploadReconciler) getRetainedSnapshot(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) *velerov2alpha1api.RetainedSnapshot {
+// when the snapshot is deleted with the backup VSC, i.e. the deletion policy is Delete,
+// or when there is no backup VSC.
+func (r *DataUploadReconciler) getRetainedSnapshot(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) (*velerov2alpha1api.RetainedSnapshot, error) {
 	if du.Spec.SnapshotType != velerov2alpha1api.SnapshotTypeCSI {
-		return nil
+		return nil, nil
 	}
 
 	// The backup VSC is named after the DataUpload, see csiSnapshotExposer.createBackupVSC.
 	// Retry transient errors, the backup VSC and the chance to record its snapshot
 	// are gone once the cleanup runs.
 	var vsc *snapshotv1api.VolumeSnapshotContent
-	backoff := wait.Backoff{Steps: 5, Duration: time.Second, Factor: 2.0, Jitter: 0.1}
-	err := retry.OnError(backoff, func(err error) bool { return !apierrors.IsNotFound(err) }, func() error {
+	err := retry.OnError(retainedSnapshotBackoff, func(err error) bool { return !apierrors.IsNotFound(err) }, func() error {
 		var getErr error
 		vsc, getErr = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
 		return getErr
 	})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
 	if err != nil {
-		log.WithError(err).Errorf("Failed to get backup VSC %s, a retained snapshot will not be deleted with the backup", du.Name)
-		return nil
+		return nil, err
 	}
 
 	retained := csi.GetRetainedSnapshot(vsc)
@@ -570,7 +595,7 @@ func (r *DataUploadReconciler) getRetainedSnapshot(ctx context.Context, du *vele
 		log.Infof("Snapshot %s is retained in the storage by deletion policy of backup VSC %s", retained.SnapshotHandle, vsc.Name)
 	}
 
-	return retained
+	return retained, nil
 }
 
 func (r *DataUploadReconciler) OnDataUploadFailed(ctx context.Context, namespace, duName string, err error) {
@@ -684,7 +709,10 @@ func (r *DataUploadReconciler) releaseRetainedSnapshot(ctx context.Context, du *
 	}
 
 	// The backup VSC is named after the DataUpload, see csiSnapshotExposer.createBackupVSC.
-	if err := csi.ReleaseRetainedVSC(ctx, r.csiSnapshotClient, du.Name); err != nil {
+	// Retry transient errors, the cleanup deletes the VSC right after this.
+	if err := retry.OnError(retainedSnapshotBackoff, func(error) bool { return true }, func() error {
+		return csi.ReleaseRetainedVSC(ctx, r.csiSnapshotClient, du.Name)
+	}); err != nil {
 		log.WithError(err).Errorf("Failed to set deletion policy of backup VSC %s to Delete, its snapshot may be left in the storage", du.Name)
 	}
 }
