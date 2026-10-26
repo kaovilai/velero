@@ -352,7 +352,7 @@ Regardless of how volumes are discovered for backup using FSB, the process of re
 ## Limitations
 
 - `hostPath` volumes are not supported. [Local persistent volumes][5] are supported.
-- Raw block volumes (`volumeMode: Block`, attached to the pod through `volumeDevices`) are not supported. With the opt-out approach (`defaultVolumesToFsBackup: true`), they are skipped with a warning and their data is not backed up. To back them up with [CSI Snapshot Data Movement][13] instead, use a [volume policy][24] with the `pvcVolumeMode: Block` condition and the `snapshot` action. To use the block data mover for them, add the `dataMover: velero-block` parameter to the action.
+- Raw block volumes (`volumeMode: Block`, attached to the pod through `volumeDevices`) are backed up with [CSI Snapshot Data Movement][13], not FSB. To back them up, enable it for them with a [volume policy][24] that has the `pvcVolumeMode: Block` condition and the `snapshot` action; add the `dataMover: velero-block` parameter to use the block data mover. Without such a policy, the opt-out approach (`defaultVolumesToFsBackup: true`) skips them with a warning and their data is not backed up.
 - At present, Velero uses a static, common encryption key for all backup repositories it creates. **This means 
 that anyone who has access to your backup storage can decrypt your backup data**. Make sure that you limit access 
 to the backup storage appropriately.
