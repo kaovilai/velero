@@ -76,6 +76,9 @@ type backupDeletionReconciler struct {
 	backupStoreGetter persistence.ObjectBackupStoreGetter
 	credentialStore   credentials.FileStore
 	repoEnsurer       *repository.Ensurer
+	// apiReader reads from the API server instead of the manager's cache, which
+	// only covers the Velero namespace.
+	apiReader client.Reader
 }
 
 // NewBackupDeletionReconciler creates a new backup deletion reconciler.
@@ -107,6 +110,7 @@ func NewBackupDeletionReconciler(
 }
 
 func (r *backupDeletionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.apiReader = mgr.GetAPIReader()
 	// Make sure the expired requests can be deleted eventually
 	s := kube.NewPeriodicalEnqueueSource(r.logger.WithField("controller", constant.ControllerBackupDeletion), mgr.GetClient(), &velerov1api.DeleteBackupRequestList{}, time.Hour, kube.PeriodicalEnqueueSourceOption{})
 	return ctrl.NewControllerManagedBy(mgr).
@@ -708,7 +712,7 @@ func (r *backupDeletionReconciler) deleteRetainedSnapshot(ctx context.Context, b
 	}
 
 	log.Infof("Deleting retained snapshot %s from configmap %s", retained.SnapshotHandle, cm.Name)
-	if err := csi.DeleteRetainedSnapshot(ctx, r.Client, retained, label.GetValidName(backup.Name), log); err != nil {
+	if err := csi.DeleteRetainedSnapshot(ctx, r.snapshotDeletionClient(), retained, label.GetValidName(backup.Name), log); err != nil {
 		return errors.Wrapf(err, "failed to delete retained snapshot %s from configmap %s", retained.SnapshotHandle, cm.Name)
 	}
 	return nil
@@ -828,4 +832,29 @@ func isTarballNotFoundError(err error) bool {
 		strings.Contains(msg, "blobnotfound") ||
 		strings.Contains(msg, "objectnotexist") ||
 		strings.Contains(msg, "doesn't exist")
+}
+
+// snapshotDeletionClient returns the client to delete retained snapshots with. Its
+// reads go to the API server: the CSI snapshotter records the events of a
+// VolumeSnapshotContent in the default namespace, which the manager's cache doesn't
+// cover, so listing them from the cache fails and a failed deletion goes unnoticed.
+func (r *backupDeletionReconciler) snapshotDeletionClient() client.Client {
+	if r.apiReader == nil {
+		return r.Client
+	}
+	return &apiReadClient{Client: r.Client, reader: r.apiReader}
+}
+
+// apiReadClient reads through reader and writes through Client.
+type apiReadClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c *apiReadClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+func (c *apiReadClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.reader.List(ctx, list, opts...)
 }

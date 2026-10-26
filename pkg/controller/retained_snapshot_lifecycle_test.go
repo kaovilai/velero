@@ -24,6 +24,7 @@ import (
 	"time"
 
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
@@ -48,18 +49,45 @@ const (
 )
 
 // fakeCSIBackend plays the CSI snapshot controller, the CSI snapshotter and the
-// storage. Deleting a VolumeSnapshotContent with deletionPolicy Delete deletes
-// its snapshot from the storage, which succeeds when the snapshot is already
-// gone as the CSI spec requires, and then removes the VolumeSnapshotContent.
+// storage, following external-snapshotter v8.6.0 for a statically provisioned
+// VolumeSnapshotContent:
+//   - The snapshotter sets status.snapshotHandle once it has found the snapshot in
+//     the storage, or status.error if it can't find it. It does so on the
+//     statusAfterGets-th read of the VSC, to model a slow first reconcile.
+//   - When the VSC is deleted, the snapshotter calls DeleteSnapshot only if the
+//     status has the snapshot handle, and then removes the finalizer.
 type fakeCSIBackend struct {
-	snapshots     map[string]bool
-	deleteCallsTo []string
+	snapshots       map[string]bool
+	statusAfterGets int
+	deleteCallsTo   []string
+	gets            map[string]int
 }
 
 func (b *fakeCSIBackend) client(t *testing.T, objs ...runtime.Object) client.Client {
 	t.Helper()
+	b.gets = map[string]int{}
 	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, objs...)
 	return interceptor.NewClient(fakeClient.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			vsc, ok := obj.(*snapshotv1api.VolumeSnapshotContent)
+			if !ok || vsc.Status != nil || vsc.Spec.Source.SnapshotHandle == nil {
+				return nil
+			}
+			b.gets[key.Name]++
+			if b.gets[key.Name] < b.statusAfterGets {
+				return nil
+			}
+			if b.snapshots[*vsc.Spec.Source.SnapshotHandle] {
+				vsc.Status = &snapshotv1api.VolumeSnapshotContentStatus{SnapshotHandle: vsc.Spec.Source.SnapshotHandle}
+			} else {
+				msg := "can not find snapshot for snapshotID " + *vsc.Spec.Source.SnapshotHandle
+				vsc.Status = &snapshotv1api.VolumeSnapshotContentStatus{Error: &snapshotv1api.VolumeSnapshotError{Message: &msg}}
+			}
+			return c.Update(ctx, vsc)
+		},
 		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 			if err := c.Delete(ctx, obj, opts...); err != nil {
 				return err
@@ -71,11 +99,10 @@ func (b *fakeCSIBackend) client(t *testing.T, objs ...runtime.Object) client.Cli
 			if err := c.Get(ctx, client.ObjectKeyFromObject(obj), vsc); err != nil {
 				return client.IgnoreNotFound(err)
 			}
-			if vsc.Spec.DeletionPolicy != snapshotv1api.VolumeSnapshotContentDelete || vsc.Spec.Source.SnapshotHandle == nil {
-				return nil
+			if vsc.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentDelete && vsc.Status != nil && vsc.Status.SnapshotHandle != nil {
+				b.deleteCallsTo = append(b.deleteCallsTo, *vsc.Status.SnapshotHandle)
+				delete(b.snapshots, *vsc.Status.SnapshotHandle)
 			}
-			b.deleteCallsTo = append(b.deleteCallsTo, *vsc.Spec.Source.SnapshotHandle)
-			delete(b.snapshots, *vsc.Spec.Source.SnapshotHandle)
 			vsc.Finalizers = nil
 			return c.Update(ctx, vsc)
 		},
@@ -126,11 +153,15 @@ func executeDataUploadDeleteAction(t *testing.T, c client.Client, backup *velero
 	}))
 }
 
-func skipTempVSCDeleteGap(t *testing.T) {
+// shortenTempVSCStatusWait keeps the real wait for the temp VSC status, with a
+// shorter timeout.
+func shortenTempVSCStatusWait(t *testing.T) {
 	t.Helper()
-	originalSleep := csi.SleepBetweenTempVSCCreateAndDelete
-	t.Cleanup(func() { csi.SleepBetweenTempVSCCreateAndDelete = originalSleep })
-	csi.SleepBetweenTempVSCCreateAndDelete = func(time.Duration) {}
+	original := csi.WaitTempVSCStatus
+	t.Cleanup(func() { csi.WaitTempVSCStatus = original })
+	csi.WaitTempVSCStatus = func(ctx context.Context, c client.Client, vsc *snapshotv1api.VolumeSnapshotContent, _ time.Duration, log logrus.FieldLogger) error {
+		return original(ctx, c, vsc, 1500*time.Millisecond, log)
+	}
 }
 
 // TestRetainedSnapshotLifecycle follows a snapshot from the end of the data
@@ -143,12 +174,23 @@ func TestRetainedSnapshotLifecycle(t *testing.T) {
 		policy        snapshotv1api.DeletionPolicy
 		wantRecorded  bool
 		wantDeleteRPC []string
+		// statusAfterGets delays the snapshotter's first reconcile of the temp VSC.
+		statusAfterGets int
 	}{
 		{
 			name:          "Retain: the snapshot is kept after the backup and deleted from the storage with the backup",
 			policy:        snapshotv1api.VolumeSnapshotContentRetain,
 			wantRecorded:  true,
 			wantDeleteRPC: []string{lifecycleHandle},
+		},
+		{
+			// Deleting the temp VSC before the snapshotter sets its status would
+			// remove it without calling DeleteSnapshot.
+			name:            "Retain: the snapshot is deleted when the snapshotter is slow to reconcile the temp VSC",
+			policy:          snapshotv1api.VolumeSnapshotContentRetain,
+			wantRecorded:    true,
+			wantDeleteRPC:   []string{lifecycleHandle},
+			statusAfterGets: 2,
 		},
 		{
 			// The CSI driver deletes the snapshot when the node-agent cleans up
@@ -160,8 +202,8 @@ func TestRetainedSnapshotLifecycle(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			skipTempVSCDeleteGap(t)
-			backend := &fakeCSIBackend{snapshots: map[string]bool{lifecycleHandle: true, "snapshot-of-another-backup": true}}
+			shortenTempVSCStatusWait(t)
+			backend := &fakeCSIBackend{snapshots: map[string]bool{lifecycleHandle: true, "snapshot-of-another-backup": true}, statusAfterGets: tc.statusAfterGets}
 			c := backend.client(t)
 			backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
 
@@ -209,19 +251,18 @@ func TestRetainedSnapshotDeletionIdempotent(t *testing.T) {
 		wantDeleteRPC    []string
 	}{
 		{
-			// The second attempt asks the CSI driver again, and the driver
-			// reports success for the snapshot it already deleted.
+			// The second attempt creates the temp VSC again. The snapshotter can't
+			// find the snapshot, so it removes the VSC without calling DeleteSnapshot.
 			name:              "deleting again after a successful deletion",
 			retained:          retained,
 			snapshotInStorage: true,
 			attempts:          2,
-			wantDeleteRPC:     []string{lifecycleHandle, lifecycleHandle},
+			wantDeleteRPC:     []string{lifecycleHandle},
 		},
 		{
-			name:          "snapshot already gone from the storage",
-			retained:      retained,
-			attempts:      1,
-			wantDeleteRPC: []string{lifecycleHandle},
+			name:     "snapshot already gone from the storage",
+			retained: retained,
+			attempts: 1,
 		},
 		{
 			name:              "temp VSC left by an interrupted attempt",
@@ -246,7 +287,7 @@ func TestRetainedSnapshotDeletionIdempotent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			skipTempVSCDeleteGap(t)
+			shortenTempVSCStatusWait(t)
 			backend := &fakeCSIBackend{snapshots: map[string]bool{lifecycleHandle: tc.snapshotInStorage}}
 			var objs []runtime.Object
 			if tc.tempVSCLeft {

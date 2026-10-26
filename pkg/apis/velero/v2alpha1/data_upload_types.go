@@ -234,6 +234,11 @@ type RetainedSnapshot struct {
 	// DeletionSecretNamespace is the namespace of the secret the CSI driver requires to delete the snapshot.
 	// +optional
 	DeletionSecretNamespace string `json:"deletionSecretNamespace,omitempty"`
+
+	// ManagedBy is the snapshot.storage.kubernetes.io/managed-by label of the backup VolumeSnapshotContent.
+	// A distributed CSI snapshotter only handles the VolumeSnapshotContents with the label of its node.
+	// +optional
+	ManagedBy string `json:"managedBy,omitempty"`
 }
 
 // TODO(2.0) After converting all resources to use the runttime-controller client,

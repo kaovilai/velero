@@ -281,6 +281,11 @@ spec:
                     description: Driver is the name of the CSI driver that created
                       the snapshot.
                     type: string
+                  managedBy:
+                    description: |-
+                      ManagedBy is the snapshot.storage.kubernetes.io/managed-by label of the backup VolumeSnapshotContent.
+                      A distributed CSI snapshotter only handles the VolumeSnapshotContents with the label of its node.
+                    type: string
                   snapshotHandle:
                     description: SnapshotHandle is the CSI snapshot handle of the
                       retained snapshot.
