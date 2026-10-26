@@ -62,7 +62,9 @@ import (
 	repomanager "github.com/velero-io/velero/pkg/repository/manager"
 	repomocks "github.com/velero-io/velero/pkg/repository/mocks"
 	repotypes "github.com/velero-io/velero/pkg/repository/types"
+	"github.com/velero-io/velero/pkg/repository/udmrepo"
 	velerotest "github.com/velero-io/velero/pkg/test"
+	"github.com/velero-io/velero/pkg/uploader"
 	"github.com/velero-io/velero/pkg/util/csi"
 )
 
@@ -1502,4 +1504,149 @@ func TestSnapshotDeletionClientReadsFromAPIServer(t *testing.T) {
 
 	// Without an API reader, e.g. in tests that don't set up the manager, the client is used.
 	assert.Equal(t, cachedClient, (&backupDeletionReconciler{Client: cachedClient}).snapshotDeletionClient())
+}
+
+func unrecordedRetainedSnapshotConfigMap(name string, snapshotID string) *corev1api.ConfigMap {
+	return &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      name,
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel:                 "foo",
+				velerov1api.DataUploadRetainedSnapshotLabel: "true",
+			},
+		},
+		Data: map[string]string{
+			"snapshotHandle":        "",
+			"driver":                "rbd.csi.ceph.com",
+			"volumeNamespace":       "app",
+			"backupStorageLocation": "default",
+			"snapshotID":            snapshotID,
+			"repositoryType":        "kopia",
+		},
+	}
+}
+
+func stubRepoSnapshotTags(t *testing.T, tags map[string]string, err error) *[]string {
+	t.Helper()
+	looked := []string{}
+	original := getRepoSnapshotTagsFunc
+	t.Cleanup(func() { getRepoSnapshotTagsFunc = original })
+	getRepoSnapshotTagsFunc = func(_ context.Context, _ *repository.Ensurer, _ repomanager.Manager, _ *velerov1api.Backup, snapshot repotypes.SnapshotIdentifier) (map[string]string, error) {
+		looked = append(looked, snapshot.SnapshotID)
+		return tags, err
+	}
+	return &looked
+}
+
+func TestResolveUnrecordedRetainedSnapshots(t *testing.T) {
+	tests := []struct {
+		name       string
+		cm         *corev1api.ConfigMap
+		tags       map[string]string
+		tagsErr    error
+		wantLooked []string
+		wantHandle string
+		wantCMGone bool
+		wantErr    string
+	}{
+		{
+			name:       "the handle is read from the CBT change ID tag of the repository snapshot",
+			cm:         unrecordedRetainedSnapshotConfigMap("du-1-retained-snapshot", "kopia-1"),
+			tags:       map[string]string{uploader.CBTChangeIDTag: "snap-handle"},
+			wantLooked: []string{"kopia-1"},
+			wantHandle: "snap-handle",
+		},
+		{
+			// An earlier attempt deleted the repository snapshot after the snapshot.
+			name:       "repository snapshot already deleted",
+			cm:         unrecordedRetainedSnapshotConfigMap("du-1-retained-snapshot", "kopia-1"),
+			tagsErr:    udmrepo.SnapshotNotFound(errors.New("snapshot not found")),
+			wantLooked: []string{"kopia-1"},
+			wantCMGone: true,
+		},
+		{
+			name:       "repository snapshot without the tag",
+			cm:         unrecordedRetainedSnapshotConfigMap("du-1-retained-snapshot", "kopia-1"),
+			tags:       map[string]string{},
+			wantLooked: []string{"kopia-1"},
+			wantCMGone: true,
+		},
+		{
+			// The deletion fails before the repository snapshot is deleted, so a retry can still read it.
+			name:       "error reading the repository snapshot",
+			cm:         unrecordedRetainedSnapshotConfigMap("du-1-retained-snapshot", "kopia-1"),
+			tagsErr:    errors.New("fake-repo-error"),
+			wantLooked: []string{"kopia-1"},
+			wantErr:    "fake-repo-error",
+		},
+		{
+			name:       "configmap that already has the handle is left alone",
+			cm:         retainedSnapshotConfigMap(t, "foo", "du-1-retained-snapshot", &velerov2alpha1api.RetainedSnapshot{SnapshotHandle: "recorded-handle", Driver: "rbd.csi.ceph.com"}),
+			wantLooked: []string{},
+			wantHandle: "recorded-handle",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			looked := stubRepoSnapshotTags(t, tc.tags, tc.tagsErr)
+			fakeClient := velerotest.NewFakeControllerRuntimeClient(t, tc.cm)
+			r := &backupDeletionReconciler{Client: fakeClient, logger: velerotest.NewLogger(), repoMgr: repomocks.NewManager(t)}
+			backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").Result()
+
+			errs := r.resolveUnrecordedRetainedSnapshots(t.Context(), backup, velerotest.NewLogger())
+			if tc.wantErr != "" {
+				require.Len(t, errs, 1)
+				require.ErrorContains(t, errs[0], tc.wantErr)
+			} else {
+				assert.Empty(t, errs)
+			}
+			assert.Equal(t, tc.wantLooked, *looked)
+
+			cm := &corev1api.ConfigMap{}
+			err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(tc.cm), cm)
+			if tc.wantCMGone {
+				assert.True(t, apierrors.IsNotFound(err), "expected the configmap to be removed, got %v", err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantHandle, cm.Data["snapshotHandle"])
+		})
+	}
+}
+
+func TestBackupDeletionKeepsSnapshotDataWhenUnrecordedSnapshotCantBeRead(t *testing.T) {
+	stubTempVSCDeletion(t, nil)
+	stubRepoSnapshotTags(t, nil, errors.New("fake-repo-error"))
+	originalBatchDelete := batchDeleteSnapshotFunc
+	t.Cleanup(func() { batchDeleteSnapshotFunc = originalBatchDelete })
+	batchDeleteCalled := false
+	batchDeleteSnapshotFunc = func(context.Context, *repository.Ensurer, repomanager.Manager, map[string][]repotypes.SnapshotIdentifier, *velerov1api.Backup, logrus.FieldLogger) []error {
+		batchDeleteCalled = true
+		return nil
+	}
+
+	backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("primary").SnapshotMoveData(true).Result()
+	backup.UID = "uid"
+	location := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "primary").Provider("objStoreProvider").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	dbr := defaultTestDbr()
+	td := setupBackupDeletionControllerTest(t, dbr, backup, location, unrecordedRetainedSnapshotConfigMap("du-1-retained-snapshot", "kopia-1"))
+	td.controller.repoMgr = repomocks.NewManager(t)
+
+	pluginManager := &pluginmocks.Manager{}
+	pluginManager.On("GetDeleteItemActions").Return([]velero.DeleteItemAction{}, nil)
+	pluginManager.On("CleanupClients")
+	td.controller.newPluginManager = func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager }
+	td.backupStore.On("GetBackupVolumeSnapshots", dbr.Spec.BackupName).Return(nil, nil)
+
+	_, err := td.controller.Reconcile(t.Context(), td.req)
+	require.NoError(t, err)
+
+	// Deleting the repository snapshot would lose the handle, so the snapshot data is kept for a retry.
+	assert.False(t, batchDeleteCalled)
+	td.backupStore.AssertNotCalled(t, "DeleteBackup", mock.Anything)
+	res := &velerov1api.DeleteBackupRequest{}
+	require.NoError(t, td.fakeClient.Get(t.Context(), td.req.NamespacedName, res))
+	assert.Contains(t, strings.Join(res.Status.Errors, "\n"), "error reading retained volume snapshot from snapshot data")
 }
