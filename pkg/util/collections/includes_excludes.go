@@ -665,13 +665,19 @@ func ValidateScopedIncludesExcludes(includesList, excludesList []string) []error
 
 // validateGlobPatterns returns an error for each item that is not a valid glob pattern.
 // An invalid pattern can never be matched, so reject it instead of letting the filter
-// silently drop resources.
+// silently drop resources. Includes and excludes are checked separately so the error
+// says which list the bad pattern came from.
 func validateGlobPatterns(includesList, excludesList []string) []error {
 	var errs []error
 
-	for _, itm := range sets.NewString(append(includesList, excludesList...)...).List() {
+	for _, itm := range sets.NewString(includesList...).List() {
 		if _, err := glob.Compile(itm); err != nil {
-			errs = append(errs, errors.Errorf("invalid glob pattern %q: %v", itm, err))
+			errs = append(errs, errors.Errorf("invalid glob pattern %q in includes list: %v", itm, err))
+		}
+	}
+	for _, itm := range sets.NewString(excludesList...).List() {
+		if _, err := glob.Compile(itm); err != nil {
+			errs = append(errs, errors.Errorf("invalid glob pattern %q in excludes list: %v", itm, err))
 		}
 	}
 

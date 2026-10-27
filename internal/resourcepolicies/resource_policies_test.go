@@ -2598,14 +2598,14 @@ func TestIncludeExcludePolicyValidateGlobPatterns(t *testing.T) {
 			policy: IncludeExcludePolicy{
 				IncludedClusterScopedResources: []string{"persistentvolumes", "foo["},
 			},
-			wantErr: `invalid glob pattern "foo["`,
+			wantErr: `invalid glob pattern "foo[" in includes list`,
 		},
 		{
 			name: "malformed namespace-scoped glob pattern is rejected",
 			policy: IncludeExcludePolicy{
 				ExcludedNamespaceScopedResources: []string{"[bar"},
 			},
-			wantErr: `invalid glob pattern "[bar"`,
+			wantErr: `invalid glob pattern "[bar" in excludes list`,
 		},
 	}
 
