@@ -61,9 +61,18 @@ CPU, memory and upload concurrency are separate settings. `podResources` sets th
 
 Uploads are asynchronous: data remains in memory until it has been written to the backup repository. So memory usage of a data mover pod grows with upload concurrency. If the concurrency is not set, it defaults to `GOMAXPROCS` of the data mover process, which the Go runtime derives from the CPU limit of the pod if one is set (see [Container-aware GOMAXPROCS][7]), or otherwise from the number of CPUs on the node. Since data mover pods have no CPU limit by default, nodes with many CPUs get a high default concurrency and high memory usage.
 
-Velero does not cap the concurrency, so you can tune it for your environment:
-- With high network bandwidth and enough memory, raise the concurrency to improve throughput.
-- With limited memory, especially on nodes with many CPUs, lower the concurrency to avoid the data mover pod being OOM killed.
+Velero does not cap the concurrency on purpose: the best value depends on where the bottleneck of the data path is, which differs between environments. Throughput is limited by the slowest of: reading the source volume, compressing and hashing the data (CPU), and writing to the backup storage (network bandwidth and the storage itself).
+
+Raising the concurrency increases the throughput when the data mover pod has spare CPU, memory and network bandwidth, and each upload spends time waiting rather than working, for example:
+- backup storage with high bandwidth but high latency per request, such as remote object storage;
+- a fast network to the backup storage that a few concurrent uploads can't fill.
+
+Lowering the concurrency reduces memory and CPU usage without reducing the throughput when the bottleneck is elsewhere, for example:
+- the network bandwidth to the backup storage, or the backup storage itself, is already saturated;
+- reading the source volume is the slowest step;
+- the concurrency is already higher than the number of CPUs the pod can use, since compressing and hashing are CPU bound.
+
+In those cases extra concurrency only keeps more data in memory. With limited memory, especially on nodes with many CPUs, lower the concurrency to avoid the data mover pod being OOM killed.
 
 If you set `memoryLimit`, also set the upload concurrency for the backup or schedule instead of relying on the default. Changing `cpuLimit` also changes the default concurrency, but it is not the intended way to control memory usage.
 
