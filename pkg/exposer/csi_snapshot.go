@@ -583,21 +583,11 @@ func (e *csiSnapshotExposer) createBackupVSC(ctx context.Context, ownerObject co
 			Source: snapshotv1api.VolumeSnapshotContentSource{
 				SnapshotHandle: snapshotVSC.Status.SnapshotHandle,
 			},
-			// The backup VSC is statically provisioned against the same
-			// snapshot handle as the source VSC, so both objects refer to one
-			// physical snapshot. Inherit the source's deletion policy instead
-			// of forcing Delete, otherwise a user who configured Retain on the
-			// VolumeSnapshotClass still loses the snapshot when the backup VSC
-			// is cleaned up.
-			//
-			// For Case 2 storages per the design (design/block-data-mover/block-data-mover.md,
-			// e.g. Ceph RBD), inheriting Retain is not just an option but a requirement for
-			// incrementals to work at all: rbd snap diff needs the base and target snapshots
-			// in the same clone chain, so Delete destroys the base as soon as this backup
-			// completes. The next incremental's delta query then fails and degrades to an
-			// allocated-blocks backup (see the CBT tier ladder) or, without that fix, a full
-			// whole-device transfer.
-			DeletionPolicy:          snapshotVSC.Spec.DeletionPolicy,
+			// Always Delete: Velero never follows the VolumeSnapshotClass
+			// deletionPolicy for data movement. The node-agent switches the
+			// backup VSC to Retain only after a DataUpload that retains its
+			// base snapshot completes.
+			DeletionPolicy:          snapshotv1api.VolumeSnapshotContentDelete,
 			Driver:                  snapshotVSC.Spec.Driver,
 			VolumeSnapshotClassName: snapshotVSC.Spec.VolumeSnapshotClassName,
 		},
