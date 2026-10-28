@@ -30,7 +30,6 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -716,11 +715,6 @@ func cancelDataUpload(
 	return nil
 }
 
-// snapshotMetadataServiceGVK is the SnapshotMetadataService of
-// kubernetes-csi/external-snapshot-metadata. It is read unstructured because
-// spec.requireBaseSnapshotForDelta is not in a released client yet.
-var snapshotMetadataServiceGVK = schema.GroupVersionKind{Group: "cbt.storage.k8s.io", Version: "v1beta1", Kind: "SnapshotMetadataService"}
-
 // retentionDecision is the base snapshot retention decision for a DataUpload
 // and where it came from.
 type retentionDecision struct {
@@ -748,12 +742,12 @@ func (p *pvcBackupItemAction) decideRetainBaseSnapshot(
 	driver string,
 	log logrus.FieldLogger,
 ) retentionDecision {
-	d := p.resolveRetainBaseSnapshot(ctx, vh, item, driver, log)
+	var d retentionDecision
 	if !datamover.IsVeleroBlockDataMover(dataMover) {
-		if d.retain {
-			log.Warnf("Ignoring base snapshot retention %s: data mover %q never retains snapshots", d, dataMover)
-		}
+		// No other source is read: only the block data mover retains.
 		d = retentionDecision{retain: false, source: fmt.Sprintf("default: data mover %q is not %q", dataMover, datamover.DataMoverTypeVeleroBlock)}
+	} else {
+		d = p.resolveRetainBaseSnapshot(ctx, vh, item, driver, log)
 	}
 	log.Infof("Base snapshot retention: %s, data mover %q, driver %s", d, dataMover, driver)
 	return d
@@ -782,26 +776,12 @@ func (p *pvcBackupItemAction) resolveRetainBaseSnapshot(
 		return retentionDecision{retain: *v, source: fmt.Sprintf("volume policy %d", index)}
 	}
 
-	if driver == "" {
-		reasons = append(reasons, "no CSI driver")
-		return retentionDecision{source: "default: " + strings.Join(reasons, "; ")}
-	}
-	sms := &unstructured.Unstructured{}
-	sms.SetGroupVersionKind(snapshotMetadataServiceGVK)
-	if err := p.crClient.Get(ctx, crclient.ObjectKey{Name: driver}, sms); err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			reasons = append(reasons, fmt.Sprintf("no SnapshotMetadataService for %s", driver))
-		} else {
-			reasons = append(reasons, fmt.Sprintf("reading SnapshotMetadataService failed: %v", err))
-		}
-	} else if b, found, err := unstructured.NestedBool(sms.Object, "spec", "requireBaseSnapshotForDelta"); err != nil {
-		reasons = append(reasons, fmt.Sprintf("reading SnapshotMetadataService failed: %v", err))
-	} else if !found {
-		// A CRD without the field prunes it, so the CR never has it until the
-		// CSI driver deployment ships the updated CRD.
-		reasons = append(reasons, fmt.Sprintf("SnapshotMetadataService %s has no requireBaseSnapshotForDelta", sms.GetName()))
+	// A CRD without requireBaseSnapshotForDelta prunes it, so the CR never has
+	// it until the CSI driver deployment ships the updated CRD.
+	if b, src := retainedsnapshot.RequireBaseSnapshotForDelta(ctx, p.crClient, driver); b != nil {
+		return retentionDecision{retain: *b, source: "SnapshotMetadataService " + src}
 	} else {
-		return retentionDecision{retain: b, source: "SnapshotMetadataService " + sms.GetName()}
+		reasons = append(reasons, src)
 	}
 
 	return retentionDecision{source: "default: " + strings.Join(reasons, "; ")}

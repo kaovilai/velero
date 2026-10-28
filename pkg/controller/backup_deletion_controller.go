@@ -641,13 +641,6 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 	return errs
 }
 
-// RetainedSnapshotDeletionWait is how long backup deletion waits for the CSI
-// driver to delete a retained snapshot. A deletion still pending after it fails
-// the DeleteBackupRequest and keeps the record in deleting; the retained snapshot
-// controller finishes it, and running the deletion again waits on the same temp
-// VolumeSnapshotContent.
-var RetainedSnapshotDeletionWait = 5 * time.Minute
-
 // deleteRetainedSnapshots handles the retained snapshot records of the backup
 // after its repository snapshots and DataUploads are deleted: tombstones are
 // removed without a storage call, records of another cluster are removed and
@@ -681,6 +674,12 @@ func (r *backupDeletionReconciler) deleteRetainedSnapshots(ctx context.Context, 
 	if r.clock != nil {
 		now = r.clock.Now
 	}
+	// Backup deletion waits up to the deletion timeout for the CSI driver to
+	// delete a retained snapshot. A deletion still pending after it fails the
+	// DeleteBackupRequest and keeps the record in deleting; the retained snapshot
+	// controller finishes it after the lease, and running the deletion again
+	// waits on the same temp VolumeSnapshotContent.
+	timeout := readRetainedSnapshotSettings(ctx, reader, backup.Namespace, log).deletionWait
 	var errs []error
 	for i := range list.Items {
 		cm := &list.Items[i]
@@ -701,15 +700,20 @@ func (r *backupDeletionReconciler) deleteRetainedSnapshots(ctx context.Context, 
 		default:
 			rlog.Infof("Deleting retained snapshot %s of record %s (state %s)", record.SnapshotHandle, cm.Name, record.State)
 			err = retainedsnapshot.DeleteSnapshot(ctx, r.Client, r.snapshotDeletionClient(), cm, retainedsnapshot.DeleteOptions{
-				Wait:   RetainedSnapshotDeletionWait,
-				Remove: true,
-				Reason: retainedsnapshot.ReasonDeletedWithBackup,
-				Now:    now,
-				Owner:  "backup-deletion",
+				Wait:    timeout,
+				Timeout: timeout,
+				Remove:  true,
+				Reason:  retainedsnapshot.ReasonDeletedWithBackup,
+				Now:     now,
+				Owner:   "backup-deletion",
 			}, rlog)
-			if errors.Is(err, csi.ErrTempVSCDeletionPending) {
+			switch {
+			case errors.Is(err, csi.ErrTempVSCDeletionInterrupted):
+				err = errors.Errorf("deletion of retained snapshot %s was interrupted (temp VolumeSnapshotContent %s), the record stays %s; run the backup deletion again",
+					record.SnapshotHandle, retainedsnapshot.TempVSCName(record.Driver, record.SnapshotHandle), retainedsnapshot.StateDeleting)
+			case errors.Is(err, csi.ErrTempVSCDeletionPending):
 				err = errors.Errorf("deletion of retained snapshot %s is pending after %v (temp VolumeSnapshotContent %s), the record stays %s; run the backup deletion again once the CSI driver deleted it",
-					record.SnapshotHandle, RetainedSnapshotDeletionWait, retainedsnapshot.TempVSCName(record.Driver, record.SnapshotHandle), retainedsnapshot.StateDeleting)
+					record.SnapshotHandle, timeout, retainedsnapshot.TempVSCName(record.Driver, record.SnapshotHandle), retainedsnapshot.StateDeleting)
 			}
 		}
 		if err != nil {

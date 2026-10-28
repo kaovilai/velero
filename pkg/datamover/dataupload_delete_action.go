@@ -132,7 +132,7 @@ func genRetainedSnapshotConfigmap(bak *velerov1.Backup, du velerov2alpha1.DataUp
 	if du.Status.SnapshotStartTime != nil {
 		startTime = du.Status.SnapshotStartTime.Time
 	}
-	record := retainedsnapshot.NewRecordForDataUpload(&du, retained, du.Status.SnapshotID, startTime)
+	record := retainedsnapshot.NewRecordForDataUpload(&du, retained, du.Status.SnapshotID, startTime, "")
 	record.Backup = bak.Name
 	return record.ToConfigMap(bak.Namespace), nil
 }

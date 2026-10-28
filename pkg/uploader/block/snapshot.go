@@ -21,6 +21,7 @@ import (
 	"io"
 	"maps"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -93,6 +94,8 @@ func Backup(ctx context.Context, blkUp Uploader, repoWriter udmrepo.BackupRepo, 
 		StartTime:       details.startTime,
 		FallbackReason:  details.fallbackReason,
 		ParentChangeID:  details.parentChangeID,
+		VolumeID:        details.volumeID,
+		DriverError:     details.driverError,
 	}
 
 	return snapshotInfo, false, err
@@ -113,7 +116,7 @@ func snapshotSource(
 	description string,
 ) (string, int64, int64, bool, snapshotDetails, error) {
 	log.Info("Start to snapshot...")
-	details := snapshotDetails{}
+	details := snapshotDetails{volumeID: cbtSource.VolumeID}
 	snapshotStartTime := time.Now()
 
 	bitmap := cbt.NewBitmap(blockSize, uint64(source.size), cbtSource.Snapshot, cbtSource.VolumeID)
@@ -150,6 +153,8 @@ func snapshotSource(
 	}
 	if !fallback {
 		details.fallbackReason = ""
+	} else if details.fallbackReason == FallbackReasonDeltaError {
+		details.driverError = joinErrors(bitmap.Errors())
 	}
 
 	snap, backupSize, err := u.Backup(source, parentBackup.parentObject, bitmap.Iterator(), uploaderCfg)
@@ -207,6 +212,30 @@ type snapshotDetails struct {
 	fallbackReason string
 	// parentChangeID is the changeId of the parent, the base snapshot handle.
 	parentChangeID string
+	// volumeID is the volume the repository snapshot is tagged with
+	// (cbt-volume-id, the CSI volume handle).
+	volumeID string
+	// driverError is the error of a deltaError fallback.
+	driverError string
+}
+
+// RestoreDetails are the details of a block restore besides the sizes.
+type RestoreDetails struct {
+	// ChangeID is the changeId an incremental restore asked the delta against,
+	// the base snapshot handle of the backup.
+	ChangeID string
+	// DriverError is the error of a fallback to a full restore.
+	DriverError string
+}
+
+func joinErrors(errs []error) string {
+	msgs := make([]string, 0, len(errs))
+	for _, e := range errs {
+		if e != nil {
+			msgs = append(msgs, e.Error())
+		}
+	}
+	return strings.Join(msgs, "; ")
 }
 
 func getParentBackupInfo(ctx context.Context, rep udmrepo.BackupRepo, forceFull bool, parentSnapshot string, volumeID string,
@@ -273,11 +302,19 @@ func getParentBackupInfo(ctx context.Context, rep udmrepo.BackupRepo, forceFull 
 
 // Restore restore specific sourcePath with given snapshotID and update progress
 func Restore(ctx context.Context, blkUp Uploader, rep udmrepo.BackupRepo, snapshotID, dest string, incremental bool, cbtSource cbtservice.SourceInfo, cbtService cbtservice.Service, uploaderCfg map[string]string, log logrus.FieldLogger) (int64, int64, bool, error) {
+	incrementalBytes, totalSize, fallback, _, err := RestoreWithDetails(ctx, blkUp, rep, snapshotID, dest, incremental, cbtSource, cbtService, uploaderCfg, log)
+	return incrementalBytes, totalSize, fallback, err
+}
+
+// RestoreWithDetails is Restore, also returning the changeId the restore asked
+// the delta against and the error of a fallback.
+func RestoreWithDetails(ctx context.Context, blkUp Uploader, rep udmrepo.BackupRepo, snapshotID, dest string, incremental bool, cbtSource cbtservice.SourceInfo, cbtService cbtservice.Service, uploaderCfg map[string]string, log logrus.FieldLogger) (int64, int64, bool, RestoreDetails, error) {
 	log.Info("Start to restore...")
+	details := RestoreDetails{}
 
 	snapshot, err := rep.GetSnapshot(ctx, udmrepo.ID(snapshotID))
 	if err != nil {
-		return 0, 0, false, errors.Wrapf(err, "unable to load snapshot %v", snapshotID)
+		return 0, 0, false, details, errors.Wrapf(err, "unable to load snapshot %v", snapshotID)
 	}
 	log.Infof("Restore from snapshot %s, incremental %v, cbt source %v, description %s, created time %v, tags %v", snapshotID, incremental, cbtSource, snapshot.Description, snapshot.EndTime, snapshot.Tags)
 
@@ -291,6 +328,7 @@ func Restore(ctx context.Context, blkUp Uploader, rep udmrepo.BackupRepo, snapsh
 			bitmap.SetFull()
 		} else {
 			bitmap.SetChangeID(bkInfo.changeID)
+			details.ChangeID = bkInfo.changeID
 			if err = cbt.SetBitmapOrFull(ctx, cbtService, bitmap, true); err != nil {
 				log.WithError(err).Warnf("Failed to create CBT with source %v", cbtSource)
 			}
@@ -303,37 +341,40 @@ func Restore(ctx context.Context, blkUp Uploader, rep udmrepo.BackupRepo, snapsh
 	if incremental {
 		fallback = (len(bitmap.Errors()) > 0)
 	}
+	if fallback {
+		details.DriverError = joinErrors(bitmap.Errors())
+	}
 
 	destPath, err := filepath.Abs(dest)
 	if err != nil {
-		return 0, 0, fallback, errors.Wrapf(err, "invalid dest path '%s'", dest)
+		return 0, 0, fallback, details, errors.Wrapf(err, "invalid dest path '%s'", dest)
 	}
 
 	destPath = filepath.Clean(destPath)
 
 	destDev, err := openBlockDeviceFunc(destPath, false)
 	if err != nil {
-		return 0, 0, fallback, errors.Wrapf(err, "error opening block device '%s'", destPath)
+		return 0, 0, fallback, details, errors.Wrapf(err, "error opening block device '%s'", destPath)
 	}
 
 	defer destDev.Close()
 
 	destSize, err := destDev.Seek(0, io.SeekEnd)
 	if err != nil {
-		return 0, 0, fallback, errors.Wrapf(err, "error getting length of block device %s", dest)
+		return 0, 0, fallback, details, errors.Wrapf(err, "error getting length of block device %s", dest)
 	}
 
 	_, err = destDev.Seek(0, io.SeekStart)
 	if err != nil {
-		return 0, 0, fallback, errors.Wrapf(err, "error reset pos of block device %s", dest)
+		return 0, 0, fallback, details, errors.Wrapf(err, "error reset pos of block device %s", dest)
 	}
 
 	incrementalBytes, totalSize, err := blkUp.Restore(snapshot, destInfo{dev: destDev, path: destPath, size: destSize}, bitmap.Iterator(), uploaderCfg)
 	if err != nil {
-		return 0, 0, fallback, errors.Wrapf(err, "error restoring to block dev %s", destPath)
+		return 0, 0, fallback, details, errors.Wrapf(err, "error restoring to block dev %s", destPath)
 	}
 
-	return incrementalBytes, totalSize, fallback, nil
+	return incrementalBytes, totalSize, fallback, details, nil
 }
 
 func getBackupInfo(snapshot udmrepo.Snapshot, volumeID string) (backupInfo, error) {

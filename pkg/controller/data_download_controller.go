@@ -499,6 +499,18 @@ func (r *DataDownloadReconciler) OnDataDownloadCompleted(ctx context.Context, na
 		Snapshot: dd.Spec.CSISnapshot,
 	})
 
+	// A driver error falls back to a full restore: refine deltaError from the
+	// record of the changeId the restore asked the delta against, like the
+	// DataUpload controller, and keep the driver error, as the data mover pod
+	// and its log are gone after the restore.
+	var driverFallbackReason velerov2alpha1api.FallbackReason
+	driverFallbackMessage := ""
+	if result.Restore.FallbackFull && dd.Annotations[retainedsnapshot.InPlaceFallbackReasonAnnotation] == "" {
+		var why string
+		driverFallbackReason, why = refineDeltaError(ctx, r.kubeClient, dd.Namespace, dd.Labels[retainedsnapshot.ChainLabel], result.Restore.ChangeID, log)
+		driverFallbackMessage = fallbackMessage("in-place incremental restore fell back to full", driverFallbackReason, why, result.Restore.DriverError)
+	}
+
 	if err := UpdateDataDownloadWithRetry(ctx, r.client, types.NamespacedName{Namespace: dd.Namespace, Name: dd.Name}, log, func(dd *velerov2alpha1api.DataDownload) bool {
 		if isDataDownloadInFinalState(dd) {
 			return false
@@ -512,8 +524,8 @@ func (r *DataDownloadReconciler) OnDataDownloadCompleted(ctx context.Context, na
 			dd.Status.FallbackReason = velerov2alpha1api.FallbackReason(reason)
 			dd.Status.Message = "in-place restore is full, not incremental: " + dd.Annotations[retainedsnapshot.InPlaceFallbackMessageAnnotation]
 		} else if result.Restore.FallbackFull {
-			dd.Status.FallbackReason = velerov2alpha1api.FallbackReasonDeltaError
-			dd.Status.Message = "in-place incremental restore fell back to full: the CSI driver failed to compute the changed blocks, see the data mover pod log"
+			dd.Status.FallbackReason = driverFallbackReason
+			dd.Status.Message = driverFallbackMessage
 		}
 		dd.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
 

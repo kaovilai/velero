@@ -63,6 +63,10 @@ type SnapshotInfo struct {
 	FallbackReason string
 	// ParentChangeID is the changeId of the parent snapshot, if any.
 	ParentChangeID string
+	// VolumeID is the volume the snapshot is tagged with (cbt-volume-id).
+	VolumeID string
+	// DriverError is the error of a deltaError fallback.
+	DriverError string
 }
 
 // Progress which defined two variables to record progress

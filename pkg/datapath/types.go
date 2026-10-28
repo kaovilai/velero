@@ -49,6 +49,11 @@ type BackupResult struct {
 	SnapshotStartTime *time.Time `json:"snapshotStartTime,omitempty"`
 	// ParentChangeID is the changeId of the parent, the base snapshot handle.
 	ParentChangeID string `json:"parentChangeID,omitempty"`
+	// VolumeID is the volume the repository snapshot is tagged with
+	// (cbt-volume-id, the CSI volume handle).
+	VolumeID string `json:"volumeID,omitempty"`
+	// DriverError is the error of a deltaError fallback.
+	DriverError string `json:"driverError,omitempty"`
 }
 
 // RestoreResult represents the result of a restore
@@ -57,6 +62,11 @@ type RestoreResult struct {
 	TotalBytes       int64       `json:"totalBytes,omitempty"`
 	IncrementalBytes int64       `json:"incrementalBytes,omitempty"`
 	FallbackFull     bool        `json:"fallbackFull,omitempty"`
+	// ChangeID is the changeId an incremental restore asked the delta against,
+	// the base snapshot handle of the backup.
+	ChangeID string `json:"changeID,omitempty"`
+	// DriverError is the error of a fallback to a full restore.
+	DriverError string `json:"driverError,omitempty"`
 }
 
 // Callbacks defines the collection of callbacks during backup/restore

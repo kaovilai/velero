@@ -248,6 +248,7 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 	restoreType := string(input.Restore.Spec.ExistingVolumeDataPolicy)
 	var fallback inPlaceBase
 	chainLabel := ""
+	heldRecord := ""
 	if pvcExists {
 		// Pre-flight checks must pass before any side effect on the existing PVC/PV.
 		if err := inplace.CheckPVCBoundToBackedUpVolume(ctx, p.crClient, existingPVC, pvcFromBackup.Spec.VolumeName, pvc.Annotations[velerov1api.InplaceRestoreVolumeHandleAnnotation], pvcFromBackup.Namespace, input.Restore.AllowExistingVolumeMismatch(), logger); err != nil {
@@ -266,8 +267,15 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 		// Only for backups that asked to retain the base: on storages that don't
 		// need the base snapshot (Case 1) the in-place incremental restore works
 		// without it.
-		if input.Restore.IsVolumeDataInplaceIncrementalRestore() && datamover.IsVeleroBlockDataMover(dataUploadResult.DataMover) && dataUploadResult.RetainBaseSnapshot {
-			base := p.decideInPlaceBase(ctx, input.Restore, backup, dataUploadResult, logger)
+		// A backup without retention restores in place as today, unless the
+		// SnapshotMetadataService of the driver says the delta needs the base.
+		if input.Restore.IsVolumeDataInplaceIncrementalRestore() && datamover.IsVeleroBlockDataMover(dataUploadResult.DataMover) {
+			var base inPlaceBase
+			if dataUploadResult.RetainBaseSnapshot {
+				base = p.decideInPlaceBase(ctx, input.Restore, backup, dataUploadResult, holdUntil(input.Restore, backup), logger)
+			} else {
+				base = p.decideWithoutRetention(ctx, backup, existingPVC, logger)
+			}
 			if base.sourcePVC == "" {
 				base.sourcePVC = pvcFromBackup.Name
 			}
@@ -275,8 +283,9 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 				logger.Warnf("In-place restore of PVC %s/%s is full, not incremental: %s", existingPVC.Namespace, existingPVC.Name, base.message)
 				restoreType = string(velerov1api.VolumeDataPolicyTypeFull)
 				fallback = base
-			} else {
+			} else if base.heldRecord != "" {
 				chainLabel = retainedsnapshot.ChainHash(dataUploadResult.BackupStorageLocation, dataUploadResult.SourceNamespace, base.sourcePVC)
+				heldRecord = base.heldRecord
 			}
 		}
 
@@ -316,6 +325,23 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 		existingPV, err = p.deleteExistingPVC(ctx, logger, pvc, existingPVC, backup.Spec.CSISnapshotTimeout.Duration)
 		if err != nil {
 			return nil, errors.WithStack(err)
+		}
+	}
+
+	// Extend the hold right before the DataDownload exists; from then on the
+	// DataDownload pauses rotation. If the base is gone meanwhile, e.g. the hold
+	// expired, restore in place as full.
+	if heldRecord != "" {
+		if base := p.renewHold(ctx, input.Restore, backup, heldRecord, holdUntil(input.Restore, backup), logger); base.reason != "" {
+			logger.Warnf("In-place restore of PVC %s/%s is full, not incremental: %s", pvc.Namespace, pvc.Name, base.message)
+			if cleanUpVolumeSnapshot && volumeSnapshot != nil {
+				csi.CleanupVolumeSnapshot(ctx, volumeSnapshot, p.crClient, p.log)
+			}
+			volumeSnapshot = nil
+			cleanUpVolumeSnapshot = false
+			restoreType = string(velerov1api.VolumeDataPolicyTypeFull)
+			fallback = base
+			chainLabel = ""
 		}
 	}
 
@@ -360,19 +386,61 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 }
 
 // inPlaceBase is the in-place incremental restore decision: an empty reason
-// means the base snapshot is live and the restore proceeds as today.
+// means the restore proceeds as today; heldRecord names the record the restore
+// holds.
 type inPlaceBase struct {
-	reason    velerov2alpha1.FallbackReason
-	message   string
-	sourcePVC string
+	reason     velerov2alpha1.FallbackReason
+	message    string
+	sourcePVC  string
+	heldRecord string
+}
+
+// holdUntil returns until when an in-place restore holds the record of its
+// base: the baseline snapshot and the PVC deletion are each bounded by a
+// timeout, plus one minute.
+func holdUntil(restore *velerov1api.Restore, backup *velerov1api.Backup) time.Time {
+	return time.Now().Add(restore.Spec.CSISnapshotTimeout.Duration + backup.Spec.CSISnapshotTimeout.Duration + time.Minute)
+}
+
+// holdName is the restore as recorded in inUseBy, the value of the restore
+// name label of its DataDownloads.
+func holdName(restore *velerov1api.Restore) string {
+	return label.GetValidName(restore.Name)
+}
+
+// holdRecord holds a live record for the restore with an update conditioned
+// on its resourceVersion, retrying on conflicts. It returns the record as it
+// last read it and whether it is held; a record that is not live (deleting,
+// deleted) isn't held.
+func (p *pvcRestoreItemAction) holdRecord(ctx context.Context, namespace, name, by string, until time.Time) (*retainedsnapshot.Record, bool, error) {
+	for range 5 {
+		cm, record, err := retainedsnapshot.Get(ctx, p.crClient, namespace, name)
+		if err != nil {
+			return nil, false, err
+		}
+		if record.State != retainedsnapshot.StateRetained {
+			return record, false, nil
+		}
+		held, err := retainedsnapshot.Hold(ctx, p.crClient, cm, by, until)
+		if errors.Is(err, retainedsnapshot.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return record, false, err
+		}
+		return held, true, nil
+	}
+	return nil, false, errors.Errorf("retained snapshot record %s keeps changing", name)
 }
 
 // decideInPlaceBase decides, before the baseline snapshot is taken, whether the
-// base snapshot of the backup is live: a live record in this cluster, or
-// status.retainedSnapshot of this cluster with no record (e.g. after a
-// reinstall), proceeds; a tombstone, no retained snapshot, or a snapshot of
-// another cluster restores in place as full.
-func (p *pvcRestoreItemAction) decideInPlaceBase(ctx context.Context, restore *velerov1api.Restore, backup *velerov1api.Backup, dur *velerov2alpha1.DataUploadResult, log logrus.FieldLogger) inPlaceBase {
+// base snapshot of the backup is live, and holds a live record until the
+// DataDownload exists: a live record in this cluster, or status.retainedSnapshot
+// of this cluster (or of none) with no record (e.g. after a reinstall),
+// proceeds; a deleting or deleted record (baseGone), no retained snapshot
+// (baseNotRetained), or a snapshot of another cluster (baseInOtherCluster)
+// restores in place as full.
+func (p *pvcRestoreItemAction) decideInPlaceBase(ctx context.Context, restore *velerov1api.Restore, backup *velerov1api.Backup, dur *velerov2alpha1.DataUploadResult, until time.Time, log logrus.FieldLogger) inPlaceBase {
 	base := inPlaceBase{sourcePVC: dur.SourcePVC}
 	if dur.DataUploadName == "" {
 		log.Warn("The DataUpload result has no DataUpload name, can't check the base snapshot, proceeding with the in-place incremental restore")
@@ -389,23 +457,34 @@ func (p *pvcRestoreItemAction) decideInPlaceBase(ctx context.Context, restore *v
 		return base
 	}
 
-	_, record, err := retainedsnapshot.Get(ctx, p.crClient, restore.Namespace, retainedsnapshot.RecordName(dur.DataUploadName))
+	recordName := retainedsnapshot.RecordName(dur.DataUploadName)
+	_, record, err := retainedsnapshot.Get(ctx, p.crClient, restore.Namespace, recordName)
 	switch {
 	case err == nil:
 		if retainedsnapshot.IsForeign(record.ClusterID, localID) {
-			return notLive(fmt.Sprintf("was taken in cluster %s", record.ClusterID), velerov2alpha1.FallbackReasonBaseNotRetained)
+			return notLive(fmt.Sprintf("was taken in cluster %s", record.ClusterID), velerov2alpha1.FallbackReasonBaseInOtherCluster)
 		}
-		if record.State == retainedsnapshot.StateRetained {
-			log.Infof("Base snapshot %s of backup %s is retained (record %s), proceeding with the in-place incremental restore", record.SnapshotHandle, backup.Name, retainedsnapshot.RecordName(dur.DataUploadName))
+		held, ok, err := p.holdRecord(ctx, restore.Namespace, recordName, holdName(restore), until)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return notLive("was deleted with the backup", velerov2alpha1.FallbackReasonBaseGone)
+			}
+			log.WithError(err).Warn("Failed to hold the retained snapshot record, proceeding with the in-place incremental restore")
 			return base
 		}
-		return notLive("was "+record.Describe(), velerov2alpha1.FallbackReasonBaseGone)
+		if !ok {
+			return notLive(describeGone(held), velerov2alpha1.FallbackReasonBaseGone)
+		}
+		log.Infof("Base snapshot %s of backup %s is retained (record %s), holding it for restore %s until %s and proceeding with the in-place incremental restore",
+			held.SnapshotHandle, backup.Name, recordName, holdName(restore), until.UTC().Format(time.RFC3339))
+		base.heldRecord = recordName
+		return base
 	case apierrors.IsNotFound(err):
 		if dur.RetainedSnapshot == nil {
 			return notLive("was not retained", velerov2alpha1.FallbackReasonBaseNotRetained)
 		}
 		if retainedsnapshot.IsForeign(dur.RetainedSnapshot.ClusterID, localID) {
-			return notLive(fmt.Sprintf("was taken in cluster %s", dur.RetainedSnapshot.ClusterID), velerov2alpha1.FallbackReasonBaseNotRetained)
+			return notLive(fmt.Sprintf("was taken in cluster %s", dur.RetainedSnapshot.ClusterID), velerov2alpha1.FallbackReasonBaseInOtherCluster)
 		}
 		log.Infof("No record for base snapshot %s of backup %s, which this cluster retained (e.g. a reinstall lost the record), proceeding with the in-place incremental restore",
 			dur.RetainedSnapshot.SnapshotHandle, backup.Name)
@@ -413,6 +492,57 @@ func (p *pvcRestoreItemAction) decideInPlaceBase(ctx context.Context, restore *v
 	default:
 		log.WithError(err).Warn("Failed to read the retained snapshot record, proceeding with the in-place incremental restore")
 		return base
+	}
+}
+
+// describeGone describes a record that is not live for the restore message.
+func describeGone(r *retainedsnapshot.Record) string {
+	if r.State == retainedsnapshot.StateDeleted && r.Reason == retainedsnapshot.ReasonDeletedWithBackup {
+		return "was deleted with the backup"
+	}
+	return "was " + r.Describe()
+}
+
+// renewHold extends the hold of the record right before the DataDownload is
+// created. A base gone meanwhile returns the full restore reason.
+func (p *pvcRestoreItemAction) renewHold(ctx context.Context, restore *velerov1api.Restore, backup *velerov1api.Backup, recordName string, until time.Time, log logrus.FieldLogger) inPlaceBase {
+	held, ok, err := p.holdRecord(ctx, restore.Namespace, recordName, holdName(restore), until)
+	switch {
+	case err != nil && apierrors.IsNotFound(err):
+		return inPlaceBase{reason: velerov2alpha1.FallbackReasonBaseGone, message: fmt.Sprintf("base snapshot of backup %s was deleted with the backup", backup.Name)}
+	case err != nil:
+		log.WithError(err).Warn("Failed to extend the hold of the retained snapshot record, proceeding with the in-place incremental restore")
+		return inPlaceBase{}
+	case !ok:
+		return inPlaceBase{reason: velerov2alpha1.FallbackReasonBaseGone, message: fmt.Sprintf("base snapshot of backup %s %s", backup.Name, describeGone(held))}
+	}
+	log.Infof("Extended the hold of retained snapshot record %s for restore %s until %s", recordName, holdName(restore), until.UTC().Format(time.RFC3339))
+	return inPlaceBase{}
+}
+
+// decideWithoutRetention decides the in-place incremental restore of a backup
+// without retention: as today, unless the SnapshotMetadataService of the
+// driver has requireBaseSnapshotForDelta true, in which case the base was never
+// kept and the delta can't work, so it restores in place as full.
+func (p *pvcRestoreItemAction) decideWithoutRetention(ctx context.Context, backup *velerov1api.Backup, existingPVC *corev1api.PersistentVolumeClaim, log logrus.FieldLogger) inPlaceBase {
+	driver := ""
+	if existingPVC.Spec.VolumeName != "" {
+		pv := &corev1api.PersistentVolume{}
+		if err := p.crClient.Get(ctx, crclient.ObjectKey{Name: existingPVC.Spec.VolumeName}, pv); err == nil && pv.Spec.CSI != nil {
+			driver = pv.Spec.CSI.Driver
+		}
+	}
+	required, src := retainedsnapshot.RequireBaseSnapshotForDelta(ctx, p.crClient, driver)
+	if required == nil || !*required {
+		if required == nil {
+			log.Debugf("Backup %s has no retained base snapshot; %s, proceeding with the in-place incremental restore", backup.Name, src)
+		}
+		return inPlaceBase{}
+	}
+	return inPlaceBase{
+		reason: velerov2alpha1.FallbackReasonBaseNotRetained,
+		message: fmt.Sprintf("base snapshot of backup %s was not retained, and SnapshotMetadataService %s requires the base snapshot for a delta",
+			backup.Name, src),
 	}
 }
 

@@ -686,7 +686,7 @@ volumePolicies:
 					},
 				},
 			},
-			expectedErr: "fail to validate ResourcePolicies in ConfigMap test-namespace/test-backup",
+			expectedErr: "fail to validate ResourcePolicies in ConfigMap test-namespace/invalid-action-configmap",
 		},
 		{
 			name: "invalid version configmap",
@@ -702,7 +702,7 @@ volumePolicies:
 					},
 				},
 			},
-			expectedErr: "fail to validate ResourcePolicies in ConfigMap test-namespace/test-backup",
+			expectedErr: "fail to validate ResourcePolicies in ConfigMap test-namespace/invalid-version-configmap",
 		},
 		{
 			name: "empty configmap",
@@ -718,7 +718,7 @@ volumePolicies:
 					},
 				},
 			},
-			expectedErr: "fail to read the ResourcePolicies from ConfigMap test-namespace/test-backup",
+			expectedErr: "fail to read the ResourcePolicies from ConfigMap test-namespace/empty-configmap",
 		},
 	}
 

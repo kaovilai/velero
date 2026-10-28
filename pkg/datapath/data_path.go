@@ -239,6 +239,8 @@ func (dp *generalDataPath) StartBackup(source AccessPoint, uploaderConfig map[st
 				details := d.LastBackupDetails()
 				result.FallbackReason = details.FallbackReason
 				result.ParentChangeID = details.ParentChangeID
+				result.VolumeID = details.VolumeID
+				result.DriverError = details.DriverError
 				if !details.SnapshotStartTime.IsZero() {
 					result.SnapshotStartTime = ptr.To(details.SnapshotStartTime)
 				}
@@ -285,11 +287,17 @@ func (dp *generalDataPath) StartRestore(snapshotID string, target AccessPoint, u
 			}
 			dp.callbacks.OnFailed(context.Background(), dp.namespace, dp.jobName, dataPathErr)
 		} else {
-			dp.callbacks.OnCompleted(context.Background(), dp.namespace, dp.jobName, Result{Restore: RestoreResult{Target: target,
+			result := RestoreResult{Target: target,
 				TotalBytes:       totalBytes,
 				IncrementalBytes: incrementalBytes,
 				FallbackFull:     fallback,
-			}})
+			}
+			if d, ok := dp.uploaderProv.(provider.RestoreDetailsProvider); ok {
+				details := d.LastRestoreDetails()
+				result.ChangeID = details.ChangeID
+				result.DriverError = details.DriverError
+			}
+			dp.callbacks.OnCompleted(context.Background(), dp.namespace, dp.jobName, Result{Restore: result})
 		}
 	}()
 

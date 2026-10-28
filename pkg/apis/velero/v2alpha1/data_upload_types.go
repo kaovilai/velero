@@ -93,6 +93,9 @@ const (
 	FallbackReasonBaseGone FallbackReason = "baseGone"
 	// FallbackReasonDeltaError means the CSI driver failed to compute the changed blocks.
 	FallbackReasonDeltaError FallbackReason = "deltaError"
+	// FallbackReasonBaseInOtherCluster means the base snapshot of an in-place
+	// restore was taken in another cluster.
+	FallbackReasonBaseInOtherCluster FallbackReason = "baseInOtherCluster"
 )
 
 type SnapshotType string

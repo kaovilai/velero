@@ -946,6 +946,11 @@ var WaitTempVSCDeleted = waitTempVSCDeleted
 // VolumeSnapshotContent still exists at the timeout.
 var ErrTempVSCDeletionPending = errors.New("temp VolumeSnapshotContent deletion is still pending")
 
+// ErrTempVSCDeletionInterrupted is returned by WaitTempVSCDeleted when the wait
+// was cut short, e.g. by a shutdown, not by its timeout. It is also an
+// ErrTempVSCDeletionPending: the deletion goes on.
+var ErrTempVSCDeletionInterrupted = errors.Wrap(ErrTempVSCDeletionPending, "the wait was interrupted")
+
 // waitTempVSCStatus waits until the CSI snapshotter has set status.snapshotHandle
 // of the temp VolumeSnapshotContent. When the VSC is deleted, the snapshotter only
 // calls DeleteSnapshot if the status has the snapshot handle; otherwise it just
@@ -997,6 +1002,9 @@ func waitTempVSCDeleted(ctx context.Context, crClient crclient.Client, name stri
 		return false, err
 	})
 	if wait.Interrupted(err) {
+		if ctx.Err() != nil {
+			return ErrTempVSCDeletionInterrupted
+		}
 		if deleteErr := snapshotDeleteErrorSince(ctx, crClient, name, start, log); deleteErr != nil {
 			return deleteErr
 		}
@@ -1116,6 +1124,11 @@ func DeleteSnapshotByTempVSCWait(ctx context.Context, crClient crclient.Client, 
 	}
 
 	if err := WaitTempVSCDeleted(ctx, crClient, vsc.Name, deleteWait, log); err != nil {
+		if errors.Is(err, ErrTempVSCDeletionInterrupted) {
+			log.Warnf("The wait for the deletion of snapshot %s was interrupted, temp VolumeSnapshotContent %s stays; the deletion is pending",
+				*vsc.Spec.Source.SnapshotHandle, vsc.Name)
+			return err
+		}
 		if errors.Is(err, ErrTempVSCDeletionPending) {
 			log.Warnf("Snapshot %s is not deleted after %v, temp VolumeSnapshotContent %s is still there; the deletion is pending",
 				*vsc.Spec.Source.SnapshotHandle, deleteWait, vsc.Name)

@@ -1990,3 +1990,92 @@ func TestRetainedSnapshotCommitPoint(t *testing.T) {
 		})
 	}
 }
+
+// TestRetainedSnapshotStepFailures checks the completion errors without a
+// restart: step 1 failing commits the result without retention and with the
+// message; step 3 failing keeps the DataUpload InProgress with the backup VSC
+// Delete (no cleanup), and after the abandon time retention is abandoned: the
+// record is deleted, the cleanup runs and the DataUpload completes.
+func TestRetainedSnapshotStepFailures(t *testing.T) {
+	shortenRetainedSnapshotBackoff(t)
+	ctx := t.Context()
+	handle := "snap-handle"
+
+	t.Run("step 1 fails", func(t *testing.T) {
+		r, err := initDataUploaderReconciler()
+		require.NoError(t, err)
+		r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger())}
+		du := dataUploadBuilder().DataMover("velero-block").Result()
+		du.Spec.RetainBaseSnapshot = true
+		require.NoError(t, r.client.Create(ctx, du))
+
+		r.OnDataUploadCompleted(ctx, du.Namespace, du.Name, datapath.Result{Backup: datapath.BackupResult{SnapshotID: "fake-id"}})
+
+		updated := &velerov2alpha1api.DataUpload{}
+		require.NoError(t, r.client.Get(ctx, types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, updated))
+		assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updated.Status.Phase)
+		assert.Nil(t, updated.Status.RetainedSnapshot)
+		assert.Equal(t, "fake-id", updated.Status.SnapshotID)
+		assert.Contains(t, updated.Status.Message, "base snapshot not retained: ")
+	})
+
+	t.Run("step 3 fails, then retention is abandoned", func(t *testing.T) {
+		original := retainAbandonAfter
+		t.Cleanup(func() { retainAbandonAfter = original })
+
+		r, err := initDataUploaderReconciler()
+		require.NoError(t, err)
+		r.nodeName = "node-1"
+		r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger())}
+		du := dataUploadBuilder().DataMover("velero-block").Phase(velerov2alpha1api.DataUploadPhaseInProgress).
+			Node("node-1").SnapshotID("repo-snap").Finalizers([]string{DataUploadDownloadFinalizer}).Result()
+		du.Spec.RetainBaseSnapshot = true
+		du.Status.RetainedSnapshot = &velerov2alpha1api.RetainedSnapshot{SnapshotHandle: handle, Driver: "rbd.csi.ceph.com"}
+		require.NoError(t, r.client.Create(ctx, du))
+		record := retainedsnapshot.NewRecordForDataUpload(du, du.Status.RetainedSnapshot, "repo-snap", time.Now(), "vol-1")
+		require.NoError(t, r.client.Create(ctx, record.ToConfigMap(du.Namespace)))
+		_, err = r.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, &snapshotv1api.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: du.Name},
+			Spec: snapshotv1api.VolumeSnapshotContentSpec{
+				DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+				Driver:         "rbd.csi.ceph.com",
+				Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
+			},
+		}, metav1.CreateOptions{})
+		require.NoError(t, err)
+		r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(clientTesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("fake-patch-error")
+		})
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}}
+
+		result, err := r.Reconcile(ctx, req)
+		require.NoError(t, err)
+		assert.Equal(t, retainRetryInterval, result.RequeueAfter)
+		updated := &velerov2alpha1api.DataUpload{}
+		require.NoError(t, r.client.Get(ctx, req.NamespacedName, updated))
+		assert.Equal(t, velerov2alpha1api.DataUploadPhaseInProgress, updated.Status.Phase)
+		// No cleanup on a Delete VSC past the commit point.
+		_, err = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+
+		retainAbandonAfter = 0
+		_, err = r.Reconcile(ctx, req)
+		require.NoError(t, err)
+		require.NoError(t, r.client.Get(ctx, req.NamespacedName, updated))
+		assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updated.Status.Phase)
+		assert.Nil(t, updated.Status.RetainedSnapshot)
+		assert.Contains(t, updated.Status.Message, "base snapshot not retained: setting backup VSC")
+		err = r.client.Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: retainedsnapshot.RecordName(du.Name)}, &corev1api.ConfigMap{})
+		assert.True(t, apierrors.IsNotFound(err))
+		_, err = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
+		assert.True(t, apierrors.IsNotFound(err))
+	})
+}
+
+func TestFallbackMessage(t *testing.T) {
+	long := strings.Repeat("x", maxDriverErrorLen+10)
+	msg := fallbackMessage("incremental backup fell back to the allocated blocks", velerov2alpha1api.FallbackReasonBaseGone, "base snapshot s1 of backup b1 was rotated out", long)
+	assert.Contains(t, msg, "(baseGone): base snapshot s1 of backup b1 was rotated out; CSI driver error: x")
+	assert.True(t, strings.HasSuffix(msg, "..."))
+	assert.Less(t, len(msg), maxDriverErrorLen+200)
+}

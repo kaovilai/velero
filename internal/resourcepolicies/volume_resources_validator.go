@@ -145,7 +145,11 @@ func (a *Action) validate() error {
 		// absent, and that overrides the Backup's datamover, so retention would
 		// silently do nothing.
 		if *retain {
-			dm, _ := a.Parameters[DataMoverParameter].(string)
+			dm, set := a.Parameters[DataMoverParameter].(string)
+			if !set {
+				return fmt.Errorf("parameter %q is true but the action has no %q (the default data mover %q would be used), it must be %q: only the block data mover retains base snapshots",
+					RetainBaseSnapshotParameter, DataMoverParameter, datamover.GetDefaultBuiltInDataMover(), datamover.DataMoverTypeVeleroBlock)
+			}
 			if dm != datamover.DataMoverTypeVeleroBlock {
 				return fmt.Errorf("parameter %q is true but parameter %q of the same action is %q, it must be %q: only the block data mover retains base snapshots",
 					RetainBaseSnapshotParameter, DataMoverParameter, dm, datamover.DataMoverTypeVeleroBlock)

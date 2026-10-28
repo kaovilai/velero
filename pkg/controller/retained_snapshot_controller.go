@@ -43,10 +43,21 @@ import (
 	"github.com/velero-io/velero/pkg/util/csi"
 )
 
+// RetainedSnapshotGCGracePeriod and RetainedSnapshotDeletionTimeout are set by
+// the server flags --retained-snapshot-gc-grace-period and
+// --retained-snapshot-deletion-timeout.
+var (
+	RetainedSnapshotGCGracePeriod   = time.Hour
+	RetainedSnapshotDeletionTimeout = 5 * time.Minute
+	// RetainedSnapshotResyncInterval is how often every chain is resynced for GC.
+	RetainedSnapshotResyncInterval = 5 * time.Minute
+)
+
 const (
-	// RetainedSnapshotConfigMap optionally overrides the GC settings of the
-	// retained snapshot controller (prototype): keys gcGracePeriod, gcInterval
-	// and deletionWait, Go durations.
+	// RetainedSnapshotConfigMap optionally overrides the settings of the
+	// retained snapshot controller and backup deletion (prototype only, so
+	// tests don't need a server restart): keys gcGracePeriod, gcInterval
+	// (resync) and deletionWait (deletion timeout), Go durations.
 	RetainedSnapshotConfigMap = "retained-snapshot-config"
 
 	// goneSinceAnnotation records on a record when the controller first saw its
@@ -55,15 +66,8 @@ const (
 	// goneWhatAnnotation records what is gone: volume or backup.
 	goneWhatAnnotation = "velero.io/retained-snapshot-gone"
 
-	defaultGCGracePeriod = 10 * time.Minute
-	defaultGCInterval    = 2 * time.Minute
-	// defaultDeletionWait is how long one reconcile waits for a temp
-	// VolumeSnapshotContent to disappear. A pending deletion keeps the record
-	// deleting and is requeued; the next attempt waits on the same object, so
-	// the total wait is unbounded.
-	defaultDeletionWait = time.Minute
-	pauseRequeue        = 15 * time.Second
-	pendingRequeue      = 30 * time.Second
+	pauseRequeue   = 15 * time.Second
+	pendingRequeue = 30 * time.Second
 
 	// deletionOwner names this controller on the records it moves to deleting.
 	deletionOwner = "retained-snapshot-controller"
@@ -111,14 +115,22 @@ func NewRetainedSnapshotReconciler(c client.Client, namespace string, logger log
 type retainedSnapshotSettings struct {
 	gcGracePeriod time.Duration
 	gcInterval    time.Duration
-	deletionWait  time.Duration
+	// deletionWait is the deletion timeout: how long one attempt waits for a
+	// temp VolumeSnapshotContent to disappear. A pending deletion keeps the
+	// record deleting and is retried on the same object.
+	deletionWait time.Duration
 }
 
-// settings reads the optional override ConfigMap.
+// settings returns the server flag values, overridden by the optional
+// prototype ConfigMap.
 func (r *retainedSnapshotReconciler) settings(ctx context.Context) retainedSnapshotSettings {
-	s := retainedSnapshotSettings{gcGracePeriod: defaultGCGracePeriod, gcInterval: defaultGCInterval, deletionWait: defaultDeletionWait}
+	return readRetainedSnapshotSettings(ctx, r.reader(), r.namespace, r.logger)
+}
+
+func readRetainedSnapshotSettings(ctx context.Context, reader client.Reader, namespace string, log logrus.FieldLogger) retainedSnapshotSettings {
+	s := retainedSnapshotSettings{gcGracePeriod: RetainedSnapshotGCGracePeriod, gcInterval: RetainedSnapshotResyncInterval, deletionWait: RetainedSnapshotDeletionTimeout}
 	cm := &corev1api.ConfigMap{}
-	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: RetainedSnapshotConfigMap}, cm); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: RetainedSnapshotConfigMap}, cm); err != nil {
 		return s
 	}
 	parse := func(key string, into *time.Duration) {
@@ -126,7 +138,7 @@ func (r *retainedSnapshotReconciler) settings(ctx context.Context) retainedSnaps
 			if d, err := time.ParseDuration(v); err == nil && d > 0 {
 				*into = d
 			} else {
-				r.logger.Warnf("Ignoring invalid %s %q in configmap %s", key, v, RetainedSnapshotConfigMap)
+				log.Warnf("Ignoring invalid %s %q in configmap %s", key, v, RetainedSnapshotConfigMap)
 			}
 		}
 	}
@@ -250,27 +262,11 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req reconcil
 		return reconcile.Result{}, nil
 	}
 
-	dus := &velerov2alpha1api.DataUploadList{}
-	if err := r.client.List(ctx, dus, client.InNamespace(r.namespace), client.MatchingLabels{retainedsnapshot.ChainLabel: chain}); err != nil {
-		return reconcile.Result{}, errors.Wrap(err, "error listing DataUploads")
+	cs, err := r.chainState(ctx, chain)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
-	byName := map[string]*velerov2alpha1api.DataUpload{}
-	var newest *velerov2alpha1api.DataUpload
-	var running []string
-	for i := range dus.Items {
-		du := &dus.Items[i]
-		byName[du.Name] = du
-		if !isDataUploadInFinalState(du) {
-			running = append(running, du.Name)
-			continue
-		}
-		if du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted || du.Status.SnapshotStartTime == nil {
-			continue
-		}
-		if newest == nil || du.Status.SnapshotStartTime.After(newest.Status.SnapshotStartTime.Time) {
-			newest = du
-		}
-	}
+	byName, newest := cs.byName, cs.newest
 
 	if r.clusterID == "" {
 		id, err := retainedsnapshot.GetClusterIDFromReader(ctx, r.reader())
@@ -280,21 +276,7 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req reconcil
 		r.clusterID = id
 	}
 
-	// Pause while the chain has a running DataUpload or in-place incremental
-	// DataDownload: a DataUpload that started earlier may still be reading
-	// changed blocks against a base, and an in-place restore may be between its
-	// check and its GetMetadataDelta call.
-	if len(running) == 0 {
-		dds := &velerov2alpha1api.DataDownloadList{}
-		if err := r.client.List(ctx, dds, client.InNamespace(r.namespace), client.MatchingLabels{retainedsnapshot.ChainLabel: chain}); err != nil {
-			return reconcile.Result{}, errors.Wrap(err, "error listing DataDownloads")
-		}
-		for i := range dds.Items {
-			if !isDataDownloadInFinalState(&dds.Items[i]) {
-				running = append(running, "DataDownload "+dds.Items[i].Name)
-			}
-		}
-	}
+	running := cs.running
 	paused := len(running) > 0
 
 	var errs []error
@@ -320,26 +302,47 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req reconcil
 			continue
 		}
 
-		action, opts, wait := r.decide(ctx, cm, record, byName, newest, paused, s, rlog)
+		action, opts, wait := r.decide(ctx, cm, record, byName, newest, cs, paused, s, rlog)
 		if wait > 0 {
 			requeue(wait)
 		}
 		if action == "" {
 			continue
 		}
+		if opts.needsUnpaused {
+			// Re-check the pause from the API server right before the
+			// conditioned update to deleting, so that a DataUpload or
+			// DataDownload created since the list above isn't missed.
+			fresh, err := r.chainState(ctx, chain)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if len(fresh.running) > 0 {
+				rlog.Infof("Not deleting retained snapshot %s, the chain was paused meanwhile by %v", record.SnapshotHandle, fresh.running)
+				requeue(pauseRequeue)
+				continue
+			}
+		}
 		rlog.Info(action)
 		opts.Wait = s.deletionWait
+		opts.Timeout = s.deletionWait
 		opts.Now = r.clock.Now
 		opts.Owner = deletionOwner
-		if err := retainedsnapshot.DeleteSnapshot(ctx, r.client, r.deletionClient(), cm, opts, rlog); err != nil {
+		if err := retainedsnapshot.DeleteSnapshot(ctx, r.client, r.deletionClient(), cm, opts.DeleteOptions, rlog); err != nil {
 			switch {
 			case errors.Is(err, retainedsnapshot.ErrGone):
 				rlog.Info("Retained snapshot record was removed by another writer")
 			case errors.Is(err, retainedsnapshot.ErrConflict):
 				rlog.Info("Retained snapshot record changed by another writer, re-reading it")
 				requeue(time.Second)
+			case errors.Is(err, retainedsnapshot.ErrOwnedByOther):
+				requeue(pendingRequeue)
+			case errors.Is(err, csi.ErrTempVSCDeletionInterrupted):
+				rlog.Infof("Deletion of retained snapshot %s was interrupted, the record stays %s", record.SnapshotHandle, retainedsnapshot.StateDeleting)
+				requeue(pendingRequeue)
 			case errors.Is(err, csi.ErrTempVSCDeletionPending):
-				rlog.Infof("Deletion of retained snapshot %s is pending, the record stays %s, retrying in %v", record.SnapshotHandle, retainedsnapshot.StateDeleting, pendingRequeue)
+				rlog.Infof("Deletion of retained snapshot %s is pending after %v, the record stays %s, retrying in %v", record.SnapshotHandle, s.deletionWait, retainedsnapshot.StateDeleting, pendingRequeue)
 				requeue(pendingRequeue)
 			default:
 				errs = append(errs, errors.Wrapf(err, "record %s", name))
@@ -357,75 +360,144 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req reconcil
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
 }
 
+// chainStatus is what the controller knows about the DataUploads and
+// DataDownloads of a chain, listed from the API server.
+type chainStatus struct {
+	byName map[string]*velerov2alpha1api.DataUpload
+	// newest is the completed block DataUpload with the latest repository
+	// snapshot start time.
+	newest *velerov2alpha1api.DataUpload
+	// running names the DataUploads and in-place DataDownloads of the chain not
+	// in a final phase; the chain is paused while there is any.
+	running []string
+	// restoresWithDataDownload are the restores that have a DataDownload of the
+	// chain; their hold is replaced by the DataDownload pause.
+	restoresWithDataDownload map[string]bool
+}
+
+func (r *retainedSnapshotReconciler) chainState(ctx context.Context, chain string) (*chainStatus, error) {
+	cs := &chainStatus{byName: map[string]*velerov2alpha1api.DataUpload{}, restoresWithDataDownload: map[string]bool{}}
+	dus := &velerov2alpha1api.DataUploadList{}
+	if err := r.reader().List(ctx, dus, client.InNamespace(r.namespace), client.MatchingLabels{retainedsnapshot.ChainLabel: chain}); err != nil {
+		return nil, errors.Wrap(err, "error listing DataUploads")
+	}
+	for i := range dus.Items {
+		du := &dus.Items[i]
+		cs.byName[du.Name] = du
+		if !isDataUploadInFinalState(du) {
+			cs.running = append(cs.running, du.Name)
+			continue
+		}
+		if du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted || du.Status.SnapshotStartTime == nil {
+			continue
+		}
+		if cs.newest == nil || du.Status.SnapshotStartTime.After(cs.newest.Status.SnapshotStartTime.Time) {
+			cs.newest = du
+		}
+	}
+	dds := &velerov2alpha1api.DataDownloadList{}
+	if err := r.reader().List(ctx, dds, client.InNamespace(r.namespace), client.MatchingLabels{retainedsnapshot.ChainLabel: chain}); err != nil {
+		return nil, errors.Wrap(err, "error listing DataDownloads")
+	}
+	for i := range dds.Items {
+		dd := &dds.Items[i]
+		if restore := dd.Labels[velerov1api.RestoreNameLabel]; restore != "" {
+			cs.restoresWithDataDownload[restore] = true
+		}
+		if !isDataDownloadInFinalState(dd) {
+			cs.running = append(cs.running, "DataDownload "+dd.Name)
+		}
+	}
+	return cs, nil
+}
+
+// recordAction is a deletion decided for a record.
+type recordAction struct {
+	retainedsnapshot.DeleteOptions
+	// needsUnpaused means the deletion can remove the base of a running
+	// DataUpload or DataDownload (rotation, volume gone), so the pause is checked
+	// again right before it.
+	needsUnpaused bool
+}
+
 // decide returns what to do with a record: a log line and the deletion options
 // if its snapshot is to be deleted, and a requeue delay if it has to be looked
 // at again later.
 func (r *retainedSnapshotReconciler) decide(ctx context.Context, cm *corev1api.ConfigMap, record *retainedsnapshot.Record,
-	byName map[string]*velerov2alpha1api.DataUpload, newest *velerov2alpha1api.DataUpload, paused bool,
-	s retainedSnapshotSettings, log logrus.FieldLogger) (string, retainedsnapshot.DeleteOptions, time.Duration) {
+	byName map[string]*velerov2alpha1api.DataUpload, newest *velerov2alpha1api.DataUpload, cs *chainStatus, paused bool,
+	s retainedSnapshotSettings, log logrus.FieldLogger) (string, recordAction, time.Duration) {
+	none := recordAction{}
 	// The Backup gone (e.g. removed by backup sync, or deleted without a
 	// DeleteBackupRequest): delete live snapshots and remove tombstones after
 	// the grace period, also while the chain is paused.
 	if gone, wait := r.backupGone(ctx, cm, record, s, log); gone {
 		if record.State == retainedsnapshot.StateDeleted {
-			return "Removing tombstone, its Backup " + record.Backup + " is gone", retainedsnapshot.DeleteOptions{Remove: true}, 0
+			return "Removing tombstone, its Backup " + record.Backup + " is gone", recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{Remove: true}}, 0
 		}
-		return "Deleting retained snapshot, its Backup " + record.Backup + " is gone", retainedsnapshot.DeleteOptions{Remove: true, Reason: retainedsnapshot.ReasonBackupGone}, 0
+		return "Deleting retained snapshot, its Backup " + record.Backup + " is gone", recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{Remove: true, Reason: retainedsnapshot.ReasonBackupGone}}, 0
 	} else if wait > 0 {
-		return "", retainedsnapshot.DeleteOptions{}, wait
+		return "", none, wait
 	}
 
 	switch record.State {
 	case retainedsnapshot.StateDeleted:
-		return "", retainedsnapshot.DeleteOptions{}, 0
+		return "", none, 0
 	case retainedsnapshot.StateDeleting:
 		// A deletion another writer (backup deletion) owns is left to it while
-		// it can still be waiting; after that it was interrupted or failed.
+		// its wait can still be running; after that it was interrupted or failed.
 		if record.DeletingBy != deletionOwner && !record.DeletingSince.IsZero() {
-			if left := record.DeletingSince.Add(RetainedSnapshotDeletionWait + time.Minute).Sub(r.clock.Now()); left > 0 {
-				return "", retainedsnapshot.DeleteOptions{}, left
+			if left := record.LeaseEnd(s.deletionWait).Sub(r.clock.Now()); left > 0 {
+				return "", none, left
 			}
 		}
 		// Interrupted or pending deletion: finish it with the reason it started with.
-		return "Finishing the deletion of retained snapshot " + record.SnapshotHandle, retainedsnapshot.DeleteOptions{
+		return "Finishing the deletion of retained snapshot " + record.SnapshotHandle + " (owner " + record.DeletingBy + ")", recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{
 			Reason: record.Reason, RotatedByDataUpload: record.RotatedByDataUpload, RotatedByBackup: record.RotatedByBackup,
-		}, 0
+		}}, 0
 	}
 
 	du := byName[record.DataUpload]
 	if du != nil && (du.Status.Phase == velerov2alpha1api.DataUploadPhaseFailed || du.Status.Phase == velerov2alpha1api.DataUploadPhaseCanceled) {
-		return "DataUpload ended " + string(du.Status.Phase) + ", deleting its retained snapshot", retainedsnapshot.DeleteOptions{Reason: retainedsnapshot.ReasonDataUploadFailed}, 0
+		return "DataUpload ended " + string(du.Status.Phase) + ", deleting its retained snapshot", recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{Reason: retainedsnapshot.ReasonDataUploadFailed}}, 0
 	}
 	if du != nil && du.Status.Phase == velerov2alpha1api.DataUploadPhaseCompleted &&
 		(du.Status.RetainedSnapshot == nil || du.Status.RetainedSnapshot.SnapshotHandle != record.SnapshotHandle) {
-		// The record was written but the commit point never passed, so the
-		// cleanup deleted the snapshot; deleting an absent handle succeeds.
-		return "DataUpload completed without retaining its snapshot, dropping the record", retainedsnapshot.DeleteOptions{Reason: retainedsnapshot.ReasonDataUploadFailed}, 0
+		// Step 2 failed or retention was abandoned, so the cleanup deleted the
+		// snapshot; deleting an absent handle succeeds.
+		return "DataUpload completed without retaining its snapshot, dropping the record", recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{Reason: retainedsnapshot.ReasonDataUploadFailed}}, 0
 	}
 
 	if paused {
-		return "", retainedsnapshot.DeleteOptions{}, 0
+		return "", none, 0
+	}
+
+	// An in-place restore holds the record between its decision and its
+	// DataDownload; once the DataDownload exists, its pause applies instead.
+	now := r.clock.Now()
+	if record.IsHeld(now) && !cs.restoresWithDataDownload[record.InUseBy] {
+		log.Debugf("Retained snapshot record is held by restore %s until %s", record.InUseBy, record.InUseUntil.UTC().Format(time.RFC3339))
+		return "", none, record.InUseUntil.Sub(now) + time.Second
 	}
 
 	if newest != nil && !record.RepoSnapshotStartTime.IsZero() && newest.Status.SnapshotStartTime.Time.After(record.RepoSnapshotStartTime) {
 		return "Rotating out retained snapshot, DataUpload " + newest.Name + " of backup " + newest.Labels[velerov1api.BackupNameLabel] +
 				" has a later repository snapshot (" + newest.Status.SnapshotStartTime.UTC().Format(time.RFC3339Nano) + " > " +
 				record.RepoSnapshotStartTime.UTC().Format(time.RFC3339Nano) + ")",
-			retainedsnapshot.DeleteOptions{
+			recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{
 				Reason:              retainedsnapshot.ReasonRotated,
 				RotatedByDataUpload: newest.Name,
 				RotatedByBackup:     newest.Labels[velerov1api.BackupNameLabel],
-			}, 0
+			}, needsUnpaused: true}, 0
 	}
 	// Equal start times keep both snapshots; the next completion resolves it.
 
-	if gone, wait := r.volumeGone(ctx, cm, record, s, log); gone {
-		return "Deleting retained snapshot, its source PVC " + record.SourceNamespace + "/" + record.SourcePVC + " is gone or was recreated",
-			retainedsnapshot.DeleteOptions{Reason: retainedsnapshot.ReasonVolumeGone}, 0
+	if gone, why, wait := r.volumeGone(ctx, cm, record, s, log); gone {
+		return "Deleting retained snapshot, its source volume is gone: " + why,
+			recordAction{DeleteOptions: retainedsnapshot.DeleteOptions{Reason: retainedsnapshot.ReasonVolumeGone}, needsUnpaused: true}, 0
 	} else if wait > 0 {
-		return "", retainedsnapshot.DeleteOptions{}, wait
+		return "", none, wait
 	}
-	return "", retainedsnapshot.DeleteOptions{}, 0
+	return "", none, 0
 }
 
 // backupGone tells whether the record's Backup has been gone for the grace
@@ -443,22 +515,53 @@ func (r *retainedSnapshotReconciler) backupGone(ctx context.Context, cm *corev1a
 	return r.goneFor(ctx, cm, "backup", s, log)
 }
 
-// volumeGone tells whether the record's source PVC has been gone, or replaced
-// by one with another UID, for the grace period.
-func (r *retainedSnapshotReconciler) volumeGone(ctx context.Context, cm *corev1api.ConfigMap, record *retainedsnapshot.Record, s retainedSnapshotSettings, log logrus.FieldLogger) (bool, time.Duration) {
-	if record.SourcePVC == "" || record.SourcePVCUID == "" {
-		return false, 0
+// volumeGone tells whether the record's source volume has been gone for the
+// grace period: no PVC with the source name, or a PVC bound to a
+// PersistentVolume whose CSI volume handle is not the record's volume ID. The
+// volume, not the PVC UID, is compared, as an in-place restore recreates the
+// PVC over the same PersistentVolume; it is also what the parent lookup checks
+// (cbt-volume-id). A PVC not bound yet doesn't count as gone: an in-place
+// restore rebinds the volume only when its DataDownload finishes.
+func (r *retainedSnapshotReconciler) volumeGone(ctx context.Context, cm *corev1api.ConfigMap, record *retainedsnapshot.Record, s retainedSnapshotSettings, log logrus.FieldLogger) (bool, string, time.Duration) {
+	if record.SourcePVC == "" {
+		return false, "", 0
 	}
 	pvc := &corev1api.PersistentVolumeClaim{}
 	err := r.reader().Get(ctx, types.NamespacedName{Namespace: record.SourceNamespace, Name: record.SourcePVC}, pvc)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return false, 0
+		return false, "", 0
 	}
-	if err == nil && string(pvc.UID) == record.SourcePVCUID {
+	why := ""
+	switch {
+	case err != nil:
+		why = "PVC " + record.SourceNamespace + "/" + record.SourcePVC + " doesn't exist"
+	case pvc.Spec.VolumeName == "" || pvc.Status.Phase != corev1api.ClaimBound:
+		// Not bound yet, e.g. recreated by an in-place restore.
 		r.clearGone(ctx, cm, "volume", log)
-		return false, 0
+		return false, "", 0
+	case record.SourceVolumeID == "":
+		// A record without the volume ID only counts a missing PVC.
+		r.clearGone(ctx, cm, "volume", log)
+		return false, "", 0
+	default:
+		pv := &corev1api.PersistentVolume{}
+		if err := r.reader().Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return false, "", 0
+			}
+			why = "PVC " + record.SourceNamespace + "/" + record.SourcePVC + " is bound to PersistentVolume " + pvc.Spec.VolumeName + ", which doesn't exist"
+		} else if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == record.SourceVolumeID {
+			r.clearGone(ctx, cm, "volume", log)
+			return false, "", 0
+		} else {
+			why = "PVC " + record.SourceNamespace + "/" + record.SourcePVC + " is bound to volume " + pv.Spec.CSI.VolumeHandle + ", not " + record.SourceVolumeID
+		}
 	}
-	return r.goneFor(ctx, cm, "volume", s, log)
+	gone, wait := r.goneFor(ctx, cm, "volume", s, log)
+	if !gone && wait == s.gcGracePeriod {
+		log.Infof("Source volume of retained snapshot record %s: %s", cm.Name, why)
+	}
+	return gone, why, wait
 }
 
 func (r *retainedSnapshotReconciler) goneFor(ctx context.Context, cm *corev1api.ConfigMap, what string, s retainedSnapshotSettings, log logrus.FieldLogger) (bool, time.Duration) {

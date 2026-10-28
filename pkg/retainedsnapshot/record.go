@@ -97,6 +97,9 @@ const (
 	keySourceNamespace         = "sourceNamespace"
 	keySourcePVC               = "sourcePVC"
 	keySourcePVCUID            = "sourcePVCUID"
+	keySourceVolumeID          = "sourceVolumeID"
+	keyInUseBy                 = "inUseBy"
+	keyInUseUntil              = "inUseUntil"
 	keyDataUpload              = "dataUpload"
 	keyBackup                  = "backup"
 	keyRepoSnapshotID          = "repoSnapshotID"
@@ -116,6 +119,10 @@ var ErrConflict = errors.New("retained snapshot record changed by another writer
 // ErrGone is returned when the record was removed while being updated.
 var ErrGone = errors.New("retained snapshot record removed by another writer")
 
+// ErrOwnedByOther is returned when another writer owns the deletion of the
+// record and its wait can still be running.
+var ErrOwnedByOther = errors.New("the deletion of the retained snapshot is owned by another writer")
+
 // Record is the in-cluster record of a retained snapshot.
 type Record struct {
 	velerov2alpha1api.RetainedSnapshot
@@ -123,6 +130,10 @@ type Record struct {
 	SourceNamespace       string
 	SourcePVC             string
 	SourcePVCUID          string
+	// SourceVolumeID is the CSI volume handle the data path tagged the
+	// repository snapshot with (cbt-volume-id). GC compares it with the volume
+	// of the PVC, as an in-place restore recreates the PVC over the same volume.
+	SourceVolumeID        string
 	DataUpload            string
 	Backup                string
 	RepoSnapshotID        string
@@ -137,6 +148,15 @@ type Record struct {
 	// when, so that another writer doesn't race the owner of the deletion.
 	DeletingBy    string
 	DeletingSince time.Time
+	// InUseBy and InUseUntil hold the record for an in-place restore between
+	// its decision and its DataDownload creation.
+	InUseBy    string
+	InUseUntil time.Time
+}
+
+// IsHeld tells whether an in-place restore holds the record at now.
+func (r *Record) IsHeld(now time.Time) bool {
+	return r.InUseBy != "" && now.Before(r.InUseUntil)
 }
 
 // Chain returns the chain key hash of the record.
@@ -169,13 +189,14 @@ func TempVSCName(driver, handle string) string {
 }
 
 // NewRecordForDataUpload builds a record for the snapshot a DataUpload retains.
-func NewRecordForDataUpload(du *velerov2alpha1api.DataUpload, retained *velerov2alpha1api.RetainedSnapshot, repoSnapshotID string, repoSnapshotStartTime time.Time) *Record {
+func NewRecordForDataUpload(du *velerov2alpha1api.DataUpload, retained *velerov2alpha1api.RetainedSnapshot, repoSnapshotID string, repoSnapshotStartTime time.Time, volumeID string) *Record {
 	return &Record{
 		RetainedSnapshot:      *retained,
 		BackupStorageLocation: du.Spec.BackupStorageLocation,
 		SourceNamespace:       du.Spec.SourceNamespace,
 		SourcePVC:             du.Spec.SourcePVC,
 		SourcePVCUID:          du.Labels[velerov1api.PVCUIDLabel],
+		SourceVolumeID:        volumeID,
 		DataUpload:            du.Name,
 		Backup:                du.Labels[velerov1api.BackupNameLabel],
 		RepoSnapshotID:        repoSnapshotID,
@@ -223,6 +244,11 @@ func (r *Record) WriteTo(cm *corev1api.ConfigMap) {
 	set(keyRotatedByDataUpload, r.RotatedByDataUpload)
 	set(keyRotatedByBackup, r.RotatedByBackup)
 	set(keyDeletingBy, r.DeletingBy)
+	set(keySourceVolumeID, r.SourceVolumeID)
+	set(keyInUseBy, r.InUseBy)
+	if r.InUseBy != "" && !r.InUseUntil.IsZero() {
+		data[keyInUseUntil] = r.InUseUntil.UTC().Format(time.RFC3339)
+	}
 	if !r.DeletingSince.IsZero() {
 		data[keyDeletingSince] = r.DeletingSince.UTC().Format(time.RFC3339)
 	}
@@ -262,6 +288,7 @@ func FromConfigMap(cm *corev1api.ConfigMap) (*Record, error) {
 		SourceNamespace:       d[keySourceNamespace],
 		SourcePVC:             d[keySourcePVC],
 		SourcePVCUID:          d[keySourcePVCUID],
+		SourceVolumeID:        d[keySourceVolumeID],
 		DataUpload:            d[keyDataUpload],
 		Backup:                d[keyBackup],
 		RepoSnapshotID:        d[keyRepoSnapshotID],
@@ -271,6 +298,12 @@ func FromConfigMap(cm *corev1api.ConfigMap) (*Record, error) {
 		RotatedByDataUpload:   d[keyRotatedByDataUpload],
 		RotatedByBackup:       d[keyRotatedByBackup],
 		DeletingBy:            d[keyDeletingBy],
+		InUseBy:               d[keyInUseBy],
+	}
+	if v := d[keyInUseUntil]; v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			r.InUseUntil = t
+		}
 	}
 	if v := d[keyDeletingSince]; v != "" {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
@@ -378,13 +411,29 @@ type DeleteOptions struct {
 	Now func() time.Time
 	// Owner names the writer, recorded when it moves the record to deleting.
 	Owner string
+	// Timeout is the deletion timeout of every writer: the deletion of another
+	// owner can still be waiting until its deletingSince plus Timeout plus one
+	// minute (the owner's lease).
+	Timeout time.Duration
+}
+
+// LeaseEnd returns until when the owner of a deleting record may still be
+// waiting on its deletion.
+func (r *Record) LeaseEnd(timeout time.Duration) time.Time {
+	return r.DeletingSince.Add(timeout + time.Minute)
 }
 
 // DeleteSnapshot deletes the snapshot of a record. cm must be read from the API
 // server. The record moves to deleting with an update conditioned on its
-// resourceVersion, so that only the writer that wins deletes; a loser gets
-// ErrConflict. Only after the temp VolumeSnapshotContent is gone is the record
-// marked deleted or removed. Deleting a snapshot already gone succeeds.
+// resourceVersion, so that only the writer that wins deletes and owns the
+// deletion; a loser gets ErrConflict. The owner moves deletingSince forward
+// before each new wait. A deleting record of another owner whose lease (see
+// LeaseEnd) has passed is taken over the same way; while the lease runs, the
+// caller gets ErrOwnedByOther, except a caller that removes the record (backup
+// deletion), which waits on the same temp VolumeSnapshotContent and then removes
+// the record. Only after the temp VolumeSnapshotContent is gone is the record
+// marked deleted or removed. Deleting a snapshot already gone succeeds, and a
+// record another writer marked deleted or removed meanwhile is done.
 func DeleteSnapshot(ctx context.Context, c crclient.Client, apiClient crclient.Client, cm *corev1api.ConfigMap, opts DeleteOptions, log logrus.FieldLogger) error {
 	r, err := FromConfigMap(cm)
 	if err != nil {
@@ -398,7 +447,9 @@ func DeleteSnapshot(ctx context.Context, c crclient.Client, apiClient crclient.C
 	}
 
 	tempVSC := TempVSCName(r.Driver, r.SnapshotHandle)
-	if r.State == StateRetained {
+	now := opts.Now()
+	switch {
+	case r.State == StateRetained:
 		r.State = StateDeleting
 		r.TempVSC = tempVSC
 		// Keep why it is deleted, so that whoever finishes an interrupted
@@ -407,11 +458,35 @@ func DeleteSnapshot(ctx context.Context, c crclient.Client, apiClient crclient.C
 		r.RotatedByDataUpload = opts.RotatedByDataUpload
 		r.RotatedByBackup = opts.RotatedByBackup
 		r.DeletingBy = opts.Owner
-		r.DeletingSince = opts.Now()
+		r.DeletingSince = now
 		if err := update(ctx, c, cm, r); err != nil {
 			return err
 		}
-		log.Infof("Retained snapshot record %s moved to deleting, temp VolumeSnapshotContent %s", cm.Name, tempVSC)
+		log.Infof("Retained snapshot record %s moved to deleting by %s, temp VolumeSnapshotContent %s", cm.Name, opts.Owner, tempVSC)
+	case r.DeletingBy == opts.Owner || r.DeletingBy == "" || r.DeletingSince.IsZero() || !now.Before(r.LeaseEnd(opts.Timeout)):
+		if r.DeletingBy != opts.Owner {
+			log.Infof("Taking over the deletion of retained snapshot record %s from %s, started %s", cm.Name, r.DeletingBy, r.DeletingSince.UTC().Format(time.RFC3339))
+		}
+		r.DeletingBy = opts.Owner
+		r.DeletingSince = now
+		if r.TempVSC == "" {
+			r.TempVSC = tempVSC
+		}
+		if err := update(ctx, c, cm, r); err != nil {
+			return err
+		}
+	case opts.Remove:
+		// The owner may still be waiting. The temp VolumeSnapshotContent has a
+		// fixed name, so waiting on it (or creating it, if the owner stopped
+		// before) is the same deletion.
+		log.Infof("The deletion of retained snapshot record %s is owned by %s since %s, waiting on the same temp VolumeSnapshotContent %s",
+			cm.Name, r.DeletingBy, r.DeletingSince.UTC().Format(time.RFC3339), tempVSC)
+		if err := deleteByTempVSC(ctx, apiClient, r, cm.Name, opts.Wait, log); err != nil {
+			return err
+		}
+		return Remove(ctx, c, cm)
+	default:
+		return ErrOwnedByOther
 	}
 
 	if err := deleteByTempVSC(ctx, apiClient, r, cm.Name, opts.Wait, log); err != nil {
@@ -421,16 +496,43 @@ func DeleteSnapshot(ctx context.Context, c crclient.Client, apiClient crclient.C
 	if opts.Remove {
 		return Remove(ctx, c, cm)
 	}
+	reason, rotatedByDU, rotatedByBackup := r.Reason, r.RotatedByDataUpload, r.RotatedByBackup
+	if reason == "" {
+		reason, rotatedByDU, rotatedByBackup = opts.Reason, opts.RotatedByDataUpload, opts.RotatedByBackup
+	}
 	r.State = StateDeleted
 	r.DeletedAt = opts.Now()
-	r.Reason = opts.Reason
-	r.RotatedByDataUpload = opts.RotatedByDataUpload
-	r.RotatedByBackup = opts.RotatedByBackup
+	r.Reason = reason
+	r.RotatedByDataUpload = rotatedByDU
+	r.RotatedByBackup = rotatedByBackup
 	if err := update(ctx, c, cm, r); err != nil {
+		if errors.Is(err, ErrGone) {
+			log.Infof("Retained snapshot record %s was removed by another writer, the deletion is done", cm.Name)
+			return nil
+		}
 		return err
 	}
 	log.Infof("Retained snapshot record %s is a tombstone now: %s", cm.Name, r.Describe())
 	return nil
+}
+
+// Hold marks the record as used by an in-place restore until until, with an
+// update conditioned on cm's resourceVersion. It fails with ErrConflict if
+// another writer changed the record first, e.g. moved it to deleting.
+func Hold(ctx context.Context, c crclient.Client, cm *corev1api.ConfigMap, by string, until time.Time) (*Record, error) {
+	r, err := FromConfigMap(cm)
+	if err != nil {
+		return nil, err
+	}
+	if r.State != StateRetained {
+		return r, nil
+	}
+	r.InUseBy = by
+	r.InUseUntil = until
+	if err := update(ctx, c, cm, r); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // Remove removes the record ConfigMap with a delete conditioned on its

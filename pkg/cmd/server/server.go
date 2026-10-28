@@ -706,6 +706,12 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		}
 	}
 
+	if s.config.RetainedSnapshotGCGracePeriod > 0 {
+		controller.RetainedSnapshotGCGracePeriod = s.config.RetainedSnapshotGCGracePeriod
+	}
+	if s.config.RetainedSnapshotDeletionTimeout > 0 {
+		controller.RetainedSnapshotDeletionTimeout = s.config.RetainedSnapshotDeletionTimeout
+	}
 	if _, ok := enabledRuntimeControllers[constant.ControllerRetainedSnapshot]; ok {
 		if err := controller.NewRetainedSnapshotReconciler(s.mgr.GetClient(), s.namespace, s.logger).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerRetainedSnapshot)

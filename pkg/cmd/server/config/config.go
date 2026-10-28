@@ -176,6 +176,8 @@ type Config struct {
 	LogFormat                           *logging.FormatFlag
 	RepoMaintenanceFrequency            time.Duration
 	GarbageCollectionFrequency          time.Duration
+	RetainedSnapshotGCGracePeriod       time.Duration
+	RetainedSnapshotDeletionTimeout     time.Duration
 	ItemOperationSyncFrequency          time.Duration
 	DefaultVolumesToFsBackup            bool
 	UploaderType                        string
@@ -203,6 +205,8 @@ func GetDefaultConfig() *Config {
 		DefaultBackupTTL:                 defaultBackupTTL,
 		DefaultVGSLabelKey:               velerov1api.DefaultVGSLabelKey,
 		DefaultBackupCSISnapshotTimeout:  defaultBackupCSISnapshotTimeout,
+		RetainedSnapshotGCGracePeriod:    time.Hour,
+		RetainedSnapshotDeletionTimeout:  5 * time.Minute,
 		DefaultRestoreCSISnapshotTimeout: defaultRestoreCSISnapshotTimeout,
 		DefaultItemOperationTimeout:      defaultItemOperationTimeout,
 		ResourceTimeout:                  resourceTimeout,
@@ -251,6 +255,8 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&c.DefaultVGSLabelKey, "volume-group-snapshot-label-key", c.DefaultVGSLabelKey, "Label key for grouping PVCs into VolumeGroupSnapshot. Default value is 'velero.io/volume-group'")
 	flags.DurationVar(&c.RepoMaintenanceFrequency, "default-repo-maintain-frequency", c.RepoMaintenanceFrequency, "How often 'maintain' is run for backup repositories by default.")
 	flags.DurationVar(&c.GarbageCollectionFrequency, "garbage-collection-frequency", c.GarbageCollectionFrequency, "How often garbage collection is run for expired backups.")
+	flags.DurationVar(&c.RetainedSnapshotGCGracePeriod, "retained-snapshot-gc-grace-period", c.RetainedSnapshotGCGracePeriod, "How long the source volume or the Backup of a retained base snapshot must be gone before the snapshot is deleted.")
+	flags.DurationVar(&c.RetainedSnapshotDeletionTimeout, "retained-snapshot-deletion-timeout", c.RetainedSnapshotDeletionTimeout, "How long one attempt waits for the CSI driver to delete a retained base snapshot.")
 	flags.DurationVar(&c.ItemOperationSyncFrequency, "item-operation-sync-frequency", c.ItemOperationSyncFrequency, "How often to check status on backup/restore operations after backup/restore processing. Default is 10 seconds")
 	flags.BoolVar(&c.DefaultVolumesToFsBackup, "default-volumes-to-fs-backup", c.DefaultVolumesToFsBackup, "Backup all volumes with pod volume file system backup by default.")
 	flags.StringVar(&c.UploaderType, "uploader-type", c.UploaderType, "Type of uploader to handle the transfer of data of pod volumes")

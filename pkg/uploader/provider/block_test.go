@@ -419,8 +419,8 @@ func TestBlockProviderCancelThroughWrappedError(t *testing.T) {
 	t.Run("restore", func(t *testing.T) {
 		orig := blockRestoreFunc
 		defer func() { blockRestoreFunc = orig }()
-		blockRestoreFunc = func(_ context.Context, _ block.Uploader, _ udmrepo.BackupRepo, _ string, _ string, _ bool, _ cbtservice.SourceInfo, _ cbtservice.Service, _ map[string]string, _ logrus.FieldLogger) (int64, int64, bool, error) {
-			return 0, 0, false, errors.Wrap(block.ErrCanceled, "error restoring bdev")
+		blockRestoreFunc = func(_ context.Context, _ block.Uploader, _ udmrepo.BackupRepo, _ string, _ string, _ bool, _ cbtservice.SourceInfo, _ cbtservice.Service, _ map[string]string, _ logrus.FieldLogger) (int64, int64, bool, block.RestoreDetails, error) {
+			return 0, 0, false, block.RestoreDetails{}, errors.Wrap(block.ErrCanceled, "error restoring bdev")
 		}
 
 		bp := &blockProvider{
@@ -503,10 +503,10 @@ func TestBlockProviderRunRestore(t *testing.T) {
 			var capturedSnapshotID string
 			var capturedVolumePath string
 
-			blockRestoreFunc = func(ctx context.Context, blkUp block.Uploader, rep udmrepo.BackupRepo, snapshotID string, dest string, incremental bool, cbtSource cbtservice.SourceInfo, cbtService cbtservice.Service, uploaderCfg map[string]string, log logrus.FieldLogger) (int64, int64, bool, error) {
+			blockRestoreFunc = func(ctx context.Context, blkUp block.Uploader, rep udmrepo.BackupRepo, snapshotID string, dest string, incremental bool, cbtSource cbtservice.SourceInfo, cbtService cbtservice.Service, uploaderCfg map[string]string, log logrus.FieldLogger) (int64, int64, bool, block.RestoreDetails, error) {
 				capturedSnapshotID = snapshotID
 				capturedVolumePath = dest
-				return tc.mockRestoreSize, tc.mockRestoreSize, false, tc.mockRestoreErr
+				return tc.mockRestoreSize, tc.mockRestoreSize, false, block.RestoreDetails{}, tc.mockRestoreErr
 			}
 
 			bp := &blockProvider{

@@ -763,14 +763,14 @@ func getResourcePoliciesFromBackup(
 		resourcePolicies, err = getResourcePoliciesFromConfig(policiesConfigMap)
 		if err != nil {
 			logger.Errorf("Fail to read ResourcePolicies from ConfigMap %s with error %s.",
-				backup.Namespace+"/"+backup.Name, err.Error())
+				backup.Namespace+"/"+backup.Spec.ResourcePolicy.Name, err.Error())
 			return nil, fmt.Errorf("fail to read the ResourcePolicies from ConfigMap %s: %w",
-				backup.Namespace+"/"+backup.Name, err)
+				backup.Namespace+"/"+backup.Spec.ResourcePolicy.Name, err)
 		} else if err = resourcePolicies.Validate(); err != nil {
 			logger.Errorf("Fail to validate ResourcePolicies in ConfigMap %s with error %s.",
-				backup.Namespace+"/"+backup.Name, err.Error())
+				backup.Namespace+"/"+backup.Spec.ResourcePolicy.Name, err.Error())
 			return nil, fmt.Errorf("fail to validate ResourcePolicies in ConfigMap %s: %w",
-				backup.Namespace+"/"+backup.Name, err)
+				backup.Namespace+"/"+backup.Spec.ResourcePolicy.Name, err)
 		}
 	}
 

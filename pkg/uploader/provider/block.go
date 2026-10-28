@@ -34,7 +34,7 @@ import (
 )
 
 var blockBackupFunc = block.Backup
-var blockRestoreFunc = block.Restore
+var blockRestoreFunc = block.RestoreWithDetails
 
 type blockProvider struct {
 	requestorType string
@@ -42,6 +42,7 @@ type blockProvider struct {
 	credGetter    *credentials.CredentialGetter
 	log           logrus.FieldLogger
 	lastBackup    BackupDetails
+	lastRestore   RestoreDetails
 }
 
 // BackupDetails are details of the last backup a provider ran that the
@@ -53,6 +54,30 @@ type BackupDetails struct {
 	FallbackReason string
 	// ParentChangeID is the changeId of the parent, the base snapshot handle.
 	ParentChangeID string
+	// VolumeID is the volume the repository snapshot is tagged with
+	// (cbt-volume-id, the CSI volume handle).
+	VolumeID string
+	// DriverError is the error of a deltaError fallback.
+	DriverError string
+}
+
+// RestoreDetails are details of the last restore a provider ran that the
+// RunRestore result doesn't carry.
+type RestoreDetails struct {
+	// ChangeID is the changeId an incremental restore asked the delta against.
+	ChangeID string
+	// DriverError is the error of a fallback to a full restore.
+	DriverError string
+}
+
+// RestoreDetailsProvider is implemented by providers that report RestoreDetails.
+type RestoreDetailsProvider interface {
+	LastRestoreDetails() RestoreDetails
+}
+
+// LastRestoreDetails returns the details of the last RunRestore.
+func (bp *blockProvider) LastRestoreDetails() RestoreDetails {
+	return bp.lastRestore
 }
 
 // BackupDetailsProvider is implemented by providers that report BackupDetails.
@@ -156,7 +181,8 @@ func (bp *blockProvider) RunBackup(
 	}
 
 	snapshotInfo, _, err := blockBackupFunc(ctx, blkUploader, bp.bkRepo, path, realSource, cbtParam.Source, forceFull, parentSnapshot, cbtParam.Service, uploaderCfg, tags, log)
-	bp.lastBackup = BackupDetails{SnapshotStartTime: snapshotInfo.StartTime, FallbackReason: snapshotInfo.FallbackReason, ParentChangeID: snapshotInfo.ParentChangeID}
+	bp.lastBackup = BackupDetails{SnapshotStartTime: snapshotInfo.StartTime, FallbackReason: snapshotInfo.FallbackReason, ParentChangeID: snapshotInfo.ParentChangeID,
+		VolumeID: snapshotInfo.VolumeID, DriverError: snapshotInfo.DriverError}
 
 	// errors.Is, not ==: the sentinel is wrapped twice on its way here, by
 	// block/uploader.go ("error backing up bdev %s") and again by
@@ -204,7 +230,8 @@ func (bp *blockProvider) RunRestore(
 
 	blkUploader := block.NewUploader(ctx, bp.bkRepo, updater, log)
 
-	incrementalBytes, totalBytes, fallback, err := blockRestoreFunc(ctx, blkUploader, bp.bkRepo, snapshotID, volumePath, incremental, cbtParam.Source, cbtParam.Service, uploaderCfg, log)
+	incrementalBytes, totalBytes, fallback, details, err := blockRestoreFunc(ctx, blkUploader, bp.bkRepo, snapshotID, volumePath, incremental, cbtParam.Source, cbtParam.Service, uploaderCfg, log)
+	bp.lastRestore = RestoreDetails{ChangeID: details.ChangeID, DriverError: details.DriverError}
 
 	// errors.Is, not ==: see the equivalent comment on the backup path above.
 	if errors.Is(err, block.ErrCanceled) {
