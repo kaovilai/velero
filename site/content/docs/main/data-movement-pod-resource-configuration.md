@@ -78,7 +78,7 @@ The following results are from one environment and are only an example: incremen
 | 8 | 690 MiB | Completed | 43 s |
 | 2 | 384 MiB | Completed | 44 s |
 
-In this environment, throughput did not improve above a concurrency of 2. Run your own tests to find the right values for your data and backup storage.
+In this environment, throughput did not improve above a concurrency of 2, probably because it was limited by the network bandwidth to the backup storage (an in-cluster object store), not by CPU or concurrency. With more network bandwidth, the same CPU setup and a higher concurrency can reach a higher throughput, at the cost of more memory. Run your own tests to find the right values for your network, data and backup storage.
 
 For restores, [`--parallel-files-download`][8] sets the concurrency of the file system data mover in the same way. The block data mover has no restore concurrency setting.
 
