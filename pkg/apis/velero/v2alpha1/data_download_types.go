@@ -153,6 +153,10 @@ type DataDownloadStatus struct {
 	// FallbackFull indicates whether the incremental restore has fallen back to full restore
 	FallbackFull bool `json:"fallbackFull,omitempty"`
 
+	// FallbackReason tells why the in-place restore was not incremental.
+	// +optional
+	FallbackReason FallbackReason `json:"fallbackReason,omitempty"`
+
 	// Activities contains one or more messages about what have been done for this DataDownload.
 	// +optional
 	// +nullable

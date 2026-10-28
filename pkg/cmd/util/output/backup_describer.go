@@ -39,6 +39,7 @@ import (
 	"github.com/velero-io/velero/pkg/cmd/util/cacert"
 	"github.com/velero-io/velero/pkg/cmd/util/downloadrequest"
 	"github.com/velero-io/velero/pkg/itemoperation"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 
 	"github.com/velero-io/velero/internal/resourcepolicies"
 	"github.com/velero-io/velero/internal/volume"
@@ -480,6 +481,17 @@ func describeBackupVolumes(
 	describeNativeSnapshots(d, details, nativeSnapshots)
 	d.Println()
 
+	baseSnapshotState = func(duName string) string {
+		cm := &corev1api.ConfigMap{}
+		if err := kbClient.Get(ctx, kbclient.ObjectKey{Namespace: backup.Namespace, Name: retainedsnapshot.RecordName(duName)}, cm); err != nil {
+			return ""
+		}
+		record, err := retainedsnapshot.FromConfigMap(cm)
+		if err != nil {
+			return ""
+		}
+		return record.Describe()
+	}
 	describeCSISnapshots(d, details, csiSnapshots, legacyInfoSource)
 	d.Println()
 
@@ -687,7 +699,11 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 			}
 
 			d.Printf("\t\t\t\tBackup Type: %s\n", backupType)
+			if info.FallbackFull && info.SnapshotDataMovementInfo.FallbackReason != "" {
+				d.Printf("\t\t\t\tFallback Reason: %s\n", info.SnapshotDataMovementInfo.FallbackReason)
+			}
 		}
+		describeBaseSnapshot(d, info)
 
 		d.Printf("\t\t\t\tUploader Type: %s\n", info.SnapshotDataMovementInfo.UploaderType)
 		d.Printf("\t\t\t\tMoved data Size (bytes): %d\n", info.SnapshotDataMovementInfo.Size)
@@ -703,6 +719,32 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 	} else {
 		d.Printf("\t\t\tData Movement: %s\n", "included, specify --details for more information")
 	}
+}
+
+// baseSnapshotState returns the state of the retained snapshot record of a
+// DataUpload, or "" if there is none. Set by describeBackupVolumes.
+var baseSnapshotState = func(string) string { return "" }
+
+// describeBaseSnapshot prints the base snapshot retention decision of a
+// data-moved volume and where its base snapshot is.
+func describeBaseSnapshot(d *Describer, info *volume.BackupVolumeInfo) {
+	dm := info.SnapshotDataMovementInfo
+	if dm.BaseSnapshotRetention == "" {
+		return
+	}
+	d.Printf("\t\t\t\tBase snapshot retention: %s\n", dm.BaseSnapshotRetention)
+	state := ""
+	if dm.DataUploadName != "" {
+		state = baseSnapshotState(dm.DataUploadName)
+	}
+	switch {
+	case state != "":
+	case dm.RetainedSnapshotHandle != "":
+		state = fmt.Sprintf("retained (%s), no record in this cluster", dm.RetainedSnapshotHandle)
+	default:
+		state = "not retained"
+	}
+	d.Printf("\t\t\t\tBase snapshot: %s\n", state)
 }
 
 func describeBackupItemOperation(d *Describer, operation *itemoperation.BackupOperation) {

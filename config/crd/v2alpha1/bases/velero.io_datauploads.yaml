@@ -146,6 +146,12 @@ spec:
                   If its value is "none", the data mover will do a full backup
                   If its value is a specific snapshotID, the data mover finds the specific snapshot as parent.
                 type: string
+              retainBaseSnapshot:
+                description: |-
+                  RetainBaseSnapshot indicates the data mover to keep the volume snapshot
+                  in the storage after the data movement completes, as the base of the
+                  next incremental backup of the same volume.
+                type: boolean
               snapshotType:
                 description: SnapshotType is the type of the snapshot to be backed
                   up.
@@ -210,6 +216,11 @@ spec:
                 description: FallbackFull indicates whether the incremental backup
                   has fallen back to full backup
                 type: boolean
+              fallbackReason:
+                description: |-
+                  FallbackReason tells why the backup fell back to the allocated blocks
+                  when FallbackFull is true.
+                type: string
               incrementalBytes:
                 description: |-
                   IncrementalBytes holds the number of bytes new or changed since the last backup.
@@ -264,11 +275,15 @@ spec:
                 type: object
               retainedSnapshot:
                 description: |-
-                  RetainedSnapshot records the volume snapshot that is kept in the storage after the
-                  DataUpload completes, because the snapshot's deletion policy is Retain. Backup deletion
-                  uses it to delete the snapshot from the storage.
+                  RetainedSnapshot is the volume snapshot kept in the storage as the
+                  base of the next incremental backup. Velero deletes it when it is
+                  no longer needed or when the backup is deleted.
                 nullable: true
                 properties:
+                  clusterID:
+                    description: ClusterID identifies the cluster whose storage holds
+                      the snapshot.
+                    type: string
                   deletionSecretName:
                     description: DeletionSecretName is the name of the secret the
                       CSI driver requires to delete the snapshot.
@@ -297,6 +312,13 @@ spec:
               snapshotID:
                 description: SnapshotID is the identifier for the snapshot in the
                   backup repository.
+                type: string
+              snapshotStartTime:
+                description: |-
+                  SnapshotStartTime is the start time of the repository snapshot, the
+                  order in which the block data mover looks for the parent snapshot.
+                format: date-time
+                nullable: true
                 type: string
               sourceSize:
                 description: SourceSize holds the total size of the source volume.

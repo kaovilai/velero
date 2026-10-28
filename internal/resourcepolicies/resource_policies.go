@@ -19,7 +19,7 @@ package resourcepolicies
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"sort"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -81,6 +81,9 @@ type Action struct {
 	Type VolumeActionType `yaml:"type"`
 	// Parameters defined map of parameters when executing a specific action
 	Parameters map[string]any `yaml:"parameters,omitempty"`
+
+	// index is the position of the volume policy in the effective list, set by a match.
+	index int
 }
 
 // GetDataMover returns the data mover configured in the snapshot action's
@@ -154,22 +157,73 @@ func (a *Action) GetRetainBaseSnapshot() (*bool, error) {
 	if !ok {
 		return nil, nil
 	}
-	return parseBoolParameter(RetainBaseSnapshotParameter, raw)
+	return parseStrictBoolParameter(RetainBaseSnapshotParameter, raw)
 }
 
-func parseBoolParameter(name string, raw any) (*bool, error) {
+// Index returns the position of the volume policy the action belongs to in
+// the effective volume policy list (backup policies, then global ones), or -1
+// if the action wasn't returned by a match.
+func (a *Action) Index() int {
+	if a == nil {
+		return -1
+	}
+	return a.index
+}
+
+// parseStrictBoolParameter accepts a YAML boolean or exactly the strings "true"
+// and "false". strconv.ParseBool is not used because it also accepts 1, t and
+// TRUE, which would make a typo silently change the behavior.
+func parseStrictBoolParameter(name string, raw any) (*bool, error) {
 	switch v := raw.(type) {
 	case bool:
 		return &v, nil
 	case string:
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("parameter %q must be a boolean, got %q", name, v)
+		switch v {
+		case "true":
+			b := true
+			return &b, nil
+		case "false":
+			b := false
+			return &b, nil
 		}
-		return &b, nil
+		return nil, fmt.Errorf("parameter %q must be true or false (a YAML boolean or the string \"true\" or \"false\"), got string %q", name, v)
 	default:
-		return nil, fmt.Errorf("parameter %q must be a boolean, got %T", name, raw)
+		return nil, fmt.Errorf("parameter %q must be true or false (a YAML boolean or the string \"true\" or \"false\"), got %T %v", name, raw, raw)
 	}
+}
+
+// knownSnapshotParameters are the parameters of the snapshot action Velero reads.
+var knownSnapshotParameters = map[string]struct{}{
+	DataMoverParameter:          {},
+	SnapshotClassParameter:      {},
+	RetainBaseSnapshotParameter: {},
+}
+
+// UnknownParameterWarnings returns one message per unknown parameter of a
+// snapshot action in the volume policies, so that a misspelled parameter, e.g.
+// retainBaseSnapshots, doesn't silently change the behavior.
+func (p *Policies) UnknownParameterWarnings() []string {
+	if p == nil {
+		return nil
+	}
+	var warnings []string
+	for i, policy := range p.volumePolicies {
+		if policy.action.Type != Snapshot {
+			continue
+		}
+		keys := make([]string, 0, len(policy.action.Parameters))
+		for k := range policy.action.Parameters {
+			if _, ok := knownSnapshotParameters[k]; !ok {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			warnings = append(warnings, fmt.Sprintf("volume policy %d: unknown parameter %q of the %q action is ignored, known parameters are %q, %q and %q",
+				i, k, Snapshot, DataMoverParameter, SnapshotClassParameter, RetainBaseSnapshotParameter))
+		}
+	}
+	return warnings
 }
 
 // PolicyLabelSelector mirrors metav1.LabelSelector with yaml tags for ConfigMap decode.
@@ -572,7 +626,7 @@ func (p *Policies) BuildPolicy(resPolicies *ResourcePolicies) error {
 }
 
 func (p *Policies) match(res *structuredVolume) *Action {
-	for _, policy := range p.volumePolicies {
+	for i, policy := range p.volumePolicies {
 		isAllMatch := false
 		for _, con := range policy.conditions {
 			if !con.match(res) {
@@ -582,7 +636,9 @@ func (p *Policies) match(res *structuredVolume) *Action {
 			isAllMatch = true
 		}
 		if isAllMatch {
-			return &policy.action
+			action := policy.action
+			action.index = i
+			return &action
 		}
 	}
 	return nil

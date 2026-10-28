@@ -461,6 +461,9 @@ func describeCSISnapshotsRestores(d *Describer, restoreVolInfo []volume.RestoreV
 					restoreType += " (fallen back to Full)"
 				}
 
+				if info.FallbackReason != "" {
+					restoreType += fmt.Sprintf(" (%s: %s)", info.FallbackReason, info.FallbackMessage)
+				}
 				d.Printf("\t\t\tRestore Type: %s\n", restoreType)
 			}
 			if info.SnapshotDataMovementInfo.Size > 0 {

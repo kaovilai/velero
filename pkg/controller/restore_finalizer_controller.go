@@ -321,7 +321,8 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 		warnings.Merge(&vgscWarnings)
 	}
 
-	viErrs := ctx.updateVolumeInfos()
+	viWarnings, viErrs := ctx.updateVolumeInfos()
+	warnings.Merge(&viWarnings)
 	errs.Merge(&viErrs)
 
 	rehErrs := ctx.WaitRestoreExecHook()
@@ -594,11 +595,11 @@ func needPatch(newPV *corev1api.PersistentVolume, pvInfo *volume.PVInfo) bool {
 	return false
 }
 
-func (ctx *finalizerContext) updateVolumeInfos() (errs results.Result) {
+func (ctx *finalizerContext) updateVolumeInfos() (warnings results.Result, errs results.Result) {
 	dataDownloads := &velerov2alpha1.DataDownloadList{}
 	if err := ctx.crClient.List(context.Background(), dataDownloads, client.InNamespace(ctx.restore.Namespace), client.MatchingLabels{velerov1api.RestoreNameLabel: ctx.restore.Name}); err != nil {
 		errs.Add("cluster", errors.Wrapf(err, "failed to list data downloads of restore %s", ctx.restore.Name))
-		return errs
+		return warnings, errs
 	}
 	for _, dataDownload := range dataDownloads.Items {
 		for index := range ctx.restoreVolumeInfos {
@@ -608,6 +609,12 @@ func (ctx *finalizerContext) updateVolumeInfos() (errs results.Result) {
 				ctx.restoreVolumeInfos[index].SnapshotDataMovementInfo.Size = dataDownload.Status.Progress.TotalBytes
 				ctx.restoreVolumeInfos[index].SnapshotDataMovementInfo.IncrementalSize = dataDownload.Status.IncrementalBytes
 				ctx.restoreVolumeInfos[index].FallbackFull = dataDownload.Status.FallbackFull
+				ctx.restoreVolumeInfos[index].FallbackReason = string(dataDownload.Status.FallbackReason)
+				if dataDownload.Status.FallbackReason != "" {
+					ctx.restoreVolumeInfos[index].FallbackMessage = dataDownload.Status.Message
+					warnings.Add(dataDownload.Spec.TargetVolume.Namespace, errors.Errorf("PVC %s/%s, DataDownload %s: %s",
+						dataDownload.Spec.TargetVolume.Namespace, dataDownload.Spec.TargetVolume.PVC, dataDownload.Name, dataDownload.Status.Message))
+				}
 				ctx.restoreVolumeInfos[index].SnapshotDataMovementInfo.Phase = dataDownload.Status.Phase
 			}
 		}
@@ -618,18 +625,18 @@ func (ctx *finalizerContext) updateVolumeInfos() (errs results.Result) {
 	defer gzw.Close()
 	if err := json.NewEncoder(gzw).Encode(ctx.restoreVolumeInfos); err != nil {
 		errs.Add("cluster", errors.Wrapf(err, "error encoding restore volume infos to JSON for restore %s", ctx.restore.Name))
-		return errs
+		return warnings, errs
 	}
 	if err := gzw.Close(); err != nil {
 		errs.Add("cluster", errors.Wrapf(err, "error closing gzip writer for restore %s", ctx.restore.Name))
-		return errs
+		return warnings, errs
 	}
 	if err := ctx.backupStore.PutRestoreVolumeInfo(ctx.restore.Name, buffer); err != nil {
 		errs.Add("cluster", errors.Wrapf(err, "failed to put restore volume info for restore %s", ctx.restore.Name))
-		return errs
+		return warnings, errs
 	}
 
-	return errs
+	return warnings, errs
 }
 
 // WaitRestoreExecHook waits for restore exec hooks to finish then update the hook execution results

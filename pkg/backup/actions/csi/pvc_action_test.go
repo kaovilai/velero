@@ -52,10 +52,12 @@ import (
 	"github.com/velero-io/velero/pkg/kuberesource"
 	"github.com/velero-io/velero/pkg/label"
 	"github.com/velero-io/velero/pkg/plugin/velero"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	uploaderUtil "github.com/velero-io/velero/pkg/uploader/util"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	csi "github.com/velero-io/velero/pkg/util/csi"
+	"github.com/velero-io/velero/pkg/util/datamover"
 )
 
 const testDriver = "csi.example.com"
@@ -267,6 +269,10 @@ func TestExecute(t *testing.T) {
 						velerov1api.BackupUIDLabel:        "",
 						velerov1api.PVCUIDLabel:           "",
 						velerov1api.AsyncOperationIDLabel: "du-.",
+						retainedsnapshot.ChainLabel:       "aa7b0911c9fafb16a1c31c685ec7a315",
+					},
+					Annotations: map[string]string{
+						retainedsnapshot.DecisionAnnotation: "false (from default: matched volume policy 0 has no retainBaseSnapshot; no CSI driver)",
 					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
@@ -2403,7 +2409,7 @@ func TestNewDataUpload(t *testing.T) {
 			operationID := "test-op-id"
 			fsType := "ext4"
 
-			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, false)
+			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, retentionDecision{})
 
 			require.NotNil(t, du)
 			assert.Equal(t, velerov2alpha1.SchemeGroupVersion.String(), du.APIVersion)
@@ -2423,6 +2429,9 @@ func TestNewDataUpload(t *testing.T) {
 				velerov1api.BackupUIDLabel:        string(backup.UID),
 				velerov1api.PVCUIDLabel:           string(pvc.UID),
 				velerov1api.AsyncOperationIDLabel: operationID,
+			}
+			if datamover.IsVeleroBlockDataMover(du.Spec.DataMover) {
+				expectedLabels[retainedsnapshot.ChainLabel] = retainedsnapshot.ChainOfDataUpload(du)
 			}
 			assert.Equal(t, expectedLabels, du.Labels)
 

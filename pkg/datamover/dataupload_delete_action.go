@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
@@ -92,30 +93,46 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 	// stays (as a tombstone once rotated out) until the backup is deleted, so it is
 	// only missing here if the record was lost, e.g. after a reinstall; recreate it
 	// from the DataUpload in the backup.
-	cm, err := genRetainedSnapshotConfigmap(input.Backup, *du)
+	cm, err := genRetainedSnapshotConfigmap(input.Backup, *du, d.logger)
 	if err != nil {
 		return err
 	}
 	if cm != nil {
-		if err := d.client.Create(context.Background(), cm); err != nil && !apierrors.IsAlreadyExists(err) {
-			return errors.WithStack(errors.Wrapf(err, "failed to create the retained snapshot configmap for DataUpload %s/%s", du.Namespace, du.Name))
+		if err := d.client.Create(context.Background(), cm); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return errors.WithStack(errors.Wrapf(err, "failed to create the retained snapshot configmap for DataUpload %s/%s", du.Namespace, du.Name))
+			}
+		} else {
+			d.logger.Infof("Recreated retained snapshot record %s from status.retainedSnapshot of DataUpload %s in backup %s (handle %s, cluster %q): "+
+				"the in-cluster record was missing, e.g. after a reinstall; backup deletion deletes the snapshot if it belongs to this cluster",
+				cm.Name, du.Name, input.Backup.Name, du.Status.RetainedSnapshot.SnapshotHandle, du.Status.RetainedSnapshot.ClusterID)
 		}
 	}
 	return nil
 }
 
 // genRetainedSnapshotConfigmap generates the record of the snapshot the DataUpload
-// retained in the storage, for the backup deletion controller.
-func genRetainedSnapshotConfigmap(bak *velerov1.Backup, du velerov2alpha1.DataUpload) (*corev1api.ConfigMap, error) {
+// retained in the storage, for the backup deletion controller. DataUploads that are
+// not Completed are skipped: the retained snapshot controller owns their records.
+func genRetainedSnapshotConfigmap(bak *velerov1.Backup, du velerov2alpha1.DataUpload, log logrus.FieldLogger) (*corev1api.ConfigMap, error) {
 	retained := du.Status.RetainedSnapshot
-	if retained == nil || du.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted {
+	if retained == nil {
+		return nil, nil
+	}
+	if du.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted {
+		log.Infof("Ignoring status.retainedSnapshot %s of DataUpload %s in phase %s, the retained snapshot controller owns the snapshots of DataUploads that didn't complete",
+			retained.SnapshotHandle, du.Name, du.Status.Phase)
 		return nil, nil
 	}
 	if retained.SnapshotHandle == "" || retained.Driver == "" {
 		return nil, errors.Errorf("invalid retained snapshot of DataUpload %s/%s, handle %q, driver %q",
 			du.Namespace, du.Name, retained.SnapshotHandle, retained.Driver)
 	}
-	record := retainedsnapshot.NewRecordForDataUpload(&du, retained, du.Annotations[retainedsnapshot.ClusterIDAnnotation], du.Status.SnapshotID)
+	startTime := time.Time{}
+	if du.Status.SnapshotStartTime != nil {
+		startTime = du.Status.SnapshotStartTime.Time
+	}
+	record := retainedsnapshot.NewRecordForDataUpload(&du, retained, du.Status.SnapshotID, startTime)
 	record.Backup = bak.Name
 	return record.ToConfigMap(bak.Namespace), nil
 }

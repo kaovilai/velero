@@ -233,6 +233,10 @@ spec:
                 description: FallbackFull indicates whether the incremental restore
                   has fallen back to full restore
                 type: boolean
+              fallbackReason:
+                description: FallbackReason tells why the in-place restore was not
+                  incremental.
+                type: string
               incrementalBytes:
                 description: IncrementalBytes holds the number of bytes restored incrementally
                   since the last snapshot

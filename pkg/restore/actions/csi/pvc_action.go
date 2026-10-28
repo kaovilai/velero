@@ -46,6 +46,7 @@ import (
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	riav2 "github.com/velero-io/velero/pkg/plugin/velero/restoreitemaction/v2"
 	"github.com/velero-io/velero/pkg/restore/inplace"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	uploaderUtil "github.com/velero-io/velero/pkg/uploader/util"
 	"github.com/velero-io/velero/pkg/util"
 	"github.com/velero-io/velero/pkg/util/boolptr"
@@ -244,6 +245,9 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 
 	var volumeSnapshot *snapshotv1api.VolumeSnapshot
 	cleanUpVolumeSnapshot := false
+	restoreType := string(input.Restore.Spec.ExistingVolumeDataPolicy)
+	var fallback inPlaceBase
+	chainLabel := ""
 	if pvcExists {
 		// Pre-flight checks must pass before any side effect on the existing PVC/PV.
 		if err := inplace.CheckPVCBoundToBackedUpVolume(ctx, p.crClient, existingPVC, pvcFromBackup.Spec.VolumeName, pvc.Annotations[velerov1api.InplaceRestoreVolumeHandleAnnotation], pvcFromBackup.Namespace, input.Restore.AllowExistingVolumeMismatch(), logger); err != nil {
@@ -256,8 +260,28 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 			return nil, errors.WithStack(err)
 		}
 
+		// Decide from the backup's DataUpload and its retained snapshot record
+		// whether the base snapshot is live before taking the baseline snapshot.
+		// Without the base, GetMetadataDelta fails and the baseline is never used.
+		// Only for backups that asked to retain the base: on storages that don't
+		// need the base snapshot (Case 1) the in-place incremental restore works
+		// without it.
+		if input.Restore.IsVolumeDataInplaceIncrementalRestore() && datamover.IsVeleroBlockDataMover(dataUploadResult.DataMover) && dataUploadResult.RetainBaseSnapshot {
+			base := p.decideInPlaceBase(ctx, input.Restore, backup, dataUploadResult, logger)
+			if base.sourcePVC == "" {
+				base.sourcePVC = pvcFromBackup.Name
+			}
+			if base.reason != "" {
+				logger.Warnf("In-place restore of PVC %s/%s is full, not incremental: %s", existingPVC.Namespace, existingPVC.Name, base.message)
+				restoreType = string(velerov1api.VolumeDataPolicyTypeFull)
+				fallback = base
+			} else {
+				chainLabel = retainedsnapshot.ChainHash(dataUploadResult.BackupStorageLocation, dataUploadResult.SourceNamespace, base.sourcePVC)
+			}
+		}
+
 		// take a CSI snapshot of the existing PVC as the baseline of CBT
-		if input.Restore.IsVolumeDataInplaceIncrementalRestore() && datamover.IsVeleroBlockDataMover(dataUploadResult.DataMover) {
+		if restoreType == string(velerov1api.VolumeDataPolicyTypeIncremental) && datamover.IsVeleroBlockDataMover(dataUploadResult.DataMover) {
 			// take a CSI snapshot of the existing PVC as the baseline of CBT
 			if !namespaceMapped {
 				logger.Info("requesting an in-place incremental restore with block data mover, taking a CSI snapshot of the existing PVC as the baseline of CBT...")
@@ -302,7 +326,20 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 	var dataDownload *velerov2alpha1.DataDownload
 	dataDownload, err = restoreFromDataUploadResult(
 		ctx, dataUploadResult, input.Restore, backup, pvc, existingPV, newNamespace,
-		operationID, string(input.Restore.Spec.ExistingVolumeDataPolicy), volumeSnapshot, cleanUpVolumeSnapshot, p.crClient)
+		operationID, restoreType, volumeSnapshot, cleanUpVolumeSnapshot, p.crClient,
+		func(dd *velerov2alpha1.DataDownload) {
+			if chainLabel != "" {
+				// Rotation pauses while this DataDownload runs, so the base stays until GetMetadataDelta.
+				dd.Labels[retainedsnapshot.ChainLabel] = chainLabel
+			}
+			if fallback.reason != "" {
+				if dd.Annotations == nil {
+					dd.Annotations = map[string]string{}
+				}
+				dd.Annotations[retainedsnapshot.InPlaceFallbackReasonAnnotation] = string(fallback.reason)
+				dd.Annotations[retainedsnapshot.InPlaceFallbackMessageAnnotation] = fallback.message
+			}
+		})
 	if err != nil {
 		logger.Errorf("Failed to restore from DataUploadResult: %s", err.Error())
 		return nil, errors.WithStack(err)
@@ -320,6 +357,63 @@ func (p *pvcRestoreItemAction) executeWithDataMove(logger *logrus.Entry, input *
 		UpdatedItem: &unstructured.Unstructured{Object: unstructuredPVC},
 		OperationID: operationID,
 	}, nil
+}
+
+// inPlaceBase is the in-place incremental restore decision: an empty reason
+// means the base snapshot is live and the restore proceeds as today.
+type inPlaceBase struct {
+	reason    velerov2alpha1.FallbackReason
+	message   string
+	sourcePVC string
+}
+
+// decideInPlaceBase decides, before the baseline snapshot is taken, whether the
+// base snapshot of the backup is live: a live record in this cluster, or
+// status.retainedSnapshot of this cluster with no record (e.g. after a
+// reinstall), proceeds; a tombstone, no retained snapshot, or a snapshot of
+// another cluster restores in place as full.
+func (p *pvcRestoreItemAction) decideInPlaceBase(ctx context.Context, restore *velerov1api.Restore, backup *velerov1api.Backup, dur *velerov2alpha1.DataUploadResult, log logrus.FieldLogger) inPlaceBase {
+	base := inPlaceBase{sourcePVC: dur.SourcePVC}
+	if dur.DataUploadName == "" {
+		log.Warn("The DataUpload result has no DataUpload name, can't check the base snapshot, proceeding with the in-place incremental restore")
+		return base
+	}
+	localID, err := retainedsnapshot.GetClusterIDFromReader(ctx, p.crClient)
+	if err != nil {
+		log.WithError(err).Warn("Failed to get the cluster identity, proceeding with the in-place incremental restore")
+		return base
+	}
+	notLive := func(msg string, reason velerov2alpha1.FallbackReason) inPlaceBase {
+		base.reason = reason
+		base.message = fmt.Sprintf("base snapshot of backup %s %s", backup.Name, msg)
+		return base
+	}
+
+	_, record, err := retainedsnapshot.Get(ctx, p.crClient, restore.Namespace, retainedsnapshot.RecordName(dur.DataUploadName))
+	switch {
+	case err == nil:
+		if retainedsnapshot.IsForeign(record.ClusterID, localID) {
+			return notLive(fmt.Sprintf("was taken in cluster %s", record.ClusterID), velerov2alpha1.FallbackReasonBaseNotRetained)
+		}
+		if record.State == retainedsnapshot.StateRetained {
+			log.Infof("Base snapshot %s of backup %s is retained (record %s), proceeding with the in-place incremental restore", record.SnapshotHandle, backup.Name, retainedsnapshot.RecordName(dur.DataUploadName))
+			return base
+		}
+		return notLive("was "+record.Describe(), velerov2alpha1.FallbackReasonBaseGone)
+	case apierrors.IsNotFound(err):
+		if dur.RetainedSnapshot == nil {
+			return notLive("was not retained", velerov2alpha1.FallbackReasonBaseNotRetained)
+		}
+		if retainedsnapshot.IsForeign(dur.RetainedSnapshot.ClusterID, localID) {
+			return notLive(fmt.Sprintf("was taken in cluster %s", dur.RetainedSnapshot.ClusterID), velerov2alpha1.FallbackReasonBaseNotRetained)
+		}
+		log.Infof("No record for base snapshot %s of backup %s, which this cluster retained (e.g. a reinstall lost the record), proceeding with the in-place incremental restore",
+			dur.RetainedSnapshot.SnapshotHandle, backup.Name)
+		return base
+	default:
+		log.WithError(err).Warn("Failed to read the retained snapshot record, proceeding with the in-place incremental restore")
+		return base
+	}
 }
 
 func resetPVCSourceToVolumeSnapshot(pvc *corev1api.PersistentVolumeClaim, vsName string) {
@@ -601,6 +695,7 @@ func restoreFromDataUploadResult(
 	volumeSnapshot *snapshotv1api.VolumeSnapshot,
 	cleanUpVolumeSnapshot bool,
 	crClient crclient.Client,
+	mutate ...func(*velerov2alpha1.DataDownload),
 ) (*velerov2alpha1.DataDownload, error) {
 	pvc.Spec.VolumeName = ""
 	if pvc.Spec.Selector == nil {
@@ -625,6 +720,9 @@ func restoreFromDataUploadResult(
 		volumeSnapshot,
 		cleanUpVolumeSnapshot,
 	)
+	for _, m := range mutate {
+		m(dataDownload)
+	}
 	err := crClient.Create(ctx, dataDownload)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create DataDownload")

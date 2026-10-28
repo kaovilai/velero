@@ -226,7 +226,7 @@ func (dp *generalDataPath) StartBackup(source AccessPoint, uploaderConfig map[st
 			}
 			dp.callbacks.OnFailed(context.Background(), dp.namespace, dp.jobName, dataPathErr)
 		} else {
-			dp.callbacks.OnCompleted(context.Background(), dp.namespace, dp.jobName, Result{Backup: BackupResult{
+			result := BackupResult{
 				SnapshotID:       snapshotID,
 				EmptySnapshot:    emptySnapshot,
 				Source:           source,
@@ -234,7 +234,16 @@ func (dp *generalDataPath) StartBackup(source AccessPoint, uploaderConfig map[st
 				IncrementalBytes: ptr.To(incrementalBytes),
 				SourceSize:       sourceSize,
 				FallbackFull:     fallback,
-			}})
+			}
+			if d, ok := dp.uploaderProv.(provider.BackupDetailsProvider); ok {
+				details := d.LastBackupDetails()
+				result.FallbackReason = details.FallbackReason
+				result.ParentChangeID = details.ParentChangeID
+				if !details.SnapshotStartTime.IsZero() {
+					result.SnapshotStartTime = ptr.To(details.SnapshotStartTime)
+				}
+			}
+			dp.callbacks.OnCompleted(context.Background(), dp.namespace, dp.jobName, Result{Backup: result})
 		}
 	}()
 

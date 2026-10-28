@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -29,6 +30,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -41,7 +43,6 @@ import (
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/velero-io/velero/internal/resourcepolicies"
 	veleroshared "github.com/velero-io/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -409,7 +410,7 @@ func (p *pvcBackupItemAction) Execute(
 		if dataMoverFromVolumePolicy != "" {
 			effectiveDataMover = dataMoverFromVolumePolicy
 		}
-		retainBaseSnapshot := p.decideRetainBaseSnapshot(ctx, vh, item, effectiveDataMover, vsc.Spec.Driver, dataUploadLog)
+		retention := p.decideRetainBaseSnapshot(ctx, vh, item, effectiveDataMover, vsc.Spec.Driver, dataUploadLog)
 
 		dataUploadLog.Info("Starting data upload of backup")
 
@@ -423,7 +424,7 @@ func (p *pvcBackupItemAction) Execute(
 			vsc,
 			fsType,
 			dataMoverFromVolumePolicy,
-			retainBaseSnapshot,
+			retention,
 		)
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -566,7 +567,7 @@ func newDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
-	retainBaseSnapshot bool,
+	retention retentionDecision,
 ) *velerov2alpha1.DataUpload {
 	parentSnapshot := ""
 
@@ -636,11 +637,14 @@ func newDataUpload(
 		}
 	}
 
-	if retainBaseSnapshot {
-		if dataUpload.Spec.DataMoverConfig == nil {
-			dataUpload.Spec.DataMoverConfig = make(map[string]string)
+	// Every block DataUpload is labeled with its chain, so that the retained
+	// snapshot controller lists one chain, whether it retains or not.
+	if datamover.IsVeleroBlockDataMover(dataMover) {
+		dataUpload.Labels[retainedsnapshot.ChainLabel] = retainedsnapshot.ChainOfDataUpload(dataUpload)
+		dataUpload.Spec.RetainBaseSnapshot = retention.retain
+		if retention.source != "" {
+			dataUpload.Annotations = map[string]string{retainedsnapshot.DecisionAnnotation: retention.String()}
 		}
-		dataUpload.Spec.DataMoverConfig[retainedsnapshot.DataMoverConfigKey] = "true"
 	}
 
 	return dataUpload
@@ -656,9 +660,9 @@ func createDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
-	retainBaseSnapshot bool,
+	retention retentionDecision,
 ) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, retainBaseSnapshot)
+	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, retention)
 
 	err := crClient.Create(ctx, dataUpload)
 	if err != nil {
@@ -717,11 +721,25 @@ func cancelDataUpload(
 // spec.requireBaseSnapshotForDelta is not in a released client yet.
 var snapshotMetadataServiceGVK = schema.GroupVersionKind{Group: "cbt.storage.k8s.io", Version: "v1beta1", Kind: "SnapshotMetadataService"}
 
+// retentionDecision is the base snapshot retention decision for a DataUpload
+// and where it came from.
+type retentionDecision struct {
+	retain bool
+	// source is "volume policy <index>", "SnapshotMetadataService <name>" or
+	// "default: <reason>".
+	source string
+}
+
+func (d retentionDecision) String() string {
+	return fmt.Sprintf("%t (from %s)", d.retain, d.source)
+}
+
 // decideRetainBaseSnapshot decides whether the block data mover keeps the
 // snapshot of the PVC as the base of the next incremental backup. First match
 // wins: the retainBaseSnapshot parameter of the volume policy snapshot action,
 // spec.requireBaseSnapshotForDelta of the SnapshotMetadataService named after
-// the CSI driver, then don't retain.
+// the CSI driver, then don't retain. Retention only applies to the block data
+// mover. The decision is logged at info level once per DataUpload.
 func (p *pvcBackupItemAction) decideRetainBaseSnapshot(
 	ctx context.Context,
 	vh vhutil.VolumeHelper,
@@ -729,38 +747,64 @@ func (p *pvcBackupItemAction) decideRetainBaseSnapshot(
 	dataMover string,
 	driver string,
 	log logrus.FieldLogger,
-) bool {
-	decision, source := false, "default"
-
-	if matched, actionType, params, err := vh.GetActionParameters(item, kuberesource.PersistentVolumeClaims); err != nil {
-		log.WithError(err).Warn("Failed to get the volume policy action, ignoring its retainBaseSnapshot parameter")
-	} else if matched && resourcepolicies.VolumeActionType(actionType) == resourcepolicies.Snapshot {
-		action := &resourcepolicies.Action{Type: resourcepolicies.VolumeActionType(actionType), Parameters: params}
-		if v, err := action.GetRetainBaseSnapshot(); err != nil {
-			log.WithError(err).Warn("Ignoring invalid retainBaseSnapshot volume policy parameter")
-		} else if v != nil {
-			decision, source = *v, "volume policy"
+) retentionDecision {
+	d := p.resolveRetainBaseSnapshot(ctx, vh, item, driver, log)
+	if !datamover.IsVeleroBlockDataMover(dataMover) {
+		if d.retain {
+			log.Warnf("Ignoring base snapshot retention %s: data mover %q never retains snapshots", d, dataMover)
 		}
+		d = retentionDecision{retain: false, source: fmt.Sprintf("default: data mover %q is not %q", dataMover, datamover.DataMoverTypeVeleroBlock)}
+	}
+	log.Infof("Base snapshot retention: %s, data mover %q, driver %s", d, dataMover, driver)
+	return d
+}
+
+func (p *pvcBackupItemAction) resolveRetainBaseSnapshot(
+	ctx context.Context,
+	vh vhutil.VolumeHelper,
+	item runtime.Unstructured,
+	driver string,
+	log logrus.FieldLogger,
+) retentionDecision {
+	var reasons []string
+
+	v, matched, index, err := vh.GetRetainBaseSnapshotFromActionParameters(item, kuberesource.PersistentVolumeClaims)
+	switch {
+	case err != nil:
+		// The validator rejects invalid values, so this is only a read error.
+		log.WithError(err).Warn("Failed to read the retainBaseSnapshot volume policy parameter, ignoring it")
+		reasons = append(reasons, fmt.Sprintf("reading the volume policy failed: %v", err))
+	case !matched:
+		reasons = append(reasons, "no volume policy matched")
+	case v == nil:
+		reasons = append(reasons, fmt.Sprintf("matched volume policy %d has no retainBaseSnapshot", index))
+	default:
+		return retentionDecision{retain: *v, source: fmt.Sprintf("volume policy %d", index)}
 	}
 
-	if source == "default" && datamover.IsVeleroBlockDataMover(dataMover) && driver != "" {
-		sms := &unstructured.Unstructured{}
-		sms.SetGroupVersionKind(snapshotMetadataServiceGVK)
-		if err := p.crClient.Get(ctx, crclient.ObjectKey{Name: driver}, sms); err != nil {
-			log.WithError(err).Debugf("No SnapshotMetadataService %s to decide base snapshot retention", driver)
-		} else if v, found, err := unstructured.NestedBool(sms.Object, "spec", "requireBaseSnapshotForDelta"); err != nil {
-			log.WithError(err).Warnf("Invalid spec.requireBaseSnapshotForDelta in SnapshotMetadataService %s", driver)
-		} else if found {
-			decision, source = v, "SnapshotMetadataService "+driver
+	if driver == "" {
+		reasons = append(reasons, "no CSI driver")
+		return retentionDecision{source: "default: " + strings.Join(reasons, "; ")}
+	}
+	sms := &unstructured.Unstructured{}
+	sms.SetGroupVersionKind(snapshotMetadataServiceGVK)
+	if err := p.crClient.Get(ctx, crclient.ObjectKey{Name: driver}, sms); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			reasons = append(reasons, fmt.Sprintf("no SnapshotMetadataService for %s", driver))
+		} else {
+			reasons = append(reasons, fmt.Sprintf("reading SnapshotMetadataService failed: %v", err))
 		}
+	} else if b, found, err := unstructured.NestedBool(sms.Object, "spec", "requireBaseSnapshotForDelta"); err != nil {
+		reasons = append(reasons, fmt.Sprintf("reading SnapshotMetadataService failed: %v", err))
+	} else if !found {
+		// A CRD without the field prunes it, so the CR never has it until the
+		// CSI driver deployment ships the updated CRD.
+		reasons = append(reasons, fmt.Sprintf("SnapshotMetadataService %s has no requireBaseSnapshotForDelta", sms.GetName()))
+	} else {
+		return retentionDecision{retain: b, source: "SnapshotMetadataService " + sms.GetName()}
 	}
 
-	if decision && !datamover.IsVeleroBlockDataMover(dataMover) {
-		log.Warnf("Ignoring retainBaseSnapshot from %s, data mover %q never retains snapshots", source, dataMover)
-		return false
-	}
-	log.Infof("Base snapshot retention: %t (from %s, data mover %q, driver %s)", decision, source, dataMover, driver)
-	return decision
+	return retentionDecision{source: "default: " + strings.Join(reasons, "; ")}
 }
 
 func NewPvcBackupItemAction(f veleroclient.Factory) plugincommon.HandlerInitializer {

@@ -570,11 +570,22 @@ func (e *csiSnapshotExposer) getRetainedSourceVSC(ctx context.Context, backupVSC
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			e.log.WithError(err).Warnf("Failed to get backup VSC %s", backupVSCName)
+			return ""
 		}
-		return ""
+		backupVSC = nil
 	}
 
-	if backupVSC.Spec.Source.SnapshotHandle == nil || *backupVSC.Spec.Source.SnapshotHandle != *sourceVSC.Status.SnapshotHandle {
+	if backupVSC == nil || backupVSC.Spec.Source.SnapshotHandle == nil || *backupVSC.Spec.Source.SnapshotHandle != *sourceVSC.Status.SnapshotHandle {
+		// Expose never took over the snapshot (the DataUpload failed or was
+		// canceled before expose). The source VSC was created from the
+		// VolumeSnapshotClass; under a Retain class, deleting the source VS
+		// would leave it and the snapshot behind with nothing that ever deletes
+		// them. Switch it to Delete first, as CleanupVolumeSnapshot does.
+		if err := csi.ReleaseRetainedVSC(ctx, e.csiSnapshotClient, sourceVSC.Name); err != nil {
+			e.log.WithError(err).Warnf("Failed to set deletion policy of source VSC %s to Delete, its snapshot may be left in the storage", sourceVSC.Name)
+		} else {
+			e.log.Infof("Set deletion policy of source VSC %s to Delete before deleting source VS %s/%s, expose never took over its snapshot", sourceVSC.Name, vsNamespace, vsName)
+		}
 		return ""
 	}
 

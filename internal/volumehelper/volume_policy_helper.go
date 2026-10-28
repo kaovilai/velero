@@ -447,6 +447,27 @@ func (v *volumeHelperImpl) GetActionParameters(obj runtime.Unstructured, groupRe
 	return false, "", nil, nil
 }
 
+// GetRetainBaseSnapshotFromActionParameters returns the retainBaseSnapshot
+// parameter of the matched snapshot action (nil if absent), whether a volume
+// policy matched, and the index of the matched policy in the effective list.
+func (v *volumeHelperImpl) GetRetainBaseSnapshotFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (*bool, bool, int, error) {
+	action, _, err := v.getPVAndMatchAction(obj, groupResource)
+	if err != nil {
+		if errors.Is(err, errGetPVForPVC) {
+			return nil, false, -1, nil
+		}
+		return nil, false, -1, err
+	}
+	if action == nil {
+		return nil, false, -1, nil
+	}
+	if action.Type != resourcepolicies.Snapshot {
+		return nil, true, action.Index(), nil
+	}
+	retain, err := action.GetRetainBaseSnapshot()
+	return retain, true, action.Index(), err
+}
+
 func (v *volumeHelperImpl) GetSnapshotClass(obj runtime.Unstructured, groupResource schema.GroupResource) (string, error) {
 	matched, actionType, params, err := v.GetActionParameters(obj, groupResource)
 	if err != nil {

@@ -18,6 +18,7 @@ package datapath
 
 import (
 	"context"
+	"time"
 
 	"github.com/velero-io/velero/pkg/uploader"
 )
@@ -41,6 +42,13 @@ type BackupResult struct {
 	IncrementalBytes *int64 `json:"incrementalBytes,omitempty"`
 	SourceSize       int64  `json:"sourceSize,omitempty"`
 	FallbackFull     bool   `json:"fallbackFull,omitempty"`
+	// FallbackReason tells why FallbackFull is true.
+	FallbackReason string `json:"fallbackReason,omitempty"`
+	// SnapshotStartTime is the start time of the repository snapshot, the
+	// order in which the block data mover looks for the parent.
+	SnapshotStartTime *time.Time `json:"snapshotStartTime,omitempty"`
+	// ParentChangeID is the changeId of the parent, the base snapshot handle.
+	ParentChangeID string `json:"parentChangeID,omitempty"`
 }
 
 // RestoreResult represents the result of a restore

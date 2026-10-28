@@ -36,4 +36,5 @@ type VolumeHelper interface {
 	GetActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, string, map[string]any, error)
 	GetSnapshotClass(obj runtime.Unstructured, groupResource schema.GroupResource) (string, error)
 	GetDataMoverFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) string
+	GetRetainBaseSnapshotFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (*bool, bool, int, error)
 }

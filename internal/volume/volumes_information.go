@@ -135,6 +135,11 @@ type RestoreVolumeInfo struct {
 	// FallbackFull indicates whether the incremental restore has fallen back to full restore
 	FallbackFull bool `json:"fallbackFull,omitempty"`
 
+	// FallbackReason tells why the in-place restore was not incremental, and
+	// FallbackMessage explains it.
+	FallbackReason  string `json:"fallbackReason,omitempty"`
+	FallbackMessage string `json:"fallbackMessage,omitempty"`
+
 	CSISnapshotInfo          *CSISnapshotInfo                 `json:"csiSnapshotInfo,omitempty"`
 	SnapshotDataMovementInfo *RestoreSnapshotDataMovementInfo `json:"snapshotDataMovementInfo,omitempty"`
 	NativeSnapshotInfo       *NativeSnapshotInfo              `json:"nativeSnapshotInfo,omitempty"`
@@ -196,6 +201,20 @@ type BackupSnapshotDataMovementInfo struct {
 
 	// The size of source volume, for backup only
 	SourceSize int64 `json:"sourceSize,omitempty"`
+
+	// DataUploadName is the name of the DataUpload, for backup only.
+	DataUploadName string `json:"dataUploadName,omitempty"`
+
+	// BaseSnapshotRetention is the base snapshot retention decision and its
+	// source, e.g. "true (from volume policy 0)", for backup only.
+	BaseSnapshotRetention string `json:"baseSnapshotRetention,omitempty"`
+
+	// RetainedSnapshotHandle is the CSI snapshot handle retained as the base of
+	// the next incremental backup, for backup only.
+	RetainedSnapshotHandle string `json:"retainedSnapshotHandle,omitempty"`
+
+	// FallbackReason tells why the backup fell back to the allocated blocks.
+	FallbackReason string `json:"fallbackReason,omitempty"`
 
 	// The DataUpload's Status.Phase value
 	Phase velerov2alpha1.DataUploadPhase `json:"phase"`

@@ -70,7 +70,30 @@ type DataUploadSpec struct {
 	// If its value is "none", the data mover will do a full backup
 	// If its value is a specific snapshotID, the data mover finds the specific snapshot as parent.
 	ParentSnapshot string `json:"parentSnapshot,omitempty"`
+
+	// RetainBaseSnapshot indicates the data mover to keep the volume snapshot
+	// in the storage after the data movement completes, as the base of the
+	// next incremental backup of the same volume.
+	// +optional
+	RetainBaseSnapshot bool `json:"retainBaseSnapshot,omitempty"`
 }
+
+// FallbackReason tells why an incremental block backup or in-place restore
+// fell back to the allocated blocks.
+type FallbackReason string
+
+const (
+	// FallbackReasonNoParent means the backup is the first one of its chain.
+	FallbackReasonNoParent FallbackReason = "noParent"
+	// FallbackReasonVolumeChanged means the PVC was recreated since the parent backup.
+	FallbackReasonVolumeChanged FallbackReason = "volumeChanged"
+	// FallbackReasonBaseNotRetained means the base snapshot was never retained.
+	FallbackReasonBaseNotRetained FallbackReason = "baseNotRetained"
+	// FallbackReasonBaseGone means the base snapshot was rotated out or deleted with its backup.
+	FallbackReasonBaseGone FallbackReason = "baseGone"
+	// FallbackReasonDeltaError means the CSI driver failed to compute the changed blocks.
+	FallbackReasonDeltaError FallbackReason = "deltaError"
+)
 
 type SnapshotType string
 
@@ -211,12 +234,23 @@ type DataUploadStatus struct {
 	// +nullable
 	Activities []string `json:"activities,omitempty"`
 
-	// RetainedSnapshot records the volume snapshot that is kept in the storage after the
-	// DataUpload completes, because the snapshot's deletion policy is Retain. Backup deletion
-	// uses it to delete the snapshot from the storage.
+	// RetainedSnapshot is the volume snapshot kept in the storage as the
+	// base of the next incremental backup. Velero deletes it when it is
+	// no longer needed or when the backup is deleted.
 	// +optional
 	// +nullable
 	RetainedSnapshot *RetainedSnapshot `json:"retainedSnapshot,omitempty"`
+
+	// FallbackReason tells why the backup fell back to the allocated blocks
+	// when FallbackFull is true.
+	// +optional
+	FallbackReason FallbackReason `json:"fallbackReason,omitempty"`
+
+	// SnapshotStartTime is the start time of the repository snapshot, the
+	// order in which the block data mover looks for the parent snapshot.
+	// +optional
+	// +nullable
+	SnapshotStartTime *metav1.MicroTime `json:"snapshotStartTime,omitempty"`
 }
 
 // RetainedSnapshot identifies a volume snapshot retained in the storage by a DataUpload.
@@ -239,6 +273,10 @@ type RetainedSnapshot struct {
 	// A distributed CSI snapshotter only handles the VolumeSnapshotContents with the label of its node.
 	// +optional
 	ManagedBy string `json:"managedBy,omitempty"`
+
+	// ClusterID identifies the cluster whose storage holds the snapshot.
+	// +optional
+	ClusterID string `json:"clusterID,omitempty"`
 }
 
 // TODO(2.0) After converting all resources to use the runttime-controller client,
@@ -325,4 +363,20 @@ type DataUploadResult struct {
 	// SnapshotClass is the name of the snapshot class that the volume snapshot is created with
 	// +optional
 	SnapshotClass string `json:"snapshotClass,omitempty"`
+
+	// DataUploadName is the name of the DataUpload in the backup.
+	// +optional
+	DataUploadName string `json:"dataUploadName,omitempty"`
+
+	// SourcePVC is the name of the backed up PVC.
+	// +optional
+	SourcePVC string `json:"sourcePVC,omitempty"`
+
+	// RetainBaseSnapshot is the spec.retainBaseSnapshot of the DataUpload in the backup.
+	// +optional
+	RetainBaseSnapshot bool `json:"retainBaseSnapshot,omitempty"`
+
+	// RetainedSnapshot is the status.retainedSnapshot of the DataUpload in the backup.
+	// +optional
+	RetainedSnapshot *RetainedSnapshot `json:"retainedSnapshot,omitempty"`
 }

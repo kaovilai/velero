@@ -50,6 +50,7 @@ import (
 	"github.com/velero-io/velero/pkg/metrics"
 	"github.com/velero-io/velero/pkg/nodeagent"
 	repository "github.com/velero-io/velero/pkg/repository/manager"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	velerotypes "github.com/velero-io/velero/pkg/types"
 	"github.com/velero-io/velero/pkg/uploader"
 	"github.com/velero-io/velero/pkg/util"
@@ -506,6 +507,14 @@ func (r *DataDownloadReconciler) OnDataDownloadCompleted(ctx context.Context, na
 		dd.Status.Phase = velerov2alpha1api.DataDownloadPhaseCompleted
 		dd.Status.IncrementalBytes = ptr.To(result.Restore.IncrementalBytes)
 		dd.Status.FallbackFull = result.Restore.FallbackFull
+		if reason := dd.Annotations[retainedsnapshot.InPlaceFallbackReasonAnnotation]; reason != "" {
+			// The restore item action skipped the baseline because the base snapshot is not live.
+			dd.Status.FallbackReason = velerov2alpha1api.FallbackReason(reason)
+			dd.Status.Message = "in-place restore is full, not incremental: " + dd.Annotations[retainedsnapshot.InPlaceFallbackMessageAnnotation]
+		} else if result.Restore.FallbackFull {
+			dd.Status.FallbackReason = velerov2alpha1api.FallbackReasonDeltaError
+			dd.Status.Message = "in-place incremental restore fell back to full: the CSI driver failed to compute the changed blocks, see the data mover pod log"
+		}
 		dd.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
 
 		delete(dd.Labels, exposer.ExposeOnGoingLabel)

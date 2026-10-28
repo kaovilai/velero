@@ -39,6 +39,7 @@ import (
 	"github.com/velero-io/velero/pkg/builder"
 	"github.com/velero-io/velero/pkg/datamover"
 	"github.com/velero-io/velero/pkg/plugin/velero"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	"github.com/velero-io/velero/pkg/util/csi"
 )
@@ -224,7 +225,7 @@ func TestRetainedSnapshotLifecycle(t *testing.T) {
 			require.NoError(t, c.List(t.Context(), vscs))
 			assert.Empty(t, vscs.Items)
 			cms := &corev1api.ConfigMapList{}
-			require.NoError(t, c.List(t.Context(), cms, client.MatchingLabels{velerov1api.DataUploadRetainedSnapshotLabel: "true"}))
+			require.NoError(t, c.List(t.Context(), cms, client.MatchingLabels{retainedsnapshot.RecordLabel: "true"}))
 			assert.Empty(t, cms.Items)
 		})
 	}
@@ -317,7 +318,7 @@ func TestRetainedSnapshotDeletionIdempotent(t *testing.T) {
 			require.NoError(t, c.List(t.Context(), vscs))
 			assert.Empty(t, vscs.Items)
 			cms := &corev1api.ConfigMapList{}
-			require.NoError(t, c.List(t.Context(), cms, client.MatchingLabels{velerov1api.DataUploadRetainedSnapshotLabel: "true"}))
+			require.NoError(t, c.List(t.Context(), cms, client.MatchingLabels{retainedsnapshot.RecordLabel: "true"}))
 			assert.Empty(t, cms.Items)
 		})
 	}

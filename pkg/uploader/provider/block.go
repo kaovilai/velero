@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
@@ -40,6 +41,28 @@ type blockProvider struct {
 	bkRepo        udmrepo.BackupRepo
 	credGetter    *credentials.CredentialGetter
 	log           logrus.FieldLogger
+	lastBackup    BackupDetails
+}
+
+// BackupDetails are details of the last backup a provider ran that the
+// RunBackup result doesn't carry.
+type BackupDetails struct {
+	// SnapshotStartTime is the start time of the repository snapshot.
+	SnapshotStartTime time.Time
+	// FallbackReason tells why the backup fell back to the allocated blocks.
+	FallbackReason string
+	// ParentChangeID is the changeId of the parent, the base snapshot handle.
+	ParentChangeID string
+}
+
+// BackupDetailsProvider is implemented by providers that report BackupDetails.
+type BackupDetailsProvider interface {
+	LastBackupDetails() BackupDetails
+}
+
+// LastBackupDetails returns the details of the last RunBackup.
+func (bp *blockProvider) LastBackupDetails() BackupDetails {
+	return bp.lastBackup
 }
 
 // NewBlockUploaderProvider initialized with open or create a repository
@@ -133,6 +156,7 @@ func (bp *blockProvider) RunBackup(
 	}
 
 	snapshotInfo, _, err := blockBackupFunc(ctx, blkUploader, bp.bkRepo, path, realSource, cbtParam.Source, forceFull, parentSnapshot, cbtParam.Service, uploaderCfg, tags, log)
+	bp.lastBackup = BackupDetails{SnapshotStartTime: snapshotInfo.StartTime, FallbackReason: snapshotInfo.FallbackReason, ParentChangeID: snapshotInfo.ParentChangeID}
 
 	// errors.Is, not ==: the sentinel is wrapped twice on its way here, by
 	// block/uploader.go ("error backing up bdev %s") and again by

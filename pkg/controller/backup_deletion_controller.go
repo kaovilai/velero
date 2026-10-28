@@ -641,92 +641,82 @@ func (r *backupDeletionReconciler) deleteMovedSnapshots(ctx context.Context, bac
 	return errs
 }
 
-// Lifecycle of the volume snapshot of a CSI DataUpload, by how the DataUpload ends
-// and the deletionPolicy of its backup VolumeSnapshotContent (the VSC the exposer
-// creates for the DataUpload). That VSC inherits the deletionPolicy of the source
-// VSC, which comes from the VolumeSnapshotClass:
-//
-//	DataUpload ends        | Delete                          | Retain
-//	-----------------------+---------------------------------+------------------------------------------
-//	Completed              | the CSI driver deletes it when  | kept in the storage and recorded in
-//	                       | the node-agent cleans up the    | status.retainedSnapshot; deleted here
-//	                       | exposed snapshot                | when the backup is deleted
-//	Failed, Canceled, or   | same as Completed               | the node-agent patches the deletionPolicy
-//	timed out in prepare   |                                 | of the backup VSC (not the class) to
-//	                       |                                 | Delete before the cleanup, so the CSI
-//	                       |                                 | driver deletes it then; nothing recorded
-//
-// When the backup is deleted, a retained snapshot is deleted after the other data
-// of the backup:
-//   - An earlier deletion step fails: the snapshot and its configmap are kept, and a
-//     retry of the backup deletion deletes them.
-//   - The CSI driver reports a failure (SnapshotDeleteError event): the backup
-//     deletion fails and the configmap is kept for a retry.
-//   - The CSI driver is not done within 30 seconds: the backup deletion completes
-//     with a warning, and the temp VSC stays until the driver deletes the snapshot.
-//
-// deleteRetainedSnapshots has the CSI driver delete the volume snapshots that the
-// DataUploads of the backup retained in the storage. The configmaps that pass the
-// snapshots from the DataUpload DeleteItemAction are the only record of the
-// snapshots once the DataUploads are deleted, so a configmap is removed only after
-// its snapshot is deleted.
+// RetainedSnapshotDeletionWait is how long backup deletion waits for the CSI
+// driver to delete a retained snapshot. A deletion still pending after it fails
+// the DeleteBackupRequest and keeps the record in deleting; the retained snapshot
+// controller finishes it, and running the deletion again waits on the same temp
+// VolumeSnapshotContent.
+var RetainedSnapshotDeletionWait = 5 * time.Minute
+
+// deleteRetainedSnapshots handles the retained snapshot records of the backup
+// after its repository snapshots and DataUploads are deleted: tombstones are
+// removed without a storage call, records of another cluster are removed and
+// their snapshots left to that cluster, and live snapshots are deleted with the
+// shared helper before their record is removed. A failure or a pending deletion
+// fails the DeleteBackupRequest and keeps the record. Records are read from the
+// API server.
 func (r *backupDeletionReconciler) deleteRetainedSnapshots(ctx context.Context, backup *velerov1api.Backup, log logrus.FieldLogger) []error {
-	list := &corev1api.ConfigMapList{}
-	if err := r.Client.List(ctx, list, &client.ListOptions{
-		Namespace: backup.Namespace,
-		LabelSelector: labels.SelectorFromSet(
-			map[string]string{
-				velerov1api.BackupNameLabel:                 label.GetValidName(backup.Name),
-				velerov1api.DataUploadRetainedSnapshotLabel: "true",
-			}),
-	}); err != nil {
-		return []error{errors.Wrapf(err, "failed to retrieve config for retained snapshots")}
-	}
-
-	var errs []error
-	for i := range list.Items {
-		cm := list.Items[i]
-		if err := r.deleteRetainedSnapshot(ctx, backup, &cm, log); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := r.Client.Delete(ctx, &cm); err != nil && !apierrors.IsNotFound(err) {
-			log.Warnf("Failed to delete retained snapshot configmap %s/%s: %v", cm.Namespace, cm.Name, err)
-		}
-	}
-
-	return errs
-}
-
-func (r *backupDeletionReconciler) deleteRetainedSnapshot(ctx context.Context, backup *velerov1api.Backup, cm *corev1api.ConfigMap, log logrus.FieldLogger) error {
-	record, err := retainedsnapshot.FromConfigMap(cm)
-	if err != nil {
-		return err
-	}
-	record.Backup = backup.Name
-	if record.State == retainedsnapshot.StateDeleted {
-		log.Infof("Retained snapshot %s of configmap %s was already rotated out", record.SnapshotHandle, cm.Name)
-		return nil
-	}
 	reader := r.apiReader
 	if reader == nil {
 		reader = r.Client
 	}
-	localID, err := retainedsnapshot.GetClusterIDFromReader(ctx, reader)
-	if err != nil {
-		return err
-	}
-	if retainedsnapshot.IsForeign(record.ClusterID, localID) {
-		log.Warnf("Retained snapshot %s of configmap %s belongs to cluster %s, not this cluster %s; leaving it to its origin cluster",
-			record.SnapshotHandle, cm.Name, record.ClusterID, localID)
-		return nil
+	list := &corev1api.ConfigMapList{}
+	if err := reader.List(ctx, list, &client.ListOptions{
+		Namespace: backup.Namespace,
+		LabelSelector: labels.SelectorFromSet(
+			map[string]string{
+				velerov1api.BackupNameLabel:  label.GetValidName(backup.Name),
+				retainedsnapshot.RecordLabel: "true",
+			}),
+	}); err != nil {
+		return []error{errors.Wrapf(err, "failed to list the retained snapshot records")}
 	}
 
-	log.Infof("Deleting retained snapshot %s from configmap %s", record.SnapshotHandle, cm.Name)
-	if err := retainedsnapshot.DeleteSnapshot(ctx, r.snapshotDeletionClient(), record, log); err != nil {
-		return errors.Wrapf(err, "failed to delete retained snapshot %s from configmap %s", record.SnapshotHandle, cm.Name)
+	localID, err := retainedsnapshot.GetClusterIDFromReader(ctx, reader)
+	if err != nil {
+		return []error{err}
 	}
-	return nil
+
+	now := time.Now
+	if r.clock != nil {
+		now = r.clock.Now
+	}
+	var errs []error
+	for i := range list.Items {
+		cm := &list.Items[i]
+		record, err := retainedsnapshot.FromConfigMap(cm)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		rlog := log.WithFields(logrus.Fields{"record": cm.Name, "snapshotHandle": record.SnapshotHandle})
+		switch {
+		case record.State == retainedsnapshot.StateDeleted:
+			rlog.Infof("Removing tombstone %s, its base snapshot was %s", cm.Name, record.Describe())
+			err = retainedsnapshot.Remove(ctx, r.Client, cm)
+		case retainedsnapshot.IsForeign(record.ClusterID, localID):
+			rlog.Warnf("Retained snapshot %s of record %s belongs to cluster %s, not this cluster %s; leaving it to its origin cluster and removing the record",
+				record.SnapshotHandle, cm.Name, record.ClusterID, localID)
+			err = retainedsnapshot.Remove(ctx, r.Client, cm)
+		default:
+			rlog.Infof("Deleting retained snapshot %s of record %s (state %s)", record.SnapshotHandle, cm.Name, record.State)
+			err = retainedsnapshot.DeleteSnapshot(ctx, r.Client, r.snapshotDeletionClient(), cm, retainedsnapshot.DeleteOptions{
+				Wait:   RetainedSnapshotDeletionWait,
+				Remove: true,
+				Reason: retainedsnapshot.ReasonDeletedWithBackup,
+				Now:    now,
+			}, rlog)
+			if errors.Is(err, csi.ErrTempVSCDeletionPending) {
+				err = errors.Errorf("deletion of retained snapshot %s is pending after %v (temp VolumeSnapshotContent %s), the record stays %s; run the backup deletion again once the CSI driver deleted it",
+					record.SnapshotHandle, RetainedSnapshotDeletionWait, retainedsnapshot.TempVSCName(record.Driver, record.SnapshotHandle), retainedsnapshot.StateDeleting)
+			}
+		}
+		if err != nil {
+			errs = append(errs, errors.Wrapf(err, "retained snapshot record %s", cm.Name))
+		}
+	}
+
+	return errs
 }
 
 func (r *backupDeletionReconciler) patchDeleteBackupRequest(ctx context.Context, req *velerov1api.DeleteBackupRequest, mutate func(*velerov1api.DeleteBackupRequest)) (*velerov1api.DeleteBackupRequest, error) {

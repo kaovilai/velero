@@ -369,7 +369,7 @@ func TestSnapshotSource(t *testing.T) {
 				forceFull = *tc.forceFull
 			}
 
-			snapID, size, snapshotSize, fallback, err := snapshotSource(
+			snapID, size, snapshotSize, fallback, _, err := snapshotSource(
 				ctx, mockRepo, mockBlkup,
 				baseSource,
 				forceFull, tc.parentSnapshot,

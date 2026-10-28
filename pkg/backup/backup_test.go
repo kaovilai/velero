@@ -5917,6 +5917,7 @@ func TestUpdateVolumeInfos(t *testing.T) {
 					SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{
 						DataMover:        "velero",
 						RetainedSnapshot: "vs-1",
+						DataUploadName:   "du-1",
 						SnapshotHandle:   "snapshot-id",
 						Size:             1000,
 						IncrementalSize:  ptr.To(int64(500)),
@@ -5957,6 +5958,7 @@ func TestUpdateVolumeInfos(t *testing.T) {
 					SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{
 						DataMover:        "velero",
 						RetainedSnapshot: "vs-1",
+						DataUploadName:   "du-1",
 						SnapshotHandle:   "snapshot-id",
 						Size:             1000,
 						IncrementalSize:  ptr.To(int64(500)),

@@ -30,6 +30,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -238,6 +239,16 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 			return ctrl.Result{}, nil
 		}
+	}
+
+	// Past the commit point the DataUpload always completes, also after a
+	// node-agent restart; a cancel request is ignored.
+	if isRetentionCommitted(du) {
+		if du.Status.Node == r.nodeName && r.dataPathMgr.GetAsyncBR(du.Name) == nil {
+			log.Info("Finishing a DataUpload past the commit point of its retained snapshot")
+			r.finishCommittedDataUpload(ctx, du, log)
+		}
+		return ctrl.Result{}, nil
 	}
 
 	if du.Spec.Cancel {
@@ -499,13 +510,20 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 		return
 	}
 
+	fallbackReason := r.refineFallbackReason(ctx, &du, result.Backup, log)
+
 	// Retain the snapshot as the base of the next incremental backup if the
-	// DataUpload asks for it. It is recorded before it becomes Retain, so that
-	// Velero never has a retained snapshot it doesn't know about. Anything that
-	// fails here leaves the backup VSC Delete, so the cleanup deletes the snapshot.
-	var retainedSnapshot *velerov2alpha1api.RetainedSnapshot
-	if retainedsnapshot.RequestedFor(&du) && !result.Backup.EmptySnapshot {
-		retainedSnapshot = r.retainBaseSnapshot(ctx, &du, result.Backup.SnapshotID, log)
+	// DataUpload asks for it: steps 1 and 2 read the snapshot from the backup
+	// VSC and write the record, then the data path result and
+	// status.retainedSnapshot with the phase still InProgress (the commit point).
+	// After the commit point the DataUpload always completes (steps 3-5), also
+	// after a node-agent restart. Anything that fails before leaves the backup VSC
+	// Delete, so the cleanup deletes the snapshot.
+	if du.Spec.RetainBaseSnapshot && !result.Backup.EmptySnapshot {
+		if r.commitRetainedSnapshot(ctx, &du, result.Backup, fallbackReason, log) {
+			r.finishCommittedDataUpload(ctx, &du, log)
+			return
+		}
 	}
 
 	// cleans up any objects generated during the snapshot expose
@@ -527,13 +545,8 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 			return false
 		}
 
-		du.Status.Path = result.Backup.Source.ByPath
+		setDataUploadResult(du, result.Backup, fallbackReason)
 		du.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
-		du.Status.SnapshotID = result.Backup.SnapshotID
-		du.Status.IncrementalBytes = result.Backup.IncrementalBytes
-		du.Status.SourceSize = result.Backup.SourceSize
-		du.Status.FallbackFull = result.Backup.FallbackFull
-		du.Status.RetainedSnapshot = retainedSnapshot
 
 		du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
 		if result.Backup.EmptySnapshot {
@@ -551,18 +564,76 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 	}
 }
 
+// setDataUploadResult writes the data path result into the DataUpload status.
+func setDataUploadResult(du *velerov2alpha1api.DataUpload, result datapath.BackupResult, fallbackReason velerov2alpha1api.FallbackReason) {
+	du.Status.Path = result.Source.ByPath
+	du.Status.SnapshotID = result.SnapshotID
+	du.Status.IncrementalBytes = result.IncrementalBytes
+	du.Status.SourceSize = result.SourceSize
+	du.Status.FallbackFull = result.FallbackFull
+	du.Status.FallbackReason = fallbackReason
+	if result.SnapshotStartTime != nil {
+		du.Status.SnapshotStartTime = &metav1.MicroTime{Time: *result.SnapshotStartTime}
+	}
+}
+
+// refineFallbackReason returns the fallback reason of a completed block backup.
+// The uploader reports noParent, volumeChanged or deltaError; deltaError is
+// refined from the record of the parent's changeId: a tombstone or a record
+// being deleted gives baseGone, no record gives baseNotRetained.
+func (r *DataUploadReconciler) refineFallbackReason(ctx context.Context, du *velerov2alpha1api.DataUpload, result datapath.BackupResult, log logrus.FieldLogger) velerov2alpha1api.FallbackReason {
+	if !result.FallbackFull {
+		return ""
+	}
+	reason := velerov2alpha1api.FallbackReason(result.FallbackReason)
+	if reason != velerov2alpha1api.FallbackReasonDeltaError || result.ParentChangeID == "" {
+		return reason
+	}
+	cms, err := r.kubeClient.CoreV1().ConfigMaps(du.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(map[string]string{
+			retainedsnapshot.RecordLabel: "true",
+			retainedsnapshot.ChainLabel:  retainedsnapshot.ChainOfDataUpload(du),
+		}).String(),
+	})
+	if err != nil {
+		log.WithError(err).Warn("Failed to list the retained snapshot records to refine the fallback reason")
+		return reason
+	}
+	for i := range cms.Items {
+		rec, err := retainedsnapshot.FromConfigMap(&cms.Items[i])
+		if err != nil || rec.SnapshotHandle != result.ParentChangeID {
+			continue
+		}
+		if rec.State == retainedsnapshot.StateRetained {
+			log.Infof("Fell back with a live base snapshot %s (record %s), the CSI driver failed to compute the changed blocks", rec.SnapshotHandle, cms.Items[i].Name)
+			return reason
+		}
+		log.Infof("Fell back because base snapshot %s is %s", rec.SnapshotHandle, rec.Describe())
+		return velerov2alpha1api.FallbackReasonBaseGone
+	}
+	log.Infof("Fell back, no retained snapshot record for base snapshot %s", result.ParentChangeID)
+	return velerov2alpha1api.FallbackReasonBaseNotRetained
+}
+
 // retainedSnapshotBackoff retries the API calls on the backup VSC of a finished
 // DataUpload for about 15 seconds. It is a variable so that tests can shorten it.
 var retainedSnapshotBackoff = wait.Backoff{Steps: 5, Duration: time.Second, Factor: 2.0, Jitter: 0.1}
 
-// retainBaseSnapshot keeps the snapshot of a completed DataUpload in the storage:
-// it reads the snapshot from the backup VSC, writes the record ConfigMap and
-// status.retainedSnapshot, and then patches the backup VSC to Retain. It returns
-// nil if the snapshot is not retained, in which case the backup VSC stays Delete.
-func (r *DataUploadReconciler) retainBaseSnapshot(ctx context.Context, du *velerov2alpha1api.DataUpload, repoSnapshotID string, log logrus.FieldLogger) *velerov2alpha1api.RetainedSnapshot {
+// isRetentionCommitted tells whether a DataUpload passed the commit point: its
+// data path result and retained snapshot are persisted while it is not final.
+// Such a DataUpload always completes, a cancel request is ignored.
+func isRetentionCommitted(du *velerov2alpha1api.DataUpload) bool {
+	return !isDataUploadInFinalState(du) && du.Status.RetainedSnapshot != nil && du.Status.SnapshotID != ""
+}
+
+// commitRetainedSnapshot runs steps 1 and 2 of the retention: (1) read the
+// snapshot handle, driver and deletion secret from the backup VSC, (2) write
+// the record, then the data path result and status.retainedSnapshot with the
+// phase InProgress. It returns true once the commit point is passed.
+func (r *DataUploadReconciler) commitRetainedSnapshot(ctx context.Context, du *velerov2alpha1api.DataUpload, result datapath.BackupResult, fallbackReason velerov2alpha1api.FallbackReason, log logrus.FieldLogger) bool {
 	if du.Spec.SnapshotType != velerov2alpha1api.SnapshotTypeCSI || !datamover.IsVeleroBlockDataMover(du.Spec.DataMover) {
-		log.Warnf("Ignoring %s for data mover %q, only the block data mover retains base snapshots", retainedsnapshot.DataMoverConfigKey, du.Spec.DataMover)
-		return nil
+		log.Warnf("Ignoring retainBaseSnapshot for data mover %q, only the block data mover retains base snapshots", du.Spec.DataMover)
+		return false
 	}
 
 	// 1. Read the snapshot from the backup VSC, which is named after the DataUpload.
@@ -574,68 +645,120 @@ func (r *DataUploadReconciler) retainBaseSnapshot(ctx context.Context, du *veler
 	})
 	if err != nil {
 		log.WithError(err).Errorf("Failed to get backup VSC %s, not retaining its snapshot", du.Name)
-		return nil
+		return false
 	}
 	retained := csi.SnapshotOfVSC(vsc)
 	if retained == nil {
 		log.Errorf("Backup VSC %s has no snapshot handle, not retaining its snapshot", du.Name)
-		return nil
+		return false
 	}
 
 	if r.clusterID == "" {
 		clusterID, err := retainedsnapshot.GetClusterID(ctx, r.kubeClient)
 		if err != nil {
 			log.WithError(err).Errorf("Failed to get the cluster identity, not retaining snapshot %s", retained.SnapshotHandle)
-			return nil
+			return false
 		}
 		r.clusterID = clusterID
 	}
+	retained.ClusterID = r.clusterID
 
-	// 2. Write the record and status.retainedSnapshot.
-	record := retainedsnapshot.NewRecordForDataUpload(du, retained, r.clusterID, repoSnapshotID)
+	// 2. Write the record, then the result and status.retainedSnapshot.
+	startTime := time.Time{}
+	if result.SnapshotStartTime != nil {
+		startTime = *result.SnapshotStartTime
+	} else {
+		log.Warnf("The data path result has no repository snapshot start time, rotation can't order snapshot %s", retained.SnapshotHandle)
+	}
+	record := retainedsnapshot.NewRecordForDataUpload(du, retained, result.SnapshotID, startTime)
 	cm := record.ToConfigMap(du.Namespace)
 	if err := r.client.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
 		log.WithError(err).Errorf("Failed to write retained snapshot record %s, not retaining snapshot %s", cm.Name, retained.SnapshotHandle)
-		return nil
+		return false
 	}
-	dropRecord := func() {
-		if err := r.client.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
-			log.WithError(err).Warnf("Failed to delete retained snapshot record %s, the server removes it", cm.Name)
-		}
-	}
+	committed := false
 	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
 		if isDataUploadInFinalState(du) {
 			return false
 		}
+		setDataUploadResult(du, result, fallbackReason)
 		du.Status.RetainedSnapshot = retained
-		if du.Annotations == nil {
-			du.Annotations = map[string]string{}
-		}
-		du.Annotations[retainedsnapshot.ClusterIDAnnotation] = r.clusterID
+		// A cancel request racing with the completion loses: the data is in the repository.
+		du.Status.Phase = velerov2alpha1api.DataUploadPhaseInProgress
+		committed = true
 		return true
-	}); err != nil {
-		log.WithError(err).Errorf("Failed to record retained snapshot %s in the DataUpload status, not retaining it", retained.SnapshotHandle)
-		dropRecord()
-		return nil
+	}); err != nil || !committed {
+		log.WithError(err).Errorf("Failed to persist the result and retained snapshot %s in the DataUpload, not retaining it", retained.SnapshotHandle)
+		// The record of a DataUpload that never completes is dropped by the
+		// retained snapshot controller too; drop it now if possible.
+		if err := r.client.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+			log.WithError(err).Warnf("Failed to delete retained snapshot record %s, the server removes it", cm.Name)
+		}
+		return false
+	}
+
+	du.Status.RetainedSnapshot = retained
+	du.Status.SnapshotID = result.SnapshotID
+	log.Infof("Commit point passed: retained snapshot %s of backup VSC %s recorded in %s, chain %s, repository snapshot %s started %s",
+		retained.SnapshotHandle, du.Name, cm.Name, record.Chain(), result.SnapshotID, startTime.UTC().Format(time.RFC3339Nano))
+	return true
+}
+
+// finishCommittedDataUpload runs steps 3-5 of a DataUpload past the commit
+// point: (3) patch the backup VSC to Retain, (4) clean up the exposed objects,
+// which deletes the backup VSC and keeps the snapshot, (5) set Completed. Every
+// step is idempotent, so it runs again after a node-agent restart.
+func (r *DataUploadReconciler) finishCommittedDataUpload(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) {
+	handle := ""
+	if du.Status.RetainedSnapshot != nil {
+		handle = du.Status.RetainedSnapshot.SnapshotHandle
 	}
 
 	// 3. Switch the backup VSC to Retain, so that the cleanup keeps the snapshot.
+	// A missing VSC means the cleanup already ran.
 	if err := retry.OnError(retainedSnapshotBackoff, func(error) bool { return true }, func() error {
 		current, err := r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
 			return err
 		}
 		_, err = csi.RetainVSC(ctx, r.csiSnapshotClient, current)
 		return err
 	}); err != nil {
-		log.WithError(err).Errorf("Failed to set deletion policy of backup VSC %s to Retain, not retaining snapshot %s", du.Name, retained.SnapshotHandle)
-		dropRecord()
-		return nil
+		// Never run the cleanup on a Delete VSC past the commit point, it would
+		// delete a recorded snapshot. The next reconcile or restart retries.
+		log.WithError(err).Errorf("Failed to set deletion policy of backup VSC %s to Retain, will retry finishing the DataUpload", du.Name)
+		return
 	}
 
-	log.Infof("Retained snapshot %s of backup VSC %s as the base of the next incremental backup, record %s, chain %s",
-		retained.SnapshotHandle, du.Name, cm.Name, record.Chain())
-	return retained
+	// 4. Clean up the exposed objects.
+	if ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]; ok {
+		volumeSnapshotName := ""
+		if du.Spec.CSISnapshot != nil {
+			volumeSnapshotName = du.Spec.CSISnapshot.VolumeSnapshot
+		}
+		ep.CleanUp(ctx, getOwnerObject(du), volumeSnapshotName, du.Spec.SourceNamespace)
+	} else {
+		log.Warnf("%v type of snapshot exposer is not exist, failed to clean up resources on completion", du.Spec.SnapshotType)
+	}
+
+	// 5. Completed.
+	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
+		if isDataUploadInFinalState(du) {
+			return false
+		}
+		du.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
+		du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
+		delete(du.Labels, exposer.ExposeOnGoingLabel)
+		return true
+	}); err != nil {
+		log.WithError(err).Error("error updating DataUpload status")
+		return
+	}
+	log.Infof("Data upload completed, retained snapshot %s as the base of the next incremental backup", handle)
+	r.metrics.RegisterDataUploadSuccess(r.nodeName)
 }
 
 func (r *DataUploadReconciler) OnDataUploadFailed(ctx context.Context, namespace, duName string, err error) {
@@ -1243,6 +1366,15 @@ func (r *DataUploadReconciler) AttemptDataUploadResume(ctx context.Context, logg
 
 	for i := range dataUploads.Items {
 		du := &dataUploads.Items[i]
+		if du.Status.Phase == velerov2alpha1api.DataUploadPhaseInProgress && isRetentionCommitted(du) {
+			if du.Status.Node != r.nodeName {
+				continue
+			}
+			// Steps 3-5 of the completion are idempotent: finish instead of canceling.
+			logger.WithField("dataupload", du.Name).Info("Finishing a DataUpload past the commit point of its retained snapshot after restart")
+			r.finishCommittedDataUpload(ctx, du, logger.WithField("dataupload", du.Name))
+			continue
+		}
 		if du.Status.Phase == velerov2alpha1api.DataUploadPhaseInProgress {
 			if du.Status.Node != r.nodeName {
 				logger.WithField("du", du.Name).WithField("current node", r.nodeName).Infof("DU should be resumed by another node %s", du.Status.Node)

@@ -250,7 +250,7 @@ func TestDataUploadDeleteActionRetainedSnapshot(t *testing.T) {
 			backup := builder.ForBackup("velero", tc.executingBackup).StorageLocation("default").Result()
 			if tc.existingCMs {
 				require.NoError(t, crClient.Create(t.Context(), genConfigmap(backup, *du)))
-				cm, err := genRetainedSnapshotConfigmap(backup, *du)
+				cm, err := genRetainedSnapshotConfigmap(backup, *du, velerotest.NewLogger())
 				require.NoError(t, err)
 				require.NoError(t, crClient.Create(t.Context(), cm))
 			}
@@ -266,7 +266,7 @@ func TestDataUploadDeleteActionRetainedSnapshot(t *testing.T) {
 			}
 
 			cms := &corev1api.ConfigMapList{}
-			require.NoError(t, crClient.List(t.Context(), cms, crclient.MatchingLabels{velerov1.DataUploadRetainedSnapshotLabel: "true"}))
+			require.NoError(t, crClient.List(t.Context(), cms, crclient.MatchingLabels{retainedsnapshot.RecordLabel: "true"}))
 			if tc.wantData == nil {
 				assert.Empty(t, cms.Items)
 				return

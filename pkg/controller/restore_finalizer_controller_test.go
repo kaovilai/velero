@@ -1370,7 +1370,7 @@ func TestUpdateVolumeInfos(t *testing.T) {
 				restoreVolumeInfos: tc.restoreVolumeInfos,
 			}
 
-			errs := ctx.updateVolumeInfos()
+			_, errs := ctx.updateVolumeInfos()
 			if tc.expectErrs {
 				assert.False(t, errs.IsEmpty())
 				assert.Contains(t, errs.Namespaces["cluster"][0], tc.expectErrMsg)

@@ -1040,11 +1040,8 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 			r, err := initDataUploaderReconciler()
 			require.NoError(t, err)
 
-			b := dataUploadBuilder().DataMover(test.dataMover)
-			if test.requested {
-				b = b.DataMoverConfig(map[string]string{retainedsnapshot.DataMoverConfigKey: "true"})
-			}
-			du := b.Result()
+			du := dataUploadBuilder().DataMover(test.dataMover).Result()
+			du.Spec.RetainBaseSnapshot = test.requested
 			require.NoError(t, r.client.Create(ctx, du))
 			if test.backupVSC != nil {
 				_, err = r.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, test.backupVSC, metav1.CreateOptions{})
@@ -1929,4 +1926,67 @@ func TestDataUploadCancelConcurrency(t *testing.T) {
 	v, ok := r.cancelledDataUpload.Load(du.Name)
 	assert.True(t, ok)
 	assert.Equal(t, firstTime, v.(time.Time), "The initially recorded timestamp should be preserved")
+}
+
+// TestRetainedSnapshotCommitPoint checks that a DataUpload past the commit
+// point (result and retained snapshot persisted, phase InProgress) is finished
+// after a node-agent restart instead of being canceled, and that a cancel
+// request is ignored.
+func TestRetainedSnapshotCommitPoint(t *testing.T) {
+	shortenRetainedSnapshotBackoff(t)
+	handle := "snap-handle"
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+		resume bool
+	}{
+		{name: "resume after restart finishes steps 3-5", resume: true},
+		{name: "a cancel request after the commit point is ignored", cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			r, err := initDataUploaderReconciler()
+			require.NoError(t, err)
+			r.nodeName = "node-1"
+			r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger())}
+
+			du := dataUploadBuilder().DataMover("velero-block").Phase(velerov2alpha1api.DataUploadPhaseInProgress).
+				Node("node-1").SnapshotID("repo-snap").Cancel(tc.cancel).Finalizers([]string{DataUploadDownloadFinalizer}).Result()
+			du.Spec.RetainBaseSnapshot = true
+			du.Status.RetainedSnapshot = &velerov2alpha1api.RetainedSnapshot{SnapshotHandle: handle, Driver: "rbd.csi.ceph.com"}
+			require.NoError(t, r.client.Create(ctx, du))
+			_, err = r.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, &snapshotv1api.VolumeSnapshotContent{
+				ObjectMeta: metav1.ObjectMeta{Name: du.Name},
+				Spec: snapshotv1api.VolumeSnapshotContentSpec{
+					DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+					Driver:         "rbd.csi.ceph.com",
+					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
+				},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			if tc.resume {
+				require.NoError(t, r.AttemptDataUploadResume(ctx, r.logger.WithField("test", t.Name()), du.Namespace))
+			} else {
+				_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
+				require.NoError(t, err)
+			}
+
+			updated := &velerov2alpha1api.DataUpload{}
+			require.NoError(t, r.client.Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, updated))
+			assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updated.Status.Phase)
+			assert.Equal(t, handle, updated.Status.RetainedSnapshot.SnapshotHandle)
+
+			retainPatched := false
+			for _, action := range r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).Actions() {
+				if patch, ok := action.(clientTesting.PatchAction); ok && patch.GetResource().Resource == "volumesnapshotcontents" &&
+					strings.Contains(string(patch.GetPatch()), `"deletionPolicy":"Retain"`) {
+					retainPatched = true
+				}
+			}
+			assert.True(t, retainPatched)
+			_, err = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
+			assert.True(t, apierrors.IsNotFound(err))
+		})
+	}
 }

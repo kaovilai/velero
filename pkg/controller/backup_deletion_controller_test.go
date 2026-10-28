@@ -62,6 +62,7 @@ import (
 	repomanager "github.com/velero-io/velero/pkg/repository/manager"
 	repomocks "github.com/velero-io/velero/pkg/repository/mocks"
 	repotypes "github.com/velero-io/velero/pkg/repository/types"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	"github.com/velero-io/velero/pkg/util/csi"
 )
@@ -1260,8 +1261,8 @@ func retainedSnapshotConfigMap(t *testing.T, backupName string, name string, ret
 			Namespace: velerov1api.DefaultNamespace,
 			Name:      name,
 			Labels: map[string]string{
-				velerov1api.BackupNameLabel:                 backupName,
-				velerov1api.DataUploadRetainedSnapshotLabel: "true",
+				velerov1api.BackupNameLabel:  backupName,
+				retainedsnapshot.RecordLabel: "true",
 			},
 		},
 		Data: data,

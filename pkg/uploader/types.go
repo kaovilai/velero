@@ -19,6 +19,7 @@ package uploader
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 const (
@@ -56,6 +57,12 @@ type SnapshotInfo struct {
 	IncrementalSize int64
 	SourceSize      int64
 	Fallback        bool
+	// StartTime is the start time of the repository snapshot.
+	StartTime time.Time
+	// FallbackReason tells why Fallback is true: noParent, volumeChanged or deltaError.
+	FallbackReason string
+	// ParentChangeID is the changeId of the parent snapshot, if any.
+	ParentChangeID string
 }
 
 // Progress which defined two variables to record progress

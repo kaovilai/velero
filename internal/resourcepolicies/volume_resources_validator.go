@@ -137,8 +137,19 @@ func (a *Action) validate() error {
 			return fmt.Errorf("parameter %q is only supported for the %q action, but the action type is %q",
 				RetainBaseSnapshotParameter, Snapshot, a.Type)
 		}
-		if _, err := parseBoolParameter(RetainBaseSnapshotParameter, raw); err != nil {
+		retain, err := parseStrictBoolParameter(RetainBaseSnapshotParameter, raw)
+		if err != nil {
 			return err
+		}
+		// GetDataMover returns the default built-in data mover when dataMover is
+		// absent, and that overrides the Backup's datamover, so retention would
+		// silently do nothing.
+		if *retain {
+			dm, _ := a.Parameters[DataMoverParameter].(string)
+			if dm != datamover.DataMoverTypeVeleroBlock {
+				return fmt.Errorf("parameter %q is true but parameter %q of the same action is %q, it must be %q: only the block data mover retains base snapshots",
+					RetainBaseSnapshotParameter, DataMoverParameter, dm, datamover.DataMoverTypeVeleroBlock)
+			}
 		}
 	}
 

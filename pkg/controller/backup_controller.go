@@ -930,6 +930,11 @@ func (b *backupReconciler) runBackup(backup *pkgbackup.Request) error {
 	backupItemActionsResolver := framework.NewBackupItemActionResolverV2(actions)
 	itemBlockActionResolver := framework.NewItemBlockActionResolver(ibActions)
 
+	for _, w := range backup.ResPolicies.UnknownParameterWarnings() {
+		b.logger.WithField(constant.ControllerBackup, kubeutil.NamespaceAndName(backup)).Warn(w)
+		backupLog.Warn(w)
+	}
+
 	var fatalErrs []error
 	if err := b.backupper.BackupWithResolvers(backupLog, backup, backupFile, backupItemActionsResolver, itemBlockActionResolver, pluginManager); err != nil {
 		fatalErrs = append(fatalErrs, err)

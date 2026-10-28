@@ -83,13 +83,16 @@ func Backup(ctx context.Context, blkUp Uploader, repoWriter udmrepo.BackupRepo, 
 		return uploader.SnapshotInfo{}, false, errors.Wrapf(err, "error reset pos of block device %s", source)
 	}
 
-	snapID, backupSize, snapshotSize, fallback, err := snapshotSource(ctx, repoWriter, blkUp, sourceInfo, forceFull, parentSnapshot, cbtSource, cbtService, tags, uploaderCfg, log, "Block Uploader")
+	snapID, backupSize, snapshotSize, fallback, details, err := snapshotSource(ctx, repoWriter, blkUp, sourceInfo, forceFull, parentSnapshot, cbtSource, cbtService, tags, uploaderCfg, log, "Block Uploader")
 	snapshotInfo := uploader.SnapshotInfo{
 		ID:              snapID,
 		SnapshotSize:    snapshotSize,
 		IncrementalSize: backupSize,
 		SourceSize:      sourceInfo.size,
 		Fallback:        fallback,
+		StartTime:       details.startTime,
+		FallbackReason:  details.fallbackReason,
+		ParentChangeID:  details.parentChangeID,
 	}
 
 	return snapshotInfo, false, err
@@ -108,8 +111,9 @@ func snapshotSource(
 	uploaderCfg map[string]string,
 	log logrus.FieldLogger,
 	description string,
-) (string, int64, int64, bool, error) {
+) (string, int64, int64, bool, snapshotDetails, error) {
 	log.Info("Start to snapshot...")
+	details := snapshotDetails{}
 	snapshotStartTime := time.Now()
 
 	bitmap := cbt.NewBitmap(blockSize, uint64(source.size), cbtSource.Snapshot, cbtSource.VolumeID)
@@ -118,25 +122,41 @@ func snapshotSource(
 	if err != nil {
 		log.WithError(err).Warn("Failed to get parent backup info, fallback to full backup")
 		bitmap.SetError(errors.Wrap(err, "error getting parent backup info, fallback to full backup"))
+		switch {
+		case errors.Is(err, errNoParent):
+			details.fallbackReason = FallbackReasonNoParent
+		case errors.Is(err, errVolumeChanged):
+			details.fallbackReason = FallbackReasonVolumeChanged
+		default:
+			details.fallbackReason = FallbackReasonDeltaError
+		}
 	} else {
 		bitmap.SetChangeID(parentBackup.changeID)
+		details.parentChangeID = parentBackup.changeID
 	}
 
 	err = cbt.SetBitmapOrFull(ctx, cbtService, bitmap, false)
 	if err != nil {
 		parentBackup.parentObject = ""
 		log.WithError(err).Warnf("Failed to create CBT with source %v", cbtSource)
+		if details.fallbackReason == "" {
+			details.fallbackReason = FallbackReasonDeltaError
+		}
 	}
 
 	fallback := false
 	if !forceFull {
 		fallback = (len(bitmap.Errors()) > 0)
 	}
+	if !fallback {
+		details.fallbackReason = ""
+	}
 
 	snap, backupSize, err := u.Backup(source, parentBackup.parentObject, bitmap.Iterator(), uploaderCfg)
 	if err != nil {
-		return "", 0, 0, fallback, errors.Wrapf(err, "failed to run uploader backup for si %v", source)
+		return "", 0, 0, fallback, details, errors.Wrapf(err, "failed to run uploader backup for si %v", source)
 	}
+	details.startTime = snap.StartTime
 
 	if snap.Tags == nil {
 		snap.Tags = make(map[string]string)
@@ -152,16 +172,41 @@ func snapshotSource(
 
 	snapID, err := rep.SaveSnapshot(ctx, snap)
 	if err != nil {
-		return "", 0, 0, fallback, errors.Wrapf(err, "failed to save snapshot %v", snap)
+		return "", 0, 0, fallback, details, errors.Wrapf(err, "failed to save snapshot %v", snap)
 	}
 
 	if err = rep.Flush(ctx); err != nil {
-		return "", 0, 0, fallback, errors.Wrapf(err, "failed to flush repository")
+		return "", 0, 0, fallback, details, errors.Wrapf(err, "failed to flush repository")
 	}
 
-	log.Infof("Created snapshot with root %v and ID %v in %v", snap.RootObject, snapID, time.Since(snapshotStartTime).Truncate(time.Second))
+	log.Infof("Created snapshot with root %v and ID %v in %v, start time %v, fallback reason %q", snap.RootObject, snapID, time.Since(snapshotStartTime).Truncate(time.Second),
+		details.startTime, details.fallbackReason)
 
-	return string(snapID), backupSize, snap.TotalSize, fallback, nil
+	return string(snapID), backupSize, snap.TotalSize, fallback, details, nil
+}
+
+// Fallback reasons the uploader reports, see DataUploadStatus.FallbackReason.
+const (
+	FallbackReasonNoParent      = "noParent"
+	FallbackReasonVolumeChanged = "volumeChanged"
+	FallbackReasonDeltaError    = "deltaError"
+)
+
+var (
+	errNoParent      = errors.New("no parent snapshot")
+	errVolumeChanged = errors.New("volume changed since the parent snapshot")
+)
+
+// snapshotDetails are the details of a saved repository snapshot the data
+// path result carries besides the sizes.
+type snapshotDetails struct {
+	// startTime is the start time of the repository snapshot, the order the
+	// parent lookup uses.
+	startTime time.Time
+	// fallbackReason tells why the backup fell back to the allocated blocks.
+	fallbackReason string
+	// parentChangeID is the changeId of the parent, the base snapshot handle.
+	parentChangeID string
 }
 
 func getParentBackupInfo(ctx context.Context, rep udmrepo.BackupRepo, forceFull bool, parentSnapshot string, volumeID string,
@@ -172,7 +217,7 @@ func getParentBackupInfo(ctx context.Context, rep udmrepo.BackupRepo, forceFull 
 	}
 
 	if volumeID == "" {
-		return parentBackupInfo{}, errors.New("volumeID is not provided from the volume snapshot")
+		return parentBackupInfo{}, errors.Wrap(errVolumeChanged, "volumeID is not provided from the volume snapshot")
 	}
 
 	var previous *udmrepo.Snapshot
@@ -209,7 +254,7 @@ func getParentBackupInfo(ctx context.Context, rep udmrepo.BackupRepo, forceFull 
 	}
 
 	if previous.Tags[uploader.CBTVolumeIDTag] != volumeID {
-		return parentBackupInfo{}, errors.Errorf("volumeID %s from parent snapshot %s is not expected as %s", previous.Tags[uploader.CBTVolumeIDTag], previous.ID, volumeID)
+		return parentBackupInfo{}, errors.Wrapf(errVolumeChanged, "volumeID %s from parent snapshot %s is not expected as %s", previous.Tags[uploader.CBTVolumeIDTag], previous.ID, volumeID)
 	}
 
 	obj, err := loadObjectFromSnapshot(ctx, rep, previous)
@@ -356,7 +401,7 @@ func findPreviousSnapshot(ctx context.Context, rep udmrepo.BackupRepo, path stri
 	}
 
 	if previous == nil {
-		return udmrepo.Snapshot{}, errors.Errorf("no matching snapshot found for source %s", path)
+		return udmrepo.Snapshot{}, errors.Wrapf(errNoParent, "no matching snapshot found for source %s", path)
 	}
 
 	return *previous, nil

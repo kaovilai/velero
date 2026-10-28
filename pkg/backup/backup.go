@@ -65,6 +65,7 @@ import (
 	vsv1 "github.com/velero-io/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/velero-io/velero/pkg/podexec"
 	"github.com/velero-io/velero/pkg/podvolume"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	"github.com/velero-io/velero/pkg/util/collections"
 	"github.com/velero-io/velero/pkg/util/kube"
@@ -1331,6 +1332,12 @@ func updateVolumeInfos(
 				volumeInfos[index].SnapshotDataMovementInfo.SourceSize = dataUpload.Status.SourceSize
 				volumeInfos[index].SnapshotDataMovementInfo.Phase = dataUpload.Status.Phase
 				volumeInfos[index].FallbackFull = dataUpload.Status.FallbackFull
+				volumeInfos[index].SnapshotDataMovementInfo.FallbackReason = string(dataUpload.Status.FallbackReason)
+				volumeInfos[index].SnapshotDataMovementInfo.DataUploadName = dataUpload.Name
+				volumeInfos[index].SnapshotDataMovementInfo.BaseSnapshotRetention = dataUpload.Annotations[retainedsnapshot.DecisionAnnotation]
+				if dataUpload.Status.RetainedSnapshot != nil {
+					volumeInfos[index].SnapshotDataMovementInfo.RetainedSnapshotHandle = dataUpload.Status.RetainedSnapshot.SnapshotHandle
+				}
 
 				if dataUpload.Status.Phase == velerov2alpha1.DataUploadPhaseCompleted {
 					volumeInfos[index].Result = volume.VolumeResultSucceeded

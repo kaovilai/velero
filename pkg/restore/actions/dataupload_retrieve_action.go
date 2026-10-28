@@ -81,6 +81,10 @@ func (d *DataUploadRetrieveAction) Execute(input *velero.RestoreItemActionExecut
 		DataMoverResult:       dataUpload.Status.DataMoverResult,
 		NodeOS:                dataUpload.Status.NodeOS,
 		FSType:                dataUpload.Spec.SourceFSType,
+		DataUploadName:        dataUpload.Name,
+		SourcePVC:             dataUpload.Spec.SourcePVC,
+		RetainBaseSnapshot:    dataUpload.Spec.RetainBaseSnapshot,
+		RetainedSnapshot:      dataUpload.Status.RetainedSnapshot,
 	}
 	if dataUpload.Spec.CSISnapshot != nil {
 		dataUploadResult.SnapshotClass = dataUpload.Spec.CSISnapshot.SnapshotClass
