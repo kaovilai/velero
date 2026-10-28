@@ -2403,7 +2403,7 @@ func TestNewDataUpload(t *testing.T) {
 			operationID := "test-op-id"
 			fsType := "ext4"
 
-			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy)
+			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, false)
 
 			require.NotNil(t, du)
 			assert.Equal(t, velerov2alpha1.SchemeGroupVersion.String(), du.APIVersion)

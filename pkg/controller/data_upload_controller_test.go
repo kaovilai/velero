@@ -58,6 +58,7 @@ import (
 	datapathmocks "github.com/velero-io/velero/pkg/datapath/mocks"
 	"github.com/velero-io/velero/pkg/exposer"
 	"github.com/velero-io/velero/pkg/metrics"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	velerotypes "github.com/velero-io/velero/pkg/types"
 	"github.com/velero-io/velero/pkg/uploader"
@@ -954,96 +955,82 @@ func shortenRetainedSnapshotBackoff(t *testing.T) {
 func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 	shortenRetainedSnapshotBackoff(t)
 	handle := "fake-snapshot-handle"
+	backupVSC := func() *snapshotv1api.VolumeSnapshotContent {
+		return &snapshotv1api.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: dataUploadName,
+				Annotations: map[string]string{
+					csi.VSCDeletionSecretNameAnnotation:      "rbd-secret",
+					csi.VSCDeletionSecretNamespaceAnnotation: "rook-ceph",
+				},
+			},
+			Spec: snapshotv1api.VolumeSnapshotContentSpec{
+				DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
+				Driver:         "rbd.csi.ceph.com",
+				Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
+			},
+		}
+	}
+	retained := &velerov2alpha1api.RetainedSnapshot{
+		SnapshotHandle:          handle,
+		Driver:                  "rbd.csi.ceph.com",
+		DeletionSecretName:      "rbd-secret",
+		DeletionSecretNamespace: "rook-ceph",
+	}
 	tests := []struct {
 		name      string
+		requested bool
+		dataMover string
 		backupVSC *snapshotv1api.VolumeSnapshotContent
 		getErrs   int
 		// recordErr fails the status update that records the retained snapshot.
 		recordErr bool
 		expected  *velerov2alpha1api.RetainedSnapshot
-		// wantReleased is whether the backup VSC is set to Delete before the cleanup.
-		wantReleased bool
 	}{
 		{
-			name: "backup VSC with Retain policy records the retained snapshot",
-			backupVSC: &snapshotv1api.VolumeSnapshotContent{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: dataUploadName,
-					Annotations: map[string]string{
-						csi.VSCDeletionSecretNameAnnotation:      "rbd-secret",
-						csi.VSCDeletionSecretNamespaceAnnotation: "rook-ceph",
-					},
-				},
-				Spec: snapshotv1api.VolumeSnapshotContentSpec{
-					DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
-					Driver:         "rbd.csi.ceph.com",
-					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
-				},
-			},
-			expected: &velerov2alpha1api.RetainedSnapshot{
-				SnapshotHandle:          handle,
-				Driver:                  "rbd.csi.ceph.com",
-				DeletionSecretName:      "rbd-secret",
-				DeletionSecretNamespace: "rook-ceph",
-			},
+			name:      "requested by the block data mover retains the snapshot",
+			requested: true,
+			dataMover: "velero-block",
+			backupVSC: backupVSC(),
+			expected:  retained,
 		},
 		{
-			name:    "transient error getting the backup VSC is retried",
-			getErrs: 2,
-			backupVSC: &snapshotv1api.VolumeSnapshotContent{
-				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
-				Spec: snapshotv1api.VolumeSnapshotContentSpec{
-					DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
-					Driver:         "rbd.csi.ceph.com",
-					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
-				},
-			},
-			expected: &velerov2alpha1api.RetainedSnapshot{
-				SnapshotHandle: handle,
-				Driver:         "rbd.csi.ceph.com",
-			},
+			name:      "transient error getting the backup VSC is retried",
+			requested: true,
+			dataMover: "velero-block",
+			getErrs:   2,
+			backupVSC: backupVSC(),
+			expected:  retained,
 		},
 		{
-			// Without the record, the cleanup must delete the snapshot rather than
-			// leave it in the storage untracked.
-			name:      "failing to record the retained snapshot releases it",
+			name:      "failing to record the retained snapshot keeps the backup VSC Delete",
+			requested: true,
+			dataMover: "velero-block",
 			recordErr: true,
-			backupVSC: &snapshotv1api.VolumeSnapshotContent{
-				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
-				Spec: snapshotv1api.VolumeSnapshotContentSpec{
-					DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
-					Driver:         "rbd.csi.ceph.com",
-					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
-				},
-			},
-			wantReleased: true,
+			backupVSC: backupVSC(),
 		},
 		{
-			name:    "failing to get the backup VSC releases it",
-			getErrs: 5,
-			backupVSC: &snapshotv1api.VolumeSnapshotContent{
-				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
-				Spec: snapshotv1api.VolumeSnapshotContentSpec{
-					DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
-					Driver:         "rbd.csi.ceph.com",
-					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
-				},
-			},
-			wantReleased: true,
+			name:      "failing to get the backup VSC keeps it Delete",
+			requested: true,
+			dataMover: "velero-block",
+			getErrs:   5,
+			backupVSC: backupVSC(),
 		},
 		{
-			name: "backup VSC with Delete policy records nothing",
-			backupVSC: &snapshotv1api.VolumeSnapshotContent{
-				ObjectMeta: metav1.ObjectMeta{Name: dataUploadName},
-				Spec: snapshotv1api.VolumeSnapshotContentSpec{
-					DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
-					Driver:         "rbd.csi.ceph.com",
-					Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
-				},
-			},
+			name:      "not requested retains nothing",
+			dataMover: "velero-block",
+			backupVSC: backupVSC(),
 		},
 		{
-			name: "missing backup VSC records nothing",
+			name:      "the file system data mover never retains",
+			requested: true,
+			dataMover: "velero",
+			backupVSC: backupVSC(),
+		},
+		{
+			name:      "missing backup VSC retains nothing",
+			requested: true,
+			dataMover: "velero-block",
 		},
 	}
 
@@ -1053,7 +1040,11 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 			r, err := initDataUploaderReconciler()
 			require.NoError(t, err)
 
-			du := dataUploadBuilder().Result()
+			b := dataUploadBuilder().DataMover(test.dataMover)
+			if test.requested {
+				b = b.DataMoverConfig(map[string]string{retainedsnapshot.DataMoverConfigKey: "true"})
+			}
+			du := b.Result()
 			require.NoError(t, r.client.Create(ctx, du))
 			if test.backupVSC != nil {
 				_, err = r.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, test.backupVSC, metav1.CreateOptions{})
@@ -1096,14 +1087,29 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 				assert.Equal(t, test.expected, recordedAtCleanup)
 			}
 
-			released := false
+			retainPatched := false
 			for _, action := range r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).Actions() {
 				if patch, ok := action.(clientTesting.PatchAction); ok && patch.GetResource().Resource == "volumesnapshotcontents" &&
-					strings.Contains(string(patch.GetPatch()), `"deletionPolicy":"Delete"`) {
-					released = true
+					strings.Contains(string(patch.GetPatch()), `"deletionPolicy":"Retain"`) {
+					retainPatched = true
 				}
 			}
-			assert.Equal(t, test.wantReleased, released)
+			assert.Equal(t, test.expected != nil, retainPatched)
+
+			// The record exists exactly when the snapshot is retained.
+			cm := &corev1api.ConfigMap{}
+			err = r.client.Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: retainedsnapshot.RecordName(du.Name)}, cm)
+			if test.expected != nil {
+				require.NoError(t, err)
+				record, err := retainedsnapshot.FromConfigMap(cm)
+				require.NoError(t, err)
+				assert.Equal(t, handle, record.SnapshotHandle)
+				assert.Equal(t, "fake-id", record.RepoSnapshotID)
+				assert.Equal(t, retainedsnapshot.ChainOfDataUpload(du), cm.Labels[retainedsnapshot.ChainLabel])
+				assert.Equal(t, retainedsnapshot.StateRetained, cm.Labels[retainedsnapshot.StateLabel])
+			} else {
+				assert.True(t, apierrors.IsNotFound(err), "unexpected record: %v", err)
+			}
 
 			// The backup VSC is still cleaned up after its snapshot info is recorded.
 			_, err = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, dataUploadName, metav1.GetOptions{})

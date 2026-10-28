@@ -592,6 +592,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		constant.ControllerServerStatusRequest: {},
 		constant.ControllerRestoreFinalizer:    {},
 		constant.ControllerBackupQueue:         {},
+		constant.ControllerRetainedSnapshot:    {},
 	}
 
 	if s.config.RestoreOnly {
@@ -603,6 +604,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			constant.ControllerBackupOperations,
 			constant.ControllerGarbageCollection,
 			constant.ControllerSchedule,
+			constant.ControllerRetainedSnapshot,
 		)
 	}
 
@@ -701,6 +703,12 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.repoEnsurer,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackupDeletion)
+		}
+	}
+
+	if _, ok := enabledRuntimeControllers[constant.ControllerRetainedSnapshot]; ok {
+		if err := controller.NewRetainedSnapshotReconciler(s.mgr.GetClient(), s.namespace, s.logger).SetupWithManager(s.mgr); err != nil {
+			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerRetainedSnapshot)
 		}
 	}
 

@@ -1120,6 +1120,15 @@ func GetRetainedSnapshot(vsc *snapshotv1api.VolumeSnapshotContent) *velerov2alph
 	if vsc == nil || vsc.Spec.DeletionPolicy != snapshotv1api.VolumeSnapshotContentRetain {
 		return nil
 	}
+	return SnapshotOfVSC(vsc)
+}
+
+// SnapshotOfVSC returns the snapshot vsc refers to, whatever its deletion policy,
+// or nil if vsc has no snapshot handle.
+func SnapshotOfVSC(vsc *snapshotv1api.VolumeSnapshotContent) *velerov2alpha1api.RetainedSnapshot {
+	if vsc == nil {
+		return nil
+	}
 
 	handle := ""
 	if vsc.Status != nil && vsc.Status.SnapshotHandle != nil {

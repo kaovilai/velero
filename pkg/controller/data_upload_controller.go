@@ -51,6 +51,7 @@ import (
 	"github.com/velero-io/velero/pkg/exposer"
 	"github.com/velero-io/velero/pkg/metrics"
 	"github.com/velero-io/velero/pkg/nodeagent"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	velerotypes "github.com/velero-io/velero/pkg/types"
 	"github.com/velero-io/velero/pkg/uploader"
 	"github.com/velero-io/velero/pkg/util"
@@ -90,6 +91,8 @@ type DataUploadReconciler struct {
 	podAnnotations                 map[string]string
 	snapshotMetadataServiceConfigs *velerotypes.CSISnapshotMetadataService
 	tolerations                    []corev1api.Toleration
+	// clusterID is the identity of the cluster recorded with retained snapshots.
+	clusterID string
 }
 
 func NewDataUploadReconciler(
@@ -496,26 +499,13 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 		return
 	}
 
-	// Record a retained snapshot before the cleanup below deletes the backup VSC,
-	// so that the record isn't lost if the node-agent stops before the DataUpload
-	// is completed. If the snapshot can't be recorded, release it instead, so that
-	// the cleanup deletes it rather than leaving it in the storage untracked.
-	retainedSnapshot, err := r.getRetainedSnapshot(ctx, &du, log)
-	if err != nil {
-		log.WithError(err).Errorf("Failed to get backup VSC %s, deleting its snapshot with it", du.Name)
-		r.releaseRetainedSnapshot(ctx, &du, log)
-	} else if retainedSnapshot != nil {
-		if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
-			if isDataUploadInFinalState(du) {
-				return false
-			}
-			du.Status.RetainedSnapshot = retainedSnapshot
-			return true
-		}); err != nil {
-			log.WithError(err).Errorf("Failed to record retained snapshot %s, deleting it with backup VSC %s", retainedSnapshot.SnapshotHandle, du.Name)
-			retainedSnapshot = nil
-			r.releaseRetainedSnapshot(ctx, &du, log)
-		}
+	// Retain the snapshot as the base of the next incremental backup if the
+	// DataUpload asks for it. It is recorded before it becomes Retain, so that
+	// Velero never has a retained snapshot it doesn't know about. Anything that
+	// fails here leaves the backup VSC Delete, so the cleanup deletes the snapshot.
+	var retainedSnapshot *velerov2alpha1api.RetainedSnapshot
+	if retainedsnapshot.RequestedFor(&du) && !result.Backup.EmptySnapshot {
+		retainedSnapshot = r.retainBaseSnapshot(ctx, &du, result.Backup.SnapshotID, log)
 	}
 
 	// cleans up any objects generated during the snapshot expose
@@ -565,37 +555,87 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 // DataUpload for about 15 seconds. It is a variable so that tests can shorten it.
 var retainedSnapshotBackoff = wait.Backoff{Steps: 5, Duration: time.Second, Factor: 2.0, Jitter: 0.1}
 
-// getRetainedSnapshot returns the volume snapshot that stays in the storage after the
-// backup VSC is cleaned up, so that backup deletion can delete it later. It returns nil
-// when the snapshot is deleted with the backup VSC, i.e. the deletion policy is Delete,
-// or when there is no backup VSC.
-func (r *DataUploadReconciler) getRetainedSnapshot(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) (*velerov2alpha1api.RetainedSnapshot, error) {
-	if du.Spec.SnapshotType != velerov2alpha1api.SnapshotTypeCSI {
-		return nil, nil
+// retainBaseSnapshot keeps the snapshot of a completed DataUpload in the storage:
+// it reads the snapshot from the backup VSC, writes the record ConfigMap and
+// status.retainedSnapshot, and then patches the backup VSC to Retain. It returns
+// nil if the snapshot is not retained, in which case the backup VSC stays Delete.
+func (r *DataUploadReconciler) retainBaseSnapshot(ctx context.Context, du *velerov2alpha1api.DataUpload, repoSnapshotID string, log logrus.FieldLogger) *velerov2alpha1api.RetainedSnapshot {
+	if du.Spec.SnapshotType != velerov2alpha1api.SnapshotTypeCSI || !datamover.IsVeleroBlockDataMover(du.Spec.DataMover) {
+		log.Warnf("Ignoring %s for data mover %q, only the block data mover retains base snapshots", retainedsnapshot.DataMoverConfigKey, du.Spec.DataMover)
+		return nil
 	}
 
-	// The backup VSC is named after the DataUpload, see csiSnapshotExposer.createBackupVSC.
-	// Retry transient errors, the backup VSC and the chance to record its snapshot
-	// are gone once the cleanup runs.
+	// 1. Read the snapshot from the backup VSC, which is named after the DataUpload.
 	var vsc *snapshotv1api.VolumeSnapshotContent
 	err := retry.OnError(retainedSnapshotBackoff, func(err error) bool { return !apierrors.IsNotFound(err) }, func() error {
 		var getErr error
 		vsc, getErr = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
 		return getErr
 	})
-	if apierrors.IsNotFound(err) {
-		return nil, nil
-	}
 	if err != nil {
-		return nil, err
+		log.WithError(err).Errorf("Failed to get backup VSC %s, not retaining its snapshot", du.Name)
+		return nil
+	}
+	retained := csi.SnapshotOfVSC(vsc)
+	if retained == nil {
+		log.Errorf("Backup VSC %s has no snapshot handle, not retaining its snapshot", du.Name)
+		return nil
 	}
 
-	retained := csi.GetRetainedSnapshot(vsc)
-	if retained != nil {
-		log.Infof("Snapshot %s is retained in the storage by deletion policy of backup VSC %s", retained.SnapshotHandle, vsc.Name)
+	if r.clusterID == "" {
+		clusterID, err := retainedsnapshot.GetClusterID(ctx, r.kubeClient)
+		if err != nil {
+			log.WithError(err).Errorf("Failed to get the cluster identity, not retaining snapshot %s", retained.SnapshotHandle)
+			return nil
+		}
+		r.clusterID = clusterID
 	}
 
-	return retained, nil
+	// 2. Write the record and status.retainedSnapshot.
+	record := retainedsnapshot.NewRecordForDataUpload(du, retained, r.clusterID, repoSnapshotID)
+	cm := record.ToConfigMap(du.Namespace)
+	if err := r.client.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
+		log.WithError(err).Errorf("Failed to write retained snapshot record %s, not retaining snapshot %s", cm.Name, retained.SnapshotHandle)
+		return nil
+	}
+	dropRecord := func() {
+		if err := r.client.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+			log.WithError(err).Warnf("Failed to delete retained snapshot record %s, the server removes it", cm.Name)
+		}
+	}
+	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
+		if isDataUploadInFinalState(du) {
+			return false
+		}
+		du.Status.RetainedSnapshot = retained
+		if du.Annotations == nil {
+			du.Annotations = map[string]string{}
+		}
+		du.Annotations[retainedsnapshot.ClusterIDAnnotation] = r.clusterID
+		return true
+	}); err != nil {
+		log.WithError(err).Errorf("Failed to record retained snapshot %s in the DataUpload status, not retaining it", retained.SnapshotHandle)
+		dropRecord()
+		return nil
+	}
+
+	// 3. Switch the backup VSC to Retain, so that the cleanup keeps the snapshot.
+	if err := retry.OnError(retainedSnapshotBackoff, func(error) bool { return true }, func() error {
+		current, err := r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		_, err = csi.RetainVSC(ctx, r.csiSnapshotClient, current)
+		return err
+	}); err != nil {
+		log.WithError(err).Errorf("Failed to set deletion policy of backup VSC %s to Retain, not retaining snapshot %s", du.Name, retained.SnapshotHandle)
+		dropRecord()
+		return nil
+	}
+
+	log.Infof("Retained snapshot %s of backup VSC %s as the base of the next incremental backup, record %s, chain %s",
+		retained.SnapshotHandle, du.Name, cm.Name, record.Chain())
+	return retained
 }
 
 func (r *DataUploadReconciler) OnDataUploadFailed(ctx context.Context, namespace, duName string, err error) {

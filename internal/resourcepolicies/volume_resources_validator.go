@@ -132,5 +132,15 @@ func (a *Action) validate() error {
 		}
 	}
 
+	if raw, ok := a.Parameters[RetainBaseSnapshotParameter]; ok {
+		if a.Type != Snapshot {
+			return fmt.Errorf("parameter %q is only supported for the %q action, but the action type is %q",
+				RetainBaseSnapshotParameter, Snapshot, a.Type)
+		}
+		if _, err := parseBoolParameter(RetainBaseSnapshotParameter, raw); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }

@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/velero-io/velero/internal/resourcepolicies"
 	veleroshared "github.com/velero-io/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -52,6 +53,7 @@ import (
 	"github.com/velero-io/velero/pkg/plugin/utils/volumehelper"
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	biav2 "github.com/velero-io/velero/pkg/plugin/velero/backupitemaction/v2"
+	"github.com/velero-io/velero/pkg/retainedsnapshot"
 	uploaderUtil "github.com/velero-io/velero/pkg/uploader/util"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	"github.com/velero-io/velero/pkg/util/csi"
@@ -403,6 +405,11 @@ func (p *pvcBackupItemAction) Execute(
 		})
 
 		dataMoverFromVolumePolicy := vh.GetDataMoverFromActionParameters(item, kuberesource.PersistentVolumeClaims)
+		effectiveDataMover := backup.Spec.DataMover
+		if dataMoverFromVolumePolicy != "" {
+			effectiveDataMover = dataMoverFromVolumePolicy
+		}
+		retainBaseSnapshot := p.decideRetainBaseSnapshot(ctx, vh, item, effectiveDataMover, vsc.Spec.Driver, dataUploadLog)
 
 		dataUploadLog.Info("Starting data upload of backup")
 
@@ -416,6 +423,7 @@ func (p *pvcBackupItemAction) Execute(
 			vsc,
 			fsType,
 			dataMoverFromVolumePolicy,
+			retainBaseSnapshot,
 		)
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -558,6 +566,7 @@ func newDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
+	retainBaseSnapshot bool,
 ) *velerov2alpha1.DataUpload {
 	parentSnapshot := ""
 
@@ -627,6 +636,13 @@ func newDataUpload(
 		}
 	}
 
+	if retainBaseSnapshot {
+		if dataUpload.Spec.DataMoverConfig == nil {
+			dataUpload.Spec.DataMoverConfig = make(map[string]string)
+		}
+		dataUpload.Spec.DataMoverConfig[retainedsnapshot.DataMoverConfigKey] = "true"
+	}
+
 	return dataUpload
 }
 
@@ -640,8 +656,9 @@ func createDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
+	retainBaseSnapshot bool,
 ) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy)
+	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, retainBaseSnapshot)
 
 	err := crClient.Create(ctx, dataUpload)
 	if err != nil {
@@ -693,6 +710,57 @@ func cancelDataUpload(
 	}
 
 	return nil
+}
+
+// snapshotMetadataServiceGVK is the SnapshotMetadataService of
+// kubernetes-csi/external-snapshot-metadata. It is read unstructured because
+// spec.requireBaseSnapshotForDelta is not in a released client yet.
+var snapshotMetadataServiceGVK = schema.GroupVersionKind{Group: "cbt.storage.k8s.io", Version: "v1beta1", Kind: "SnapshotMetadataService"}
+
+// decideRetainBaseSnapshot decides whether the block data mover keeps the
+// snapshot of the PVC as the base of the next incremental backup. First match
+// wins: the retainBaseSnapshot parameter of the volume policy snapshot action,
+// spec.requireBaseSnapshotForDelta of the SnapshotMetadataService named after
+// the CSI driver, then don't retain.
+func (p *pvcBackupItemAction) decideRetainBaseSnapshot(
+	ctx context.Context,
+	vh vhutil.VolumeHelper,
+	item runtime.Unstructured,
+	dataMover string,
+	driver string,
+	log logrus.FieldLogger,
+) bool {
+	decision, source := false, "default"
+
+	if matched, actionType, params, err := vh.GetActionParameters(item, kuberesource.PersistentVolumeClaims); err != nil {
+		log.WithError(err).Warn("Failed to get the volume policy action, ignoring its retainBaseSnapshot parameter")
+	} else if matched && resourcepolicies.VolumeActionType(actionType) == resourcepolicies.Snapshot {
+		action := &resourcepolicies.Action{Type: resourcepolicies.VolumeActionType(actionType), Parameters: params}
+		if v, err := action.GetRetainBaseSnapshot(); err != nil {
+			log.WithError(err).Warn("Ignoring invalid retainBaseSnapshot volume policy parameter")
+		} else if v != nil {
+			decision, source = *v, "volume policy"
+		}
+	}
+
+	if source == "default" && datamover.IsVeleroBlockDataMover(dataMover) && driver != "" {
+		sms := &unstructured.Unstructured{}
+		sms.SetGroupVersionKind(snapshotMetadataServiceGVK)
+		if err := p.crClient.Get(ctx, crclient.ObjectKey{Name: driver}, sms); err != nil {
+			log.WithError(err).Debugf("No SnapshotMetadataService %s to decide base snapshot retention", driver)
+		} else if v, found, err := unstructured.NestedBool(sms.Object, "spec", "requireBaseSnapshotForDelta"); err != nil {
+			log.WithError(err).Warnf("Invalid spec.requireBaseSnapshotForDelta in SnapshotMetadataService %s", driver)
+		} else if found {
+			decision, source = v, "SnapshotMetadataService "+driver
+		}
+	}
+
+	if decision && !datamover.IsVeleroBlockDataMover(dataMover) {
+		log.Warnf("Ignoring retainBaseSnapshot from %s, data mover %q never retains snapshots", source, dataMover)
+		return false
+	}
+	log.Infof("Base snapshot retention: %t (from %s, data mover %q, driver %s)", decision, source, dataMover, driver)
+	return decision
 }
 
 func NewPvcBackupItemAction(f veleroclient.Factory) plugincommon.HandlerInitializer {

@@ -20,6 +20,7 @@ const (
 	ControllerSchedule              = "schedule"
 	ControllerServerStatusRequest   = "server-status-request"
 	ControllerRestoreFinalizer      = "restore-finalizer"
+	ControllerRetainedSnapshot      = "retained-snapshot"
 
 	PluginCSIPVCRestoreRIA            = "velero.io/csi-pvc-restorer"
 	PluginCsiVolumeSnapshotRestoreRIA = "velero.io/csi-volumesnapshot-restorer"

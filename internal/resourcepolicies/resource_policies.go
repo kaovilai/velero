@@ -19,6 +19,7 @@ package resourcepolicies
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -58,6 +59,11 @@ const (
 	// SnapshotClassParameter is the key of the action parameter that selects the
 	// VolumeSnapshotClass to use for CSI snapshots when the action type is snapshot.
 	SnapshotClassParameter = "snapshotClass"
+
+	// RetainBaseSnapshotParameter is the key of the action parameter that makes
+	// the block data mover keep the snapshot of the matched volumes in the
+	// storage as the base of the next incremental backup.
+	RetainBaseSnapshotParameter = "retainBaseSnapshot"
 )
 
 // validDataMovers is the set of data mover values accepted in the snapshot
@@ -135,6 +141,35 @@ func (a *Action) GetSnapshotClass() (string, error) {
 		return "", fmt.Errorf("parameter %q must be a string, got %T", SnapshotClassParameter, raw)
 	}
 	return snapshotClass, nil
+}
+
+// GetRetainBaseSnapshot returns the retainBaseSnapshot parameter of the snapshot
+// action, or nil when it is absent so that the caller falls back to the next
+// source of the decision.
+func (a *Action) GetRetainBaseSnapshot() (*bool, error) {
+	if a == nil || a.Type != Snapshot {
+		return nil, fmt.Errorf("the %q parameter is only supported for the %q action", RetainBaseSnapshotParameter, Snapshot)
+	}
+	raw, ok := a.Parameters[RetainBaseSnapshotParameter]
+	if !ok {
+		return nil, nil
+	}
+	return parseBoolParameter(RetainBaseSnapshotParameter, raw)
+}
+
+func parseBoolParameter(name string, raw any) (*bool, error) {
+	switch v := raw.(type) {
+	case bool:
+		return &v, nil
+	case string:
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %q must be a boolean, got %q", name, v)
+		}
+		return &b, nil
+	default:
+		return nil, fmt.Errorf("parameter %q must be a boolean, got %T", name, raw)
+	}
 }
 
 // PolicyLabelSelector mirrors metav1.LabelSelector with yaml tags for ConfigMap decode.
