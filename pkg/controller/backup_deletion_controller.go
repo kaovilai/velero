@@ -705,6 +705,7 @@ func (r *backupDeletionReconciler) deleteRetainedSnapshots(ctx context.Context, 
 				Remove: true,
 				Reason: retainedsnapshot.ReasonDeletedWithBackup,
 				Now:    now,
+				Owner:  "backup-deletion",
 			}, rlog)
 			if errors.Is(err, csi.ErrTempVSCDeletionPending) {
 				err = errors.Errorf("deletion of retained snapshot %s is pending after %v (temp VolumeSnapshotContent %s), the record stays %s; run the backup deletion again once the CSI driver deleted it",

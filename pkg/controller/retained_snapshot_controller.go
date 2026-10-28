@@ -64,6 +64,9 @@ const (
 	defaultDeletionWait = time.Minute
 	pauseRequeue        = 15 * time.Second
 	pendingRequeue      = 30 * time.Second
+
+	// deletionOwner names this controller on the records it moves to deleting.
+	deletionOwner = "retained-snapshot-controller"
 )
 
 // retainedSnapshotReconciler reconciles the retained snapshot records of a
@@ -327,8 +330,11 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req reconcil
 		rlog.Info(action)
 		opts.Wait = s.deletionWait
 		opts.Now = r.clock.Now
+		opts.Owner = deletionOwner
 		if err := retainedsnapshot.DeleteSnapshot(ctx, r.client, r.deletionClient(), cm, opts, rlog); err != nil {
 			switch {
+			case errors.Is(err, retainedsnapshot.ErrGone):
+				rlog.Info("Retained snapshot record was removed by another writer")
 			case errors.Is(err, retainedsnapshot.ErrConflict):
 				rlog.Info("Retained snapshot record changed by another writer, re-reading it")
 				requeue(time.Second)
@@ -373,6 +379,13 @@ func (r *retainedSnapshotReconciler) decide(ctx context.Context, cm *corev1api.C
 	case retainedsnapshot.StateDeleted:
 		return "", retainedsnapshot.DeleteOptions{}, 0
 	case retainedsnapshot.StateDeleting:
+		// A deletion another writer (backup deletion) owns is left to it while
+		// it can still be waiting; after that it was interrupted or failed.
+		if record.DeletingBy != deletionOwner && !record.DeletingSince.IsZero() {
+			if left := record.DeletingSince.Add(RetainedSnapshotDeletionWait + time.Minute).Sub(r.clock.Now()); left > 0 {
+				return "", retainedsnapshot.DeleteOptions{}, left
+			}
+		}
 		// Interrupted or pending deletion: finish it with the reason it started with.
 		return "Finishing the deletion of retained snapshot " + record.SnapshotHandle, retainedsnapshot.DeleteOptions{
 			Reason: record.Reason, RotatedByDataUpload: record.RotatedByDataUpload, RotatedByBackup: record.RotatedByBackup,

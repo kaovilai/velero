@@ -106,10 +106,15 @@ const (
 	keyReason                  = "reason"
 	keyRotatedByDataUpload     = "rotatedByDataUpload"
 	keyRotatedByBackup         = "rotatedByBackup"
+	keyDeletingBy              = "deletingBy"
+	keyDeletingSince           = "deletingSince"
 )
 
 // ErrConflict is returned when another writer changed the record first.
 var ErrConflict = errors.New("retained snapshot record changed by another writer")
+
+// ErrGone is returned when the record was removed while being updated.
+var ErrGone = errors.New("retained snapshot record removed by another writer")
 
 // Record is the in-cluster record of a retained snapshot.
 type Record struct {
@@ -128,6 +133,10 @@ type Record struct {
 	Reason                string
 	RotatedByDataUpload   string
 	RotatedByBackup       string
+	// DeletingBy and DeletingSince tell who moved the record to deleting and
+	// when, so that another writer doesn't race the owner of the deletion.
+	DeletingBy    string
+	DeletingSince time.Time
 }
 
 // Chain returns the chain key hash of the record.
@@ -213,6 +222,10 @@ func (r *Record) WriteTo(cm *corev1api.ConfigMap) {
 	set(keyReason, r.Reason)
 	set(keyRotatedByDataUpload, r.RotatedByDataUpload)
 	set(keyRotatedByBackup, r.RotatedByBackup)
+	set(keyDeletingBy, r.DeletingBy)
+	if !r.DeletingSince.IsZero() {
+		data[keyDeletingSince] = r.DeletingSince.UTC().Format(time.RFC3339)
+	}
 	if !r.RepoSnapshotStartTime.IsZero() {
 		data[keyRepoSnapshotStartTime] = r.RepoSnapshotStartTime.UTC().Format(time.RFC3339Nano)
 	}
@@ -257,6 +270,12 @@ func FromConfigMap(cm *corev1api.ConfigMap) (*Record, error) {
 		Reason:                d[keyReason],
 		RotatedByDataUpload:   d[keyRotatedByDataUpload],
 		RotatedByBackup:       d[keyRotatedByBackup],
+		DeletingBy:            d[keyDeletingBy],
+	}
+	if v := d[keyDeletingSince]; v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			r.DeletingSince = t
+		}
 	}
 	if r.State == "" {
 		r.State = StateRetained
@@ -332,6 +351,10 @@ func update(ctx context.Context, c crclient.Client, cm *corev1api.ConfigMap, r *
 		if apierrors.IsConflict(err) {
 			return ErrConflict
 		}
+		if apierrors.IsNotFound(err) {
+			// Removed by the owner of the deletion, e.g. backup deletion.
+			return ErrGone
+		}
 		return errors.Wrapf(err, "error updating retained snapshot record %s", cm.Name)
 	}
 	*cm = *updated
@@ -353,6 +376,8 @@ type DeleteOptions struct {
 	RotatedByBackup     string
 	// Now returns the current time.
 	Now func() time.Time
+	// Owner names the writer, recorded when it moves the record to deleting.
+	Owner string
 }
 
 // DeleteSnapshot deletes the snapshot of a record. cm must be read from the API
@@ -381,6 +406,8 @@ func DeleteSnapshot(ctx context.Context, c crclient.Client, apiClient crclient.C
 		r.Reason = opts.Reason
 		r.RotatedByDataUpload = opts.RotatedByDataUpload
 		r.RotatedByBackup = opts.RotatedByBackup
+		r.DeletingBy = opts.Owner
+		r.DeletingSince = opts.Now()
 		if err := update(ctx, c, cm, r); err != nil {
 			return err
 		}
