@@ -113,6 +113,12 @@ Even in environments where CSI Changed Block Tracking (CBT) is unavailable (e.g.
     - Linux cluster nodes: Block data mover pods mount raw block devices. In heterogeneous clusters with both Linux and Windows nodes, block data mover pods must run on Linux nodes. (Windows workloads backed by block storage can still be protected and restored from Linux nodes).
     - CBT Service Account (if required): If the CSI SnapshotMetadataService requires authentication via a specific ServiceAccount, configure `csiSnapshotMetadataServiceConfigs` in the `node-agent-config` ConfigMap.
 
+### VolumeSnapshotClass
+
+Use a `VolumeSnapshotClass` with `deletionPolicy: Delete` for Velero built-in data movers (`velero-fs` and `velero-block`). After successful data movement, Velero deletes the underlying snapshot regardless of the SnapshotClass deletion policy. Setting `deletionPolicy: Retain` does not preserve the snapshot after a successful backup.  
+
+Velero first creates a `VolumeSnapshot` in the workload namespace, then creates a static `VolumeSnapshot` and `VolumeSnapshotContent` in the Velero namespace referencing the same underlying snapshot.  
+If you use `deletionPolicy: Retain` and the operation fails or is canceled before the handoff completes, the source `VolumeSnapshotContent` and underlying snapshot may remain. These resources require manual cleanup.  
 
 ### Install Velero Node Agent
 
