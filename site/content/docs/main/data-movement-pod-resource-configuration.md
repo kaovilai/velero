@@ -78,16 +78,24 @@ If you set `memoryLimit`, also set the upload concurrency for the backup or sche
 
 For the block data mover, memory usage also grows with the provisioned size of the volume, so large volumes need more memory at any concurrency.
 
-The following results are from one environment and are only an example: incremental backup with the block data mover of a 100Gi Ceph RBD volume with 4 GiB of new data, on a 96-CPU node, with `memoryLimit: 1Gi`. The concurrency was the default (`GOMAXPROCS`), changed by setting a CPU limit on the data mover pod.
+The following results are from one environment and are only an example:
+- 96-CPU nodes, so the default concurrency is 96.
+- Backup storage: in-cluster S3-compatible object storage whose measured write bandwidth is about 130 MiB/s (limited by its disks; the network between nodes measured 24 Gbit/s, so the network is not the limit).
+- Incremental backup with the block data mover of a 100 GiB block volume with 2 GiB of data to upload, no memory limit on the data mover pod, median of three runs.
 
-| Concurrency | Peak memory | Result | Duration |
-|---|---|---|---|
-| 96 (no CPU limit) | over 900 MiB | OOM killed | - |
-| 16 | 928 MiB | Completed | 43 s |
-| 8 | 690 MiB | Completed | 43 s |
-| 2 | 384 MiB | Completed | 44 s |
+| `--parallel-blocks-upload` | Throughput | Peak memory |
+|---|---|---|
+| 1 | 70 MiB/s | 315 MiB |
+| 2 | 131 MiB/s | 330 MiB |
+| 4 | 131 MiB/s | 437 MiB |
+| 8 | 130 MiB/s | 639 MiB |
+| 16 | 131 MiB/s | 800 MiB |
+| 32 | 131 MiB/s | 981 MiB |
+| not set (96) | 131 MiB/s | 1017 MiB |
 
-In this environment, throughput did not improve above a concurrency of 2, probably because it was limited by the network bandwidth to the backup storage (an in-cluster object store), not by CPU or concurrency. With more network bandwidth, the same CPU setup and a higher concurrency can reach a higher throughput, at the cost of more memory. Run your own tests to find the right values for your network, data and backup storage.
+With about 130 MiB/s of bandwidth to the backup storage, throughput stops improving above a concurrency of 2, since one upload stream reaches about 70 MiB/s and two already fill the bandwidth. The default of 96 on this node gives the same throughput but uses about 1 GiB of memory, three times as much as 2 (330 MiB) and more than twice as much as 4 (437 MiB). With `memoryLimit: 1Gi`, a backup at the default concurrency was OOM killed when 4 GiB had changed. In this environment, set `--parallel-blocks-upload` to 2, or 4 for some headroom: the same speed with less than half the memory.
+
+To pick a starting value for your environment, divide the bandwidth to your backup storage by the throughput of a single upload stream (a backup with `--parallel-blocks-upload 1`), round up and add some headroom. With more bandwidth, for example remote object storage with high throughput but high latency per request, the value is higher and a higher concurrency increases the throughput, at the cost of more memory.
 
 For restores, [`--parallel-files-download`][8] sets the concurrency of the file system data mover in the same way. The block data mover has no restore concurrency setting.
 
