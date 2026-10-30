@@ -1,1 +1,0 @@
-Add FailBlock hook error mode so a failed backup pre hook skips the whole ItemBlock
