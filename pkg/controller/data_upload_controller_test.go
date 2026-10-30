@@ -1072,9 +1072,13 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 			if test.recordErr {
 				r.client = &failRecordClient{Client: r.client}
 			}
-			// Record what the DataUpload says when the cleanup deletes the backup VSC.
+			// Record what the DataUpload says when the cleanup deletes the backup VS,
+			// which deletes the backup VSC with it.
 			var recordedAtCleanup *velerov2alpha1api.RetainedSnapshot
-			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("delete", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("delete", "volumesnapshots", func(action clientTesting.Action) (bool, runtime.Object, error) {
+				if action.(clientTesting.DeleteAction).GetName() != dataUploadName {
+					return false, nil, nil
+				}
 				current := &velerov2alpha1api.DataUpload{}
 				if err := r.client.Get(ctx, types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, current); err == nil {
 					recordedAtCleanup = current.Status.RetainedSnapshot
@@ -1105,8 +1109,8 @@ func TestOnDataUploadCompletedRetainedSnapshot(t *testing.T) {
 			}
 			assert.Equal(t, test.wantReleased, released)
 
-			// The backup VSC is still cleaned up after its snapshot info is recorded.
-			_, err = r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, dataUploadName, metav1.GetOptions{})
+			// The backup VS is still cleaned up after its snapshot info is recorded.
+			_, err = r.csiSnapshotClient.VolumeSnapshots(du.Namespace).Get(ctx, dataUploadName, metav1.GetOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 		})
 	}
@@ -1179,27 +1183,25 @@ func TestDataUploadNotCompletedReleasesRetainedSnapshot(t *testing.T) {
 
 			tc.finish(ctx, r, du)
 
-			// The deletionPolicy of the backup VSC must be Delete before the
-			// cleanup deletes the VSC, so that the CSI driver deletes the snapshot.
+			// The deletionPolicy of the backup VSC must be Delete before the cleanup
+			// deletes the backup VS, so that the CSI driver deletes the snapshot.
 			var released, deleted, patches int
 			for i, action := range r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).Actions() {
-				if action.GetResource().Resource != "volumesnapshotcontents" {
-					continue
-				}
 				switch a := action.(type) {
 				case clientTesting.PatchAction:
-					if a.GetName() == dataUploadName && strings.Contains(string(a.GetPatch()), `"deletionPolicy":"Delete"`) {
+					if a.GetResource().Resource == "volumesnapshotcontents" && a.GetName() == dataUploadName &&
+						strings.Contains(string(a.GetPatch()), `"deletionPolicy":"Delete"`) {
 						released = i
 						patches++
 					}
 				case clientTesting.DeleteAction:
-					if a.GetName() == dataUploadName {
+					if a.GetResource().Resource == "volumesnapshots" && a.GetName() == dataUploadName {
 						deleted = i
 					}
 				}
 			}
 			require.NotZero(t, released, "backup VSC deletion policy was not changed to Delete")
-			require.NotZero(t, deleted, "backup VSC was not deleted")
+			require.NotZero(t, deleted, "backup VS was not deleted")
 			assert.Less(t, released, deleted)
 			// Transient errors are retried until the patch succeeds.
 			assert.Equal(t, tc.patchErrs+1, patches)
