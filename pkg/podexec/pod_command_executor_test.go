@@ -20,26 +20,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	kscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	restfake "k8s.io/client-go/rest/fake"
 	"k8s.io/client-go/tools/remotecommand"
 
 	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -269,7 +263,7 @@ func TestEnsureContainerExists(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestPodCompeted(t *testing.T) {
+func TestPodCompleted(t *testing.T) {
 	pod := &corev1api.Pod{
 		Spec: corev1api.PodSpec{
 			Containers: []corev1api.Container{
@@ -300,174 +294,50 @@ func TestPodCompeted(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestExecutePodCommandRecheckPod(t *testing.T) {
-	now := metav1.Now()
-
+func TestPodNotRunning(t *testing.T) {
 	tests := []struct {
-		name       string
-		currentPod *corev1api.Pod
-		getErr     error
-		expectExec bool
-		expectLog  string
+		phase     corev1api.PodPhase
+		expectErr string
 	}{
-		{
-			name:       "pod is still running",
-			currentPod: &corev1api.Pod{Status: corev1api.PodStatus{Phase: corev1api.PodRunning}},
-			expectExec: true,
-		},
-		{
-			name:      "pod no longer exists",
-			getErr:    apierrors.NewNotFound(corev1api.Resource("pods"), "name"),
-			expectLog: "Skipping exec hook, pod no longer exists since it was collected for backup",
-		},
-		{
-			name:       "pod is being deleted",
-			currentPod: &corev1api.Pod{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &now}, Status: corev1api.PodStatus{Phase: corev1api.PodRunning}},
-			expectLog:  "Skipping exec hook, pod is being deleted since it was collected for backup",
-		},
-		{
-			name:       "pod succeeded after migration",
-			currentPod: &corev1api.Pod{Status: corev1api.PodStatus{Phase: corev1api.PodSucceeded}},
-			expectLog:  "Skipping exec hook, pod entered phase Succeeded since it was collected for backup",
-		},
-		{
-			name:       "pod failed",
-			currentPod: &corev1api.Pod{Status: corev1api.PodStatus{Phase: corev1api.PodFailed}},
-			expectLog:  "Skipping exec hook, pod entered phase Failed since it was collected for backup",
-		},
-		{
-			name:       "error getting pod runs the hook anyway",
-			getErr:     errors.New("fake-get-error"),
-			expectExec: true,
-			expectLog:  "Failed to get the current pod before running exec hook, running the hook anyway",
-		},
+		{phase: corev1api.PodPending, expectErr: "Pod phase is Pending"},
+		{phase: corev1api.PodFailed, expectErr: "Pod phase is Failed"},
+		{phase: corev1api.PodSucceeded},
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			// the collected copy of the pod is still running
-			pod, err := velerotest.GetAsMap(`
-{
-	"metadata": {
-		"namespace": "namespace",
-		"name": "name"
-	},
-	"spec": {
-		"containers": [
-			{"name": "compute"}
-		]
-	},
-	"status": {
-		"phase": "Running"
-	}
-}`)
+		t.Run(string(test.phase), func(t *testing.T) {
+			pod := &corev1api.Pod{
+				Spec: corev1api.PodSpec{
+					Containers: []corev1api.Container{
+						{
+							Name: "foo",
+						},
+					},
+				},
+				Status: corev1api.PodStatus{
+					Phase: test.phase,
+				},
+			}
+
+			obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pod)
 			require.NoError(t, err)
 
 			clientConfig := &rest.Config{}
 			poster := &mockPoster{}
 			defer poster.AssertExpectations(t)
 			podCommandExecutor := NewPodCommandExecutor(clientConfig, poster).(*defaultPodCommandExecutor)
-			podCommandExecutor.getPod = func(_ context.Context, namespace, name string) (*corev1api.Pod, error) {
-				assert.Equal(t, "namespace", namespace)
-				assert.Equal(t, "name", name)
-				return test.currentPod, test.getErr
-			}
-
-			streamExecutorFactory := &mockStreamExecutorFactory{}
-			defer streamExecutorFactory.AssertExpectations(t)
-			podCommandExecutor.streamExecutorFactory = streamExecutorFactory
-
-			if test.expectExec {
-				baseURL, _ := url.Parse("https://some.server")
-				contentConfig := rest.ClientContentConfig{
-					GroupVersion: schema.GroupVersion{Group: "", Version: "v1"},
-				}
-				poster.On("Post").Return(rest.NewRequestWithClient(baseURL, "/api/v1", contentConfig, nil))
-
-				streamExecutor := &mockStreamExecutor{}
-				defer streamExecutor.AssertExpectations(t)
-				streamExecutorFactory.On("NewSPDYExecutor", clientConfig, "POST", mock.Anything).Return(streamExecutor, nil)
-				streamExecutor.On("StreamWithContext", mock.Anything, mock.Anything).Return(nil)
-			}
-
-			logger, logHook := logrustest.NewNullLogger()
 
 			hook := v1.ExecHook{
-				Container: "compute",
-				Command:   []string{"/usr/bin/virt-freezer", "--freeze"},
+				Container: "foo",
+				Command:   []string{"some", "command"},
 			}
 
-			err = podCommandExecutor.ExecutePodCommand(logger, pod, "namespace", "name", "hookName", &hook)
-			require.NoError(t, err)
-
-			if test.expectLog != "" {
-				found := false
-				for _, entry := range logHook.AllEntries() {
-					if entry.Message == test.expectLog {
-						found = true
-						break
-					}
-				}
-				assert.True(t, found, "expected log %q not found", test.expectLog)
+			err = podCommandExecutor.ExecutePodCommand(velerotest.NewLogger(), obj, "namespace", "name", "hookName", &hook)
+			if test.expectErr != "" {
+				require.EqualError(t, err, test.expectErr)
+			} else {
+				require.NoError(t, err)
 			}
-		})
-	}
-}
-
-func TestNewPodCommandExecutorGetPod(t *testing.T) {
-	tests := []struct {
-		name           string
-		status         int
-		body           runtime.Object
-		expectPhase    corev1api.PodPhase
-		expectNotFound bool
-	}{
-		{
-			name:        "pod is returned",
-			status:      http.StatusOK,
-			body:        &corev1api.Pod{TypeMeta: metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"}, ObjectMeta: metav1.ObjectMeta{Namespace: "namespace", Name: "name"}, Status: corev1api.PodStatus{Phase: corev1api.PodSucceeded}},
-			expectPhase: corev1api.PodSucceeded,
-		},
-		{
-			name:           "pod is not found",
-			status:         http.StatusNotFound,
-			body:           &apierrors.NewNotFound(corev1api.Resource("pods"), "name").ErrStatus,
-			expectNotFound: true,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			codec := kscheme.Codecs.LegacyCodec(corev1api.SchemeGroupVersion)
-			client := &restfake.RESTClient{
-				NegotiatedSerializer: kscheme.Codecs.WithoutConversion(),
-				GroupVersion:         corev1api.SchemeGroupVersion,
-				Client: restfake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
-					assert.Equal(t, http.MethodGet, req.Method)
-					assert.Equal(t, "/namespaces/namespace/pods/name", req.URL.Path)
-
-					body, err := runtime.Encode(codec, test.body)
-					require.NoError(t, err)
-
-					return &http.Response{
-						StatusCode: test.status,
-						Header:     http.Header{"Content-Type": []string{runtime.ContentTypeJSON}},
-						Body:       io.NopCloser(bytes.NewReader(body)),
-					}, nil
-				}),
-			}
-
-			pce := NewPodCommandExecutor(&rest.Config{}, client).(*defaultPodCommandExecutor)
-			require.NotNil(t, pce.getPod)
-
-			pod, err := pce.getPod(t.Context(), "namespace", "name")
-			if test.expectNotFound {
-				assert.True(t, apierrors.IsNotFound(err))
-				return
-			}
-
-			require.NoError(t, err)
-			assert.Equal(t, test.expectPhase, pod.Status.Phase)
 		})
 	}
 }
