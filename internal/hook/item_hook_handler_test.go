@@ -391,6 +391,77 @@ func TestHandleHooks(t *testing.T) {
 			expectedError:        nil,
 		},
 		{
+			name:          "pod, annotation (pre), no onError = FailBlock",
+			phase:         PhasePre,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"annotations": {
+					"pre.hook.backup.velero.io/container": "c",
+					"pre.hook.backup.velero.io/command": "/bin/ls"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "c",
+				Command:   []string{"/bin/ls"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+			expectedError:        errors.New("pre hook failed with FailBlock error mode: pod hook error"),
+		},
+		{
+			name:          "pod, annotation (legacy), no onError = FailBlock",
+			phase:         PhasePre,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"annotations": {
+					"hook.backup.velero.io/container": "c",
+					"hook.backup.velero.io/command": "/bin/ls"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "c",
+				Command:   []string{"/bin/ls"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+			expectedError:        errors.New("pre hook failed with FailBlock error mode: pod hook error"),
+		},
+		{
+			name:          "pod, annotation (post), no onError = return nil",
+			phase:         PhasePost,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"annotations": {
+					"post.hook.backup.velero.io/container": "c",
+					"post.hook.backup.velero.io/command": "/bin/ls"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "c",
+				Command:   []string{"/bin/ls"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+		},
+		{
 			name:          "pod, spec, onError=fail = don't run other hooks",
 			phase:         PhasePre,
 			groupResource: "pods",

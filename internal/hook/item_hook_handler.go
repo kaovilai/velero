@@ -89,6 +89,17 @@ func hookFailureError(err error, mode velerov1api.HookErrorMode) error {
 	}
 }
 
+// annotationHookErrorMode returns the error mode of a hook from the pod annotations. A pre hook without
+// an on-error annotation defaults to FailBlock, so the items of the pod's ItemBlock (e.g. its PVCs) are not
+// backed up when the hook that should quiesce them failed.
+func annotationHookErrorMode(mode velerov1api.HookErrorMode, phase HookPhase) velerov1api.HookErrorMode {
+	if mode == "" && phase == PhasePre {
+		return velerov1api.HookErrorModeFailBlock
+	}
+
+	return mode
+}
+
 // ItemHookHandler invokes hooks for an item.
 type ItemHookHandler interface {
 	// HandleHooks invokes hooks for an item. If the item is a pod and the appropriate annotations exist
@@ -264,7 +275,7 @@ func (h *DefaultItemHookHandler) HandleHooks(
 		}
 
 		if errExec != nil {
-			return hookFailureError(errExec, hookFromAnnotations.OnError)
+			return hookFailureError(errExec, annotationHookErrorMode(hookFromAnnotations.OnError, phase))
 		}
 
 		return nil
