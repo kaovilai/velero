@@ -125,7 +125,7 @@ func (e *defaultPodCommandExecutor) ExecutePodCommand(log logrus.FieldLogger, it
 	}
 
 	switch localHook.OnError {
-	case api.HookErrorModeFail, api.HookErrorModeContinue, api.HookErrorModeFailBlock:
+	case api.HookErrorModeFail, api.HookErrorModeContinue:
 		// use the specified value
 	default:
 		// default to fail
