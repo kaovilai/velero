@@ -391,6 +391,139 @@ func TestHandleHooks(t *testing.T) {
 			expectedError:        nil,
 		},
 		{
+			name:          "pod, virt-launcher freeze pre hook, no onError = FailBlock",
+			phase:         PhasePre,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"labels": {
+					"kubevirt.io": "virt-launcher"
+				},
+				"annotations": {
+					"pre.hook.backup.velero.io/container": "compute",
+					"pre.hook.backup.velero.io/command": "/usr/bin/virt-freezer"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "compute",
+				Command:   []string{"/usr/bin/virt-freezer"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+			expectedError:        errors.New("pre hook failed with FailBlock error mode: pod hook error"),
+		},
+		{
+			name:          "pod, virt-launcher freeze pre hook, onError=continue = return nil",
+			phase:         PhasePre,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"labels": {
+					"kubevirt.io": "virt-launcher"
+				},
+				"annotations": {
+					"pre.hook.backup.velero.io/container": "compute",
+					"pre.hook.backup.velero.io/command": "/usr/bin/virt-freezer",
+					"pre.hook.backup.velero.io/on-error": "Continue"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "compute",
+				Command:   []string{"/usr/bin/virt-freezer"},
+				OnError:   velerov1api.HookErrorModeContinue,
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+		},
+		{
+			name:          "pod, virt-launcher unfreeze post hook, no onError = return nil",
+			phase:         PhasePost,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"labels": {
+					"kubevirt.io": "virt-launcher"
+				},
+				"annotations": {
+					"post.hook.backup.velero.io/container": "compute",
+					"post.hook.backup.velero.io/command": "/usr/bin/virt-freezer"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "compute",
+				Command:   []string{"/usr/bin/virt-freezer"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+		},
+		{
+			name:          "pod, virt-launcher pre hook in another container, no onError = return nil",
+			phase:         PhasePre,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"labels": {
+					"kubevirt.io": "virt-launcher"
+				},
+				"annotations": {
+					"pre.hook.backup.velero.io/container": "other",
+					"pre.hook.backup.velero.io/command": "/bin/ls"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "other",
+				Command:   []string{"/bin/ls"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+		},
+		{
+			name:          "pod, not virt-launcher, compute container pre hook, no onError = return nil",
+			phase:         PhasePre,
+			groupResource: "pods",
+			item: velerotest.UnstructuredOrDie(`
+		{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"metadata": {
+				"namespace": "ns",
+				"name": "name",
+				"labels": {
+					"app": "foo"
+				},
+				"annotations": {
+					"pre.hook.backup.velero.io/container": "compute",
+					"pre.hook.backup.velero.io/command": "/bin/ls"
+				}
+			}
+		}`),
+			expectedPodHook: &velerov1api.ExecHook{
+				Container: "compute",
+				Command:   []string{"/bin/ls"},
+			},
+			expectedPodHookError: errors.New("pod hook error"),
+		},
+		{
 			name:          "pod, spec, onError=fail = don't run other hooks",
 			phase:         PhasePre,
 			groupResource: "pods",
