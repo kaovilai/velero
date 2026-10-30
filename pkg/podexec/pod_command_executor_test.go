@@ -308,6 +308,7 @@ func TestExecutePodCommandRecheckPod(t *testing.T) {
 		currentPod *corev1api.Pod
 		getErr     error
 		expectExec bool
+		expectErr  string
 		expectLog  string
 	}{
 		{
@@ -318,22 +319,22 @@ func TestExecutePodCommandRecheckPod(t *testing.T) {
 		{
 			name:      "pod no longer exists",
 			getErr:    apierrors.NewNotFound(corev1api.Resource("pods"), "name"),
-			expectLog: "Skipping exec hook, pod no longer exists since it was collected for backup",
+			expectErr: "exec hook not run, pod no longer exists since it was collected for backup",
 		},
 		{
 			name:       "pod is being deleted",
 			currentPod: &corev1api.Pod{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &now}, Status: corev1api.PodStatus{Phase: corev1api.PodRunning}},
-			expectLog:  "Skipping exec hook, pod is being deleted since it was collected for backup",
+			expectErr:  "exec hook not run, pod is being deleted since it was collected for backup",
 		},
 		{
 			name:       "pod succeeded after migration",
 			currentPod: &corev1api.Pod{Status: corev1api.PodStatus{Phase: corev1api.PodSucceeded}},
-			expectLog:  "Skipping exec hook, pod entered phase Succeeded since it was collected for backup",
+			expectErr:  "exec hook not run, pod entered phase Succeeded since it was collected for backup",
 		},
 		{
 			name:       "pod failed",
 			currentPod: &corev1api.Pod{Status: corev1api.PodStatus{Phase: corev1api.PodFailed}},
-			expectLog:  "Skipping exec hook, pod entered phase Failed since it was collected for backup",
+			expectErr:  "exec hook not run, pod entered phase Failed since it was collected for backup",
 		},
 		{
 			name:       "error getting pod runs the hook anyway",
@@ -398,7 +399,11 @@ func TestExecutePodCommandRecheckPod(t *testing.T) {
 			}
 
 			err = podCommandExecutor.ExecutePodCommand(logger, pod, "namespace", "name", "hookName", &hook)
-			require.NoError(t, err)
+			if test.expectErr != "" {
+				require.EqualError(t, err, test.expectErr)
+			} else {
+				require.NoError(t, err)
+			}
 
 			if test.expectLog != "" {
 				found := false
