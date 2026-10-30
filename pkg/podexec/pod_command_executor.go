@@ -26,6 +26,7 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -59,6 +60,9 @@ type defaultPodCommandExecutor struct {
 
 	// getPod returns the current state of the pod; nil means the pod is not re-checked before the exec
 	getPod func(ctx context.Context, namespace, name string) (*corev1api.Pod, error)
+
+	// listPods lists the pods matching the label selector; nil means a replaced virt-launcher pod is not looked up
+	listPods func(ctx context.Context, namespace, labelSelector string) (*corev1api.PodList, error)
 }
 
 // NewPodCommandExecutor creates a new PodCommandExecutor.
@@ -78,6 +82,17 @@ func NewPodCommandExecutor(restClientConfig *rest.Config, restClient poster) Pod
 			}
 
 			return pod, nil
+		}
+
+		e.listPods = func(ctx context.Context, namespace, labelSelector string) (*corev1api.PodList, error) {
+			pods := new(corev1api.PodList)
+			if err := g.Get().Resource("pods").Namespace(namespace).
+				VersionedParams(&metav1.ListOptions{LabelSelector: labelSelector}, kscheme.ParameterCodec).
+				Do(ctx).Into(pods); err != nil {
+				return nil, err
+			}
+
+			return pods, nil
 		}
 	}
 
@@ -155,8 +170,17 @@ func (e *defaultPodCommandExecutor) ExecutePodCommand(log logrus.FieldLogger, it
 	// replaced since then, e.g., the source virt-launcher pod after a VM live migration. Running the hook on
 	// it fails with "container not found", so re-check the pod right before the exec.
 	if skip, reason := e.podGoneSinceCollected(namespace, name, hookLog); skip {
-		hookLog.Warnf("Skipping exec hook, %s since it was collected for backup", reason)
-		return nil
+		// A KubeVirt VM keeps running in a new virt-launcher pod after a live migration, and the hooks of the
+		// old pod (freeze/unfreeze of the guest) are meant for the VM, so run them in the pod running it now.
+		live := e.liveLauncherPod(namespace, pod, hookLog)
+		if live == "" {
+			hookLog.Warnf("Skipping exec hook, %s since it was collected for backup", reason)
+			return nil
+		}
+
+		hookLog.Warnf("Running exec hook in virt-launcher pod %s instead, pod %s: %s since it was collected for backup", live, name, reason)
+		name = live
+		hookLog = hookLog.WithField("hookPod", live)
 	}
 
 	hookLog.Info("running exec hook")
@@ -238,6 +262,56 @@ func (e *defaultPodCommandExecutor) podGoneSinceCollected(namespace, name string
 	}
 
 	return false, ""
+}
+
+const (
+	kubevirtLauncherLabelKey    = "kubevirt.io"
+	kubevirtLauncherLabelValue  = "virt-launcher"
+	kubevirtCreatedByLabelKey   = "kubevirt.io/created-by"
+	kubevirtDomainAnnotationKey = "kubevirt.io/domain"
+)
+
+// liveLauncherPod returns the name of the virt-launcher pod currently running the VM of the passed
+// virt-launcher pod, i.e. a Running pod not being deleted, created for the same VMI and running the same
+// domain. While a migration is in progress both pods are Running and the older one (the migration source)
+// still runs the domain, so the oldest pod wins. An empty name is returned for any other pod, or if no such
+// pod exists (e.g. the VM was stopped).
+func (e *defaultPodCommandExecutor) liveLauncherPod(namespace string, collected *corev1api.Pod, log logrus.FieldLogger) string {
+	if e.listPods == nil || collected.Labels[kubevirtLauncherLabelKey] != kubevirtLauncherLabelValue {
+		return ""
+	}
+
+	vmiUID, domain := collected.Labels[kubevirtCreatedByLabelKey], collected.Annotations[kubevirtDomainAnnotationKey]
+	if vmiUID == "" || domain == "" {
+		return ""
+	}
+
+	pods, err := e.listPods(context.Background(), namespace,
+		kubevirtLauncherLabelKey+"="+kubevirtLauncherLabelValue+","+kubevirtCreatedByLabelKey+"="+vmiUID)
+	if err != nil {
+		log.WithError(err).Warn("Failed to list the virt-launcher pods of the VM")
+		return ""
+	}
+
+	var live *corev1api.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Name == collected.Name || pod.Annotations[kubevirtDomainAnnotationKey] != domain ||
+			pod.DeletionTimestamp != nil || pod.Status.Phase != corev1api.PodRunning {
+			continue
+		}
+
+		if live == nil || pod.CreationTimestamp.Before(&live.CreationTimestamp) ||
+			(pod.CreationTimestamp.Equal(&live.CreationTimestamp) && pod.Name < live.Name) {
+			live = pod
+		}
+	}
+
+	if live == nil {
+		return ""
+	}
+
+	return live.Name
 }
 
 func ensureContainerExists(pod *corev1api.Pod, container string) error {

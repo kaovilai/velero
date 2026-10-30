@@ -472,6 +472,195 @@ func TestNewPodCommandExecutorGetPod(t *testing.T) {
 	}
 }
 
+func TestExecutePodCommandRedirectLauncherPod(t *testing.T) {
+	older := metav1.NewTime(time.Date(2026, 1, 1, 15, 0, 0, 0, time.UTC))
+	newer := metav1.NewTime(time.Date(2026, 1, 1, 15, 30, 0, 0, time.UTC))
+	now := metav1.Now()
+
+	launcherPod := func(name, vmiUID, domain string, phase corev1api.PodPhase, created metav1.Time) corev1api.Pod {
+		return corev1api.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         "namespace",
+				Name:              name,
+				CreationTimestamp: created,
+				Labels:            map[string]string{"kubevirt.io": "virt-launcher", "kubevirt.io/created-by": vmiUID},
+				Annotations:       map[string]string{"kubevirt.io/domain": domain},
+			},
+			Status: corev1api.PodStatus{Phase: phase},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		labels       string
+		pods         []corev1api.Pod
+		listErr      error
+		expectExecIn string
+		expectLog    string
+	}{
+		{
+			name:   "hook runs in the migration target pod",
+			labels: `"kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "vmi-uid"`,
+			pods: []corev1api.Pod{
+				launcherPod("name", "vmi-uid", "vm", corev1api.PodSucceeded, older),
+				launcherPod("target", "vmi-uid", "vm", corev1api.PodRunning, newer),
+			},
+			expectExecIn: "target",
+			expectLog:    "Running exec hook in virt-launcher pod target instead, pod name: pod entered phase Succeeded since it was collected for backup",
+		},
+		{
+			name:   "oldest running pod wins while a migration is in progress",
+			labels: `"kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "vmi-uid"`,
+			pods: []corev1api.Pod{
+				launcherPod("target-2", "vmi-uid", "vm", corev1api.PodRunning, newer),
+				launcherPod("target-1", "vmi-uid", "vm", corev1api.PodRunning, older),
+			},
+			expectExecIn: "target-1",
+		},
+		{
+			name:   "pods of another domain, being deleted or not running are ignored",
+			labels: `"kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "vmi-uid"`,
+			pods: func() []corev1api.Pod {
+				deleting := launcherPod("deleting", "vmi-uid", "vm", corev1api.PodRunning, older)
+				deleting.DeletionTimestamp = &now
+				return []corev1api.Pod{
+					launcherPod("other-domain", "vmi-uid", "other-vm", corev1api.PodRunning, older),
+					deleting,
+					launcherPod("pending", "vmi-uid", "vm", corev1api.PodPending, older),
+				}
+			}(),
+			expectLog: "Skipping exec hook, pod entered phase Succeeded since it was collected for backup",
+		},
+		{
+			name:      "no live launcher pod, e.g. the VM was stopped",
+			labels:    `"kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "vmi-uid"`,
+			expectLog: "Skipping exec hook, pod entered phase Succeeded since it was collected for backup",
+		},
+		{
+			name:      "listing the pods fails",
+			labels:    `"kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "vmi-uid"`,
+			listErr:   errors.New("fake-list-error"),
+			expectLog: "Failed to list the virt-launcher pods of the VM",
+		},
+		{
+			name:      "not a virt-launcher pod",
+			labels:    `"app": "foo"`,
+			pods:      []corev1api.Pod{launcherPod("target", "vmi-uid", "vm", corev1api.PodRunning, newer)},
+			expectLog: "Skipping exec hook, pod entered phase Succeeded since it was collected for backup",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// the collected copy of the pod is still running
+			pod, err := velerotest.GetAsMap(`
+{
+	"metadata": {
+		"namespace": "namespace",
+		"name": "name",
+		"labels": {` + test.labels + `},
+		"annotations": {"kubevirt.io/domain": "vm"}
+	},
+	"spec": {
+		"containers": [
+			{"name": "compute"}
+		]
+	},
+	"status": {
+		"phase": "Running"
+	}
+}`)
+			require.NoError(t, err)
+
+			clientConfig := &rest.Config{}
+			poster := &mockPoster{}
+			defer poster.AssertExpectations(t)
+			podCommandExecutor := NewPodCommandExecutor(clientConfig, poster).(*defaultPodCommandExecutor)
+			podCommandExecutor.getPod = func(_ context.Context, _, _ string) (*corev1api.Pod, error) {
+				return &corev1api.Pod{Status: corev1api.PodStatus{Phase: corev1api.PodSucceeded}}, nil
+			}
+			podCommandExecutor.listPods = func(_ context.Context, namespace, labelSelector string) (*corev1api.PodList, error) {
+				assert.Equal(t, "namespace", namespace)
+				assert.Equal(t, "kubevirt.io=virt-launcher,kubevirt.io/created-by=vmi-uid", labelSelector)
+				return &corev1api.PodList{Items: test.pods}, test.listErr
+			}
+
+			streamExecutorFactory := &mockStreamExecutorFactory{}
+			defer streamExecutorFactory.AssertExpectations(t)
+			podCommandExecutor.streamExecutorFactory = streamExecutorFactory
+
+			if test.expectExecIn != "" {
+				baseURL, _ := url.Parse("https://some.server")
+				contentConfig := rest.ClientContentConfig{
+					GroupVersion: schema.GroupVersion{Group: "", Version: "v1"},
+				}
+				poster.On("Post").Return(rest.NewRequestWithClient(baseURL, "/api/v1", contentConfig, nil))
+
+				streamExecutor := &mockStreamExecutor{}
+				defer streamExecutor.AssertExpectations(t)
+				streamExecutorFactory.On("NewSPDYExecutor", clientConfig, "POST", mock.MatchedBy(func(u *url.URL) bool {
+					return u.Path == "/api/v1/namespaces/namespace/pods/"+test.expectExecIn+"/exec"
+				})).Return(streamExecutor, nil)
+				streamExecutor.On("StreamWithContext", mock.Anything, mock.Anything).Return(nil)
+			}
+
+			logger, logHook := logrustest.NewNullLogger()
+
+			hook := v1.ExecHook{
+				Container: "compute",
+				Command:   []string{"/usr/bin/virt-freezer", "--freeze"},
+			}
+
+			err = podCommandExecutor.ExecutePodCommand(logger, pod, "namespace", "name", "hookName", &hook)
+			require.NoError(t, err)
+
+			if test.expectLog != "" {
+				found := false
+				for _, entry := range logHook.AllEntries() {
+					if entry.Message == test.expectLog {
+						found = true
+						break
+					}
+				}
+				assert.True(t, found, "expected log %q not found", test.expectLog)
+			}
+		})
+	}
+}
+
+func TestNewPodCommandExecutorListPods(t *testing.T) {
+	codec := kscheme.Codecs.LegacyCodec(corev1api.SchemeGroupVersion)
+	client := &restfake.RESTClient{
+		NegotiatedSerializer: kscheme.Codecs.WithoutConversion(),
+		GroupVersion:         corev1api.SchemeGroupVersion,
+		Client: restfake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+			assert.Equal(t, http.MethodGet, req.Method)
+			assert.Equal(t, "/namespaces/namespace/pods", req.URL.Path)
+			assert.Equal(t, "kubevirt.io=virt-launcher", req.URL.Query().Get("labelSelector"))
+
+			body, err := runtime.Encode(codec, &corev1api.PodList{
+				TypeMeta: metav1.TypeMeta{Kind: "PodList", APIVersion: "v1"},
+				Items:    []corev1api.Pod{{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace", Name: "target"}}},
+			})
+			require.NoError(t, err)
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{runtime.ContentTypeJSON}},
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		}),
+	}
+
+	pce := NewPodCommandExecutor(&rest.Config{}, client).(*defaultPodCommandExecutor)
+	require.NotNil(t, pce.listPods)
+
+	pods, err := pce.listPods(t.Context(), "namespace", "kubevirt.io=virt-launcher")
+	require.NoError(t, err)
+	require.Len(t, pods.Items, 1)
+	assert.Equal(t, "target", pods.Items[0].Name)
+}
+
 type mockStreamExecutorFactory struct {
 	mock.Mock
 }
