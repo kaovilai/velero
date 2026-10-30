@@ -365,14 +365,11 @@ func (ms *microServiceBRWatcher) startWatch() {
 			result := funcGetResultFromMessage(ms.taskType, terminateMessage, ms.log)
 			ms.callbacks.OnProgress(ms.ctx, ms.namespace, ms.taskName, getCompletionProgressFromResult(ms.taskType, result))
 			ms.callbacks.OnCompleted(ms.ctx, ms.namespace, ms.taskName, result)
-		} else if ms.completedFromEvent != nil {
+		} else if ms.completedFromEvent != nil && podDeleted {
 			// the data path already completed and reported its result before the pod went away, e.g., the pod was
-			// evicted after the completed event, so the result is taken from the event rather than the termination message
-			if podDeleted {
-				logger.Warnf("Data path pod %s was deleted in phase %s after the data path completed, completing %s task %s through the pod deletion path", lastPod.Name, lastPod.Status.Phase, ms.taskType, ms.taskName)
-			} else {
-				logger.Warnf("Data path pod %s is in phase %s after the data path completed, completing %s task %s with the result from the completed event", lastPod.Name, lastPod.Status.Phase, ms.taskType, ms.taskName)
-			}
+			// evicted after the completed event, so the result is taken from the event rather than the termination message.
+			// A pod that reached the Failed phase is still treated as a failure below, even after the completed event.
+			logger.Warnf("Data path pod %s was deleted in phase %s after the data path completed, completing %s task %s through the pod deletion path", lastPod.Name, lastPod.Status.Phase, ms.taskType, ms.taskName)
 
 			ms.callbacks.OnProgress(ms.ctx, ms.namespace, ms.taskName, getCompletionProgressFromResult(ms.taskType, *ms.completedFromEvent))
 			ms.callbacks.OnCompleted(ms.ctx, ms.namespace, ms.taskName, *ms.completedFromEvent)
@@ -384,6 +381,10 @@ func (ms *microServiceBRWatcher) startWatch() {
 			ms.callbacks.OnCancelled(ms.ctx, ms.namespace, ms.taskName)
 		} else {
 			err := errors.New(terminateMessage)
+			if ms.completedFromEvent != nil {
+				logger.Warnf("Data path pod %s is in phase %s after the data path completed, failing %s task %s and discarding the result from the completed event", lastPod.Name, lastPod.Status.Phase, ms.taskType, ms.taskName)
+			}
+
 			if podDeleted && terminateMessage == "" {
 				if ms.failedFromEvent != "" {
 					err = errors.Errorf("data path pod %s was deleted in phase %s, data path failed: %s", lastPod.Name, lastPod.Status.Phase, ms.failedFromEvent)
