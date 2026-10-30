@@ -153,10 +153,10 @@ func (e *defaultPodCommandExecutor) ExecutePodCommand(log logrus.FieldLogger, it
 
 	// The item may have been collected long before the hook runs, so the pod may have terminated or been
 	// replaced since then, e.g., the source virt-launcher pod after a VM live migration. Running the hook on
-	// it fails with "container not found", so re-check the pod right before the exec.
+	// it fails with "container not found", so re-check the pod right before the exec. The hook is not run, but
+	// it is still reported as a hook error so that a quiesce hook that could not run (e.g. a freeze) is visible.
 	if skip, reason := e.podGoneSinceCollected(namespace, name, hookLog); skip {
-		hookLog.Warnf("Skipping exec hook, %s since it was collected for backup", reason)
-		return nil
+		return errors.Errorf("exec hook not run, %s since it was collected for backup", reason)
 	}
 
 	hookLog.Info("running exec hook")
