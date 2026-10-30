@@ -461,15 +461,17 @@ func TestPVBReconcile(t *testing.T) {
 			expectCancelRecord: true,
 		},
 		{
-			name:           "release data path of pvb canceled by another node",
+			name:           "data path of pvb canceled by another node stays tracked without the final state release",
 			pvb:            pvbBuilder().Phase(velerov1api.PodVolumeBackupPhaseCanceled).Cancel(true).Finalizers([]string{PodVolumeFinalizer}).Node("test-node").Result(),
 			needCreateFSBR: true,
+			expectDataPath: true,
 			expected:       pvbBuilder().Phase(velerov1api.PodVolumeBackupPhaseCanceled).Cancel(true).Result(),
 		},
 		{
-			name:           "release data path of pvb in terminal state",
+			name:           "data path of pvb in terminal state stays tracked without the final state release",
 			pvb:            pvbBuilder().Phase(velerov1api.PodVolumeBackupPhaseFailed).Node("test-node").Result(),
 			needCreateFSBR: true,
+			expectDataPath: true,
 			expected:       pvbBuilder().Phase(velerov1api.PodVolumeBackupPhaseFailed).Result(),
 		},
 	}

@@ -936,17 +936,17 @@ func TestPodVolumeRestoreReconcile(t *testing.T) {
 			expectCancelRecord: true,
 		},
 		{
-			name:           "release data path of pvr canceled by another node",
+			name:           "data path of pvr canceled by another node stays tracked without the final state release",
 			pvr:            builder.ForPodVolumeRestore(velerov1api.DefaultNamespace, pvrName).Phase(velerov1api.PodVolumeRestorePhaseCanceled).Cancel(true).Finalizers([]string{PodVolumeFinalizer}).Node("test-node").Result(),
 			needCreateFSBR: true,
-			mockClose:      true,
+			expectDataPath: true,
 			expected:       builder.ForPodVolumeRestore(velerov1api.DefaultNamespace, pvrName).Phase(velerov1api.PodVolumeRestorePhaseCanceled).Cancel(true).Result(),
 		},
 		{
-			name:           "release data path of pvr in terminal state",
+			name:           "data path of pvr in terminal state stays tracked without the final state release",
 			pvr:            builder.ForPodVolumeRestore(velerov1api.DefaultNamespace, pvrName).Phase(velerov1api.PodVolumeRestorePhaseFailed).Node("test-node").Result(),
 			needCreateFSBR: true,
-			mockClose:      true,
+			expectDataPath: true,
 			expected:       builder.ForPodVolumeRestore(velerov1api.DefaultNamespace, pvrName).Phase(velerov1api.PodVolumeRestorePhaseFailed).Result(),
 		},
 	}

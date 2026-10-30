@@ -611,15 +611,17 @@ func TestReconcile(t *testing.T) {
 			expectCancelRecord: true,
 		},
 		{
-			name:           "release data path of du canceled by another node",
+			name:           "data path of du canceled by another node stays tracked without the final state release",
 			du:             dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseCanceled).Cancel(true).Finalizers([]string{DataUploadDownloadFinalizer}).Node("test-node").Result(),
 			needCreateFSBR: true,
+			expectDataPath: true,
 			expected:       dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseCanceled).Cancel(true).Result(),
 		},
 		{
-			name:           "release data path of du in terminal state",
+			name:           "data path of du in terminal state stays tracked without the final state release",
 			du:             dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseFailed).Node("test-node").Result(),
 			needCreateFSBR: true,
+			expectDataPath: true,
 			expected:       dataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseFailed).Result(),
 		},
 	}

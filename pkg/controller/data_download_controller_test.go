@@ -472,17 +472,17 @@ func TestDataDownloadReconcile(t *testing.T) {
 			expectCancelRecord: true,
 		},
 		{
-			name:           "release data path of dd canceled by another node",
+			name:           "data path of dd canceled by another node stays tracked without the final state release",
 			dd:             dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseCanceled).Cancel(true).Finalizers([]string{DataUploadDownloadFinalizer}).Node("test-node").Result(),
 			needCreateFSBR: true,
-			mockClose:      true,
+			expectDataPath: true,
 			expected:       dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseCanceled).Cancel(true).Result(),
 		},
 		{
-			name:           "release data path of dd in terminal state",
+			name:           "data path of dd in terminal state stays tracked without the final state release",
 			dd:             dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseFailed).Node("test-node").Result(),
 			needCreateFSBR: true,
-			mockClose:      true,
+			expectDataPath: true,
 			expected:       dataDownloadBuilder().Phase(velerov2alpha1api.DataDownloadPhaseFailed).Result(),
 		},
 		{
