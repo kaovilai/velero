@@ -89,6 +89,25 @@ func hookFailureError(err error, mode velerov1api.HookErrorMode) error {
 	}
 }
 
+const (
+	kubevirtLauncherLabelKey   = "kubevirt.io"
+	kubevirtLauncherLabelValue = "virt-launcher"
+	kubevirtComputeContainer   = "compute"
+)
+
+// annotationHookErrorMode returns the error mode of a hook from the pod annotations. The pre hook KubeVirt
+// sets on a virt-launcher pod freezes the guest file systems from the compute container; when it fails without
+// an on-error annotation, the VM disks would be snapshotted unfrozen, so it defaults to FailBlock and the
+// items of the pod's ItemBlock (the VM PVCs) are not backed up. Any other hook keeps its error mode.
+func annotationHookErrorMode(podLabels map[string]string, hook *velerov1api.ExecHook, phase HookPhase) velerov1api.HookErrorMode {
+	if hook.OnError == "" && phase == PhasePre &&
+		podLabels[kubevirtLauncherLabelKey] == kubevirtLauncherLabelValue && hook.Container == kubevirtComputeContainer {
+		return velerov1api.HookErrorModeFailBlock
+	}
+
+	return hook.OnError
+}
+
 // ItemHookHandler invokes hooks for an item.
 type ItemHookHandler interface {
 	// HandleHooks invokes hooks for an item. If the item is a pod and the appropriate annotations exist
@@ -264,7 +283,7 @@ func (h *DefaultItemHookHandler) HandleHooks(
 		}
 
 		if errExec != nil {
-			return hookFailureError(errExec, hookFromAnnotations.OnError)
+			return hookFailureError(errExec, annotationHookErrorMode(metadata.GetLabels(), hookFromAnnotations, phase))
 		}
 
 		return nil
