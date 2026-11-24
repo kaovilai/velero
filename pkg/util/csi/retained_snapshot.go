@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -63,9 +64,37 @@ const (
 // itself, and after a successful call (clearing the status). Only the call
 // itself is a stale-snapshot signal; the others are environment problems or
 // follow a successful delete and stay retryable.
+//
+// The message match is best effort: the strings come from external-snapshotter
+// and may change across versions. Nothing depends on a match succeeding. The
+// deletion timeout is the authoritative escalation signal -- an attempt that
+// reaches it counts toward the bound whether or not any message matched -- and
+// a matched call-failure message only shortens the time to escalate, by
+// counting the attempt as soon as the event appears. A matched credential
+// message likewise only shortens the time to the retryable failure. An unknown
+// message is treated as retryable and the wait runs on to the timeout; if the
+// message set changes in a later snapshotter release, nothing is lost except
+// that speed (design section 4).
 const (
 	snapshotDeleteCredentialFailureMessage = "Failed to get snapshot credentials" // #nosec G101
 	snapshotDeleteCallFailureMessage       = "Failed to delete snapshot"
+)
+
+// snapshotDeleteErrorKind classifies the latest SnapshotDeleteError event of a
+// temp content, best effort; see the message constants above.
+type snapshotDeleteErrorKind int
+
+const (
+	// snapshotDeleteErrorNone: no SnapshotDeleteError event was recorded.
+	snapshotDeleteErrorNone snapshotDeleteErrorKind = iota
+	// snapshotDeleteErrorCall: the DeleteSnapshot call itself failed.
+	snapshotDeleteErrorCall
+	// snapshotDeleteErrorCredential: the sidecar could not get the deletion
+	// credentials before the call.
+	snapshotDeleteErrorCredential
+	// snapshotDeleteErrorOther: a clear-status failure or a message this
+	// version does not know; retryable, the wait runs on to the timeout.
+	snapshotDeleteErrorOther
 )
 
 // RetainedSnapshotDeletionTimeout bounds the wait for the CSI snapshotter to
@@ -79,11 +108,14 @@ var RetainedSnapshotDeletionTimeout = 5 * time.Minute
 // the deletion of a temporary VolumeSnapshotContent is polled.
 const retainedSnapshotPollInterval = 2 * time.Second
 
-// SnapshotDeleteCallError reports that the CSI snapshotter's DeleteSnapshot
-// call itself failed for a retained snapshot, as opposed to a credential
-// failure before the call or a timeout. A stale record whose snapshot is
-// already gone can fail the deletion on every retry, so the caller escalates
-// after a bounded number of these instead of relying on driver compliance.
+// SnapshotDeleteCallError reports a counted DeleteSnapshot failure of a
+// retained snapshot: the sidecar reported that the call itself failed, or the
+// deletion reached RetainedSnapshotDeletionTimeout without the content going
+// away, which is the authoritative signal and counts whatever the sidecar did
+// or did not report. A credential failure before the call is not one. A stale
+// record whose snapshot is already gone can fail the deletion on every retry,
+// so the caller escalates after a bounded number of these instead of relying
+// on driver compliance.
 type SnapshotDeleteCallError struct {
 	Message string
 }
@@ -210,9 +242,13 @@ func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorag
 // After the deletion, it polls every two seconds without backoff until the
 // content disappears from the API, bounded by RetainedSnapshotDeletionTimeout.
 // On a failed DeleteSnapshot the sidecar emits a SnapshotDeleteError event and
-// does not write status.error, so the wait reports the event; a call failure
-// is returned as a *SnapshotDeleteCallError so the caller can count attempts
-// and escalate, while credential failures and timeouts stay retryable.
+// does not write status.error, so each poll also reads the content's events as
+// the fast path: a call-failure message returns a *SnapshotDeleteCallError at
+// once, so the caller counts the attempt without waiting out the timeout, and
+// a credential message returns the retryable failure at once. The timeout is
+// the authoritative signal: reaching it returns a *SnapshotDeleteCallError
+// whether or not any event matched, because the message match is best effort
+// and nothing may depend on it succeeding (design section 4).
 func DeleteRetainedSnapshot(
 	ctx context.Context,
 	crClient crclient.Client,
@@ -294,14 +330,35 @@ func DeleteRetainedSnapshot(
 		return errors.Wrapf(err, "error deleting temp VolumeSnapshotContent %s", tempVSC.Name)
 	}
 
+	// The fast path, best effort: the sidecar's latest SnapshotDeleteError
+	// event, when its message is one this version knows, ends the wait early.
+	// The result is only ever a shortcut to a verdict the timeout below would
+	// reach anyway, so a message set that changes in a later snapshotter
+	// release costs speed, never correctness.
+	var fastErr error
 	err = wait.PollUntilContextTimeout(ctx, retainedSnapshotPollInterval, RetainedSnapshotDeletionTimeout, true, func(ctx context.Context) (bool, error) {
 		err := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, &snapshotv1api.VolumeSnapshotContent{})
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}
-		return false, err
+		if err != nil {
+			return false, err
+		}
+		message, kind := latestSnapshotDeleteErrorMessage(ctx, reader, tempVSC.Name, log)
+		switch kind {
+		case snapshotDeleteErrorCall:
+			fastErr = &SnapshotDeleteCallError{Message: message}
+			return true, nil
+		case snapshotDeleteErrorCredential:
+			fastErr = errors.Errorf("CSI snapshotter failed on temp VolumeSnapshotContent %s: %s", tempVSC.Name, message)
+			return true, nil
+		}
+		return false, nil
 	})
 	if err == nil {
+		if fastErr != nil {
+			return fastErr
+		}
 		log.Infof("Deleted temp VolumeSnapshotContent %s, the CSI driver deleted snapshot %s", tempVSC.Name, record.CSISnapshotHandle)
 		return nil
 	}
@@ -309,15 +366,16 @@ func DeleteRetainedSnapshot(
 		return errors.Wrapf(err, "error waiting for temp VolumeSnapshotContent %s to be deleted", tempVSC.Name)
 	}
 
-	// The wait timed out: report the sidecar's failure if it recorded one.
-	if message, kind := latestSnapshotDeleteErrorMessage(ctx, reader, tempVSC.Name, log); message != "" {
-		if kind == snapshotDeleteCallFailureMessage {
-			return &SnapshotDeleteCallError{Message: message}
-		}
-		return errors.Errorf("CSI snapshotter failed on temp VolumeSnapshotContent %s: %s", tempVSC.Name, message)
-	}
-	return errors.Errorf("snapshot %s is not deleted within %v, temp VolumeSnapshotContent %s is still pending; check the events of the VolumeSnapshotContent and the CSI snapshotter logs",
+	// The timeout is the authoritative signal and counts toward the
+	// escalation bound whether or not the sidecar recorded a message this
+	// version recognizes. The latest event, when there is one, only adds
+	// detail to the error.
+	detail := fmt.Sprintf("snapshot %s is not deleted within %v, temp VolumeSnapshotContent %s is still pending; check the events of the VolumeSnapshotContent and the CSI snapshotter logs",
 		record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, tempVSC.Name)
+	if message, _ := latestSnapshotDeleteErrorMessage(ctx, reader, tempVSC.Name, log); message != "" {
+		detail += "; latest SnapshotDeleteError: " + message
+	}
+	return &SnapshotDeleteCallError{Message: detail}
 }
 
 // ReleaseTempVSC removes the bound-protection finalizer from the temp
@@ -374,16 +432,16 @@ func ReleaseTempVSC(
 
 // latestSnapshotDeleteErrorMessage returns the message of the latest
 // SnapshotDeleteError event recorded for the named VolumeSnapshotContent, and
-// whether the message belongs to the DeleteSnapshot call itself. Events of a
-// cluster-scoped object are recorded in the default namespace, which the
-// Velero manager's cache does not cover, so reads go through the API reader
-// when one is given. A failure to list the events only removes detail from a
-// pending deletion and is not an error.
-func latestSnapshotDeleteErrorMessage(ctx context.Context, reader crclient.Reader, vscName string, log logrus.FieldLogger) (message, kind string) {
+// its best-effort classification. Events of a cluster-scoped object are
+// recorded in the default namespace, which the Velero manager's cache does not
+// cover, so reads go through the API reader when one is given. A failure to
+// list the events only removes the fast path and detail from a pending
+// deletion and is not an error: the timeout decides without it.
+func latestSnapshotDeleteErrorMessage(ctx context.Context, reader crclient.Reader, vscName string, log logrus.FieldLogger) (message string, kind snapshotDeleteErrorKind) {
 	events := &corev1api.EventList{}
 	if err := reader.List(ctx, events, crclient.InNamespace(metav1.NamespaceDefault)); err != nil {
 		log.WithError(err).Warnf("Failed to list the events of VolumeSnapshotContent %s", vscName)
-		return "", ""
+		return "", snapshotDeleteErrorNone
 	}
 
 	var latest *corev1api.Event
@@ -398,15 +456,19 @@ func latestSnapshotDeleteErrorMessage(ctx context.Context, reader crclient.Reade
 		}
 	}
 	if latest == nil {
-		return "", ""
+		return "", snapshotDeleteErrorNone
 	}
 
 	// The matching is message-based and therefore snapshotter-version-sensitive;
-	// an unknown message is treated as retryable rather than a call failure.
-	if strings.Contains(latest.Message, snapshotDeleteCallFailureMessage) {
-		return latest.Message, snapshotDeleteCallFailureMessage
+	// an unknown message is treated as retryable rather than a call failure,
+	// and the timeout, not this match, is what finally counts the attempt.
+	switch {
+	case strings.Contains(latest.Message, snapshotDeleteCallFailureMessage):
+		return latest.Message, snapshotDeleteErrorCall
+	case strings.Contains(latest.Message, snapshotDeleteCredentialFailureMessage):
+		return latest.Message, snapshotDeleteErrorCredential
 	}
-	return latest.Message, "other"
+	return latest.Message, snapshotDeleteErrorOther
 }
 
 // PatchVSCDeletionPolicy patches the deletion policy of the named

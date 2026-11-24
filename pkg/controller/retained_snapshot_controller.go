@@ -316,10 +316,14 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 
 	var callErr *csi.SnapshotDeleteCallError
 	if errors.As(err, &callErr) {
-		// Only a failure of the DeleteSnapshot call itself is a stale-snapshot
-		// signal: the sidecar emits the same reason for credential failures,
-		// which are an environment problem that stays retryable, and for
-		// status-clear failures, which follow a successful delete. A driver
+		// A counted failure: the DeleteSnapshot call itself failed, or the
+		// deletion timed out. The timeout is the authoritative signal and
+		// counts whether or not the sidecar's event message matched; the
+		// message match is best effort and only shortens the time to get
+		// here (design section 4). The sidecar emits the same event reason
+		// for credential failures, which are an environment problem that
+		// stays retryable, and for status-clear failures, which follow a
+		// successful delete; those come back as plain errors below. A driver
 		// that answers an already-gone snapshot with an internal error can
 		// fail every retry, so the deletion escalates after a bounded number
 		// of these instead of relying on driver compliance. Escalating trades
@@ -360,8 +364,8 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 		return entryRetrying, nil
 	}
 
-	// Any other failure -- a timeout, a credential failure, an API error --
-	// fails the backup deletion so it can be retried.
+	// Any other failure -- a credential failure, an API error -- fails the
+	// backup deletion so it can be retried.
 	return entryDeleted, err
 }
 

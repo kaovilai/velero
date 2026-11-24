@@ -1001,7 +1001,7 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 	record := retainedTestRecord()
 	tempName := TempVSCName(record.Driver, record.CSISnapshotHandle)
 
-	t.Run("delete call failure is a SnapshotDeleteCallError", func(t *testing.T) {
+	t.Run("delete call failure is a SnapshotDeleteCallError before the timeout", func(t *testing.T) {
 		backend := &fakeSnapshotterBackend{
 			snapshots:          map[string]bool{retainedTestHandle: true},
 			deleteErrorMessage: "Failed to delete snapshot " + retainedTestHandle + ": fake-driver-error",
@@ -1015,6 +1015,9 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		require.ErrorAs(t, err, &callErr)
 		assert.Contains(t, callErr.Message, "fake-driver-error")
 		assert.Contains(t, callErr.Error(), "CSI snapshotter failed to delete the snapshot: ")
+		// The fast path: the matched event ends the wait, the timeout wording
+		// is absent.
+		assert.NotContains(t, callErr.Message, "is not deleted within")
 	})
 
 	t.Run("credential failure stays retryable, not classified as a call failure", func(t *testing.T) {
@@ -1032,7 +1035,10 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		assert.ErrorContains(t, err, "CSI snapshotter failed on temp VolumeSnapshotContent "+tempName)
 	})
 
-	t.Run("unknown event message stays retryable", func(t *testing.T) {
+	t.Run("unknown event message runs on to the timeout, which counts", func(t *testing.T) {
+		// The message match is best effort: a message this version does not
+		// know ends no wait early, and the timeout then counts the attempt as
+		// a call failure, carrying the message as detail.
 		backend := &fakeSnapshotterBackend{
 			snapshots:          map[string]bool{retainedTestHandle: true},
 			deleteErrorMessage: "Failed to update the status of snapshot " + retainedTestHandle,
@@ -1043,12 +1049,15 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		require.Error(t, err)
 
 		var callErr *SnapshotDeleteCallError
-		assert.NotErrorAs(t, err, &callErr)
+		require.ErrorAs(t, err, &callErr)
+		assert.Contains(t, callErr.Message, "is not deleted within")
+		assert.Contains(t, callErr.Message, "Failed to update the status of snapshot")
 	})
 
-	t.Run("stuck deletion without events reports the timeout", func(t *testing.T) {
+	t.Run("stuck deletion without events counts at the timeout", func(t *testing.T) {
 		// The snapshot never becomes deletable and the sidecar reports
-		// nothing: the plain timeout must name the bound and the content.
+		// nothing: the timeout is the authoritative signal, so the attempt
+		// counts, and the error names the bound and the content.
 		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: false}}
 		c := backend.client(t)
 
@@ -1056,9 +1065,10 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		require.Error(t, err)
 
 		var callErr *SnapshotDeleteCallError
-		assert.NotErrorAs(t, err, &callErr)
+		require.ErrorAs(t, err, &callErr)
 		require.ErrorContains(t, err, "is not deleted within")
-		assert.ErrorContains(t, err, tempName)
+		require.ErrorContains(t, err, tempName)
+		assert.NotContains(t, callErr.Message, "latest SnapshotDeleteError")
 	})
 }
 
@@ -1084,7 +1094,7 @@ func TestLatestSnapshotDeleteErrorMessage(t *testing.T) {
 		clientObj   []runtime.Object
 		vscName     string
 		wantMessage string
-		wantKind    string
+		wantKind    snapshotDeleteErrorKind
 	}{
 		{
 			name:    "no events",
@@ -1111,7 +1121,7 @@ func TestLatestSnapshotDeleteErrorMessage(t *testing.T) {
 			},
 			vscName:     "fake-vsc",
 			wantMessage: "Failed to delete snapshot newer",
-			wantKind:    snapshotDeleteCallFailureMessage,
+			wantKind:    snapshotDeleteErrorCall,
 		},
 		{
 			name: "credential message is not a call failure",
@@ -1120,7 +1130,16 @@ func TestLatestSnapshotDeleteErrorMessage(t *testing.T) {
 			},
 			vscName:     "fake-vsc",
 			wantMessage: "Failed to get snapshot credentials",
-			wantKind:    "other",
+			wantKind:    snapshotDeleteErrorCredential,
+		},
+		{
+			name: "unknown message is other",
+			clientObj: []runtime.Object{
+				newEvent("event-unknown", "fake-vsc", "Failed to clear content status", SnapshotDeleteErrorEventReason, metav1.Now()),
+			},
+			vscName:     "fake-vsc",
+			wantMessage: "Failed to clear content status",
+			wantKind:    snapshotDeleteErrorOther,
 		},
 	}
 
