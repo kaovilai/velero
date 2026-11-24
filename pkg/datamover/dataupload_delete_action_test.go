@@ -17,6 +17,7 @@ limitations under the License.
 package datamover
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -32,10 +33,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/builder"
+	"github.com/velero-io/velero/pkg/label"
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
@@ -423,4 +426,58 @@ func TestDataUploadDeleteActionGathersRecordWithoutSnapshotID(t *testing.T) {
 	entry, ok := family.Entry("daily-backup-abcde")
 	require.True(t, ok)
 	assert.Equal(t, "0001-0009-rook-ceph-0000000000000001-snap", entry.CSISnapshotHandle)
+}
+
+// TestDataUploadDeleteActionWritesEntriesBeforeInfoConfigMap proves design
+// section 5: the record entries are written before the snapshot-info
+// ConfigMap, and an info-CM failure does not strand the retained snapshot. It
+// also covers the long-name case that used to fail the info-CM create: a
+// backup name over 63 characters is sanitized in the label, as the
+// backup-deletion controller's own lookup expects.
+func TestDataUploadDeleteActionWritesEntriesBeforeInfoConfigMap(t *testing.T) {
+	longName := strings.Repeat("a", 80)
+	backup := builder.ForBackup("velero", longName).StorageLocation("default").Result()
+	backup.UID = "long-uid"
+
+	t.Run("a long backup name writes a valid info-CM label", func(t *testing.T) {
+		crClient := velerotest.NewFakeControllerRuntimeClient(t)
+		action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+
+		du := newCompletedDataUpload("long-du", label.GetValidName(longName))
+		du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h", Driver: "d"}
+		require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+
+		cm := &corev1api.ConfigMap{}
+		require.NoError(t, crClient.Get(t.Context(), crclient.ObjectKey{Namespace: "velero", Name: "long-du-info"}, cm))
+		assert.Equal(t, label.GetValidName(longName), cm.Labels[velerov1.BackupNameLabel])
+		assert.LessOrEqual(t, len(cm.Labels[velerov1.BackupNameLabel]), 63)
+
+		family, err := retainedsnapshot.LoadFamily(t.Context(), crClient, backup)
+		require.NoError(t, err)
+		assert.Equal(t, 1, family.PendingEntries())
+	})
+
+	t.Run("an info-CM failure leaves the record entry in place", func(t *testing.T) {
+		base := velerotest.NewFakeControllerRuntimeClient(t)
+		crClient := interceptor.NewClient(base.(crclient.WithWatch), interceptor.Funcs{
+			Create: func(ctx context.Context, c crclient.WithWatch, obj crclient.Object, opts ...crclient.CreateOption) error {
+				if cm, ok := obj.(*corev1api.ConfigMap); ok && strings.HasSuffix(cm.Name, "-info") {
+					return apierrors.NewInvalid(corev1api.SchemeGroupVersion.WithKind("ConfigMap").GroupKind(), cm.Name, nil)
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		})
+		action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+
+		du := newCompletedDataUpload("long-du", label.GetValidName(longName))
+		du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h", Driver: "d"}
+		err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup})
+		require.Error(t, err, "the info-CM failure is still reported")
+
+		family, err := retainedsnapshot.LoadFamily(t.Context(), base, backup)
+		require.NoError(t, err)
+		entry, ok := family.Entry("long-du")
+		require.True(t, ok, "the record entry was written before the info-CM")
+		assert.Equal(t, "h", entry.CSISnapshotHandle)
+	})
 }

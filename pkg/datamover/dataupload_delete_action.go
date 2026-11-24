@@ -78,18 +78,6 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 		)
 		return nil
 	}
-	// The snapshot-info ConfigMap of the repository data is only created for
-	// a DataUpload the config can be generated for; the retained-snapshot
-	// record gather below must not depend on it, or a failed or interrupted
-	// DataUpload with a retained record but no SnapshotID would lose its
-	// record as soon as the DataUpload is gone from the cluster.
-	if cm := genConfigmap(input.Backup, *du); cm != nil {
-		err := d.client.Create(context.Background(), cm)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return errors.WithStack(errors.Wrapf(err, "failed to create the configmap for DataUpload %s/%s", du.Namespace, du.Name))
-		}
-	}
-
 	// The DataUploads are deleted in an earlier step of the backup deletion
 	// than the retained snapshots, so the working record of a retained
 	// snapshot is gathered here, from the backup tarball, into the sharded
@@ -121,6 +109,21 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 	}
 	if err := retainedsnapshot.WriteEntries(context.Background(), d.client, input.Backup, entries); err != nil {
 		return errors.WithStack(errors.Wrapf(err, "failed to gather the retained snapshot record of DataUpload %s/%s", du.Namespace, du.Name))
+	}
+
+	// The snapshot-info ConfigMap of the repository data is written after the
+	// record entries, and its failure neither blocks nor fails the gather
+	// above: a delete action that returned on the info-CM failure before
+	// writing the entries would strand the retained snapshot (design section
+	// 5). The info-CM is only created for a DataUpload the config can be
+	// generated for, so the gather must not depend on it either, or a failed
+	// or interrupted DataUpload with a retained record but no SnapshotID would
+	// lose its record as soon as the DataUpload is gone from the cluster.
+	if cm := genConfigmap(input.Backup, *du); cm != nil {
+		err := d.client.Create(context.Background(), cm)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return errors.WithStack(errors.Wrapf(err, "failed to create the configmap for DataUpload %s/%s", du.Namespace, du.Name))
+		}
 	}
 	return nil
 }
@@ -245,7 +248,11 @@ func genConfigmap(bak *velerov1.Backup, du velerov2alpha1.DataUpload) *corev1api
 			Namespace: bak.Namespace,
 			Name:      fmt.Sprintf("%s-info", du.Name),
 			Labels: map[string]string{
-				velerov1.BackupNameLabel:             bak.Name,
+				// The backup-deletion controller lists these ConfigMaps by
+				// the sanitized backup name, and a label value is capped at
+				// 63 characters: the raw name of a long backup name fails the
+				// create and left the backup undeletable.
+				velerov1.BackupNameLabel:             label.GetValidName(bak.Name),
 				velerov1.DataUploadSnapshotInfoLabel: "true",
 			},
 		},
