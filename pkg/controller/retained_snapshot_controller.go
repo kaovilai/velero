@@ -131,14 +131,6 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if shard.Labels[retainedsnapshot.FamilyLabel] != "true" {
 		return ctrl.Result{}, nil
 	}
-	// The retained-snapshot controller ignores an inactive ConfigMap, so a
-	// deletion whose repository step failed gathers records but never creates
-	// a temporary content.
-	if shard.Data[retainedsnapshot.ActiveKey] != "true" {
-		log.Debug("The record shard is not activated, ignoring it")
-		return ctrl.Result{}, nil
-	}
-
 	backup, err := r.backupOfShard(ctx, shard)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -149,19 +141,38 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// pending entries exist, they are moved to the orphan-snapshot
 		// ConfigMap with an event, the same path as escalation and skip, and
 		// only then is the family removed, so no path deletes a pending record
-		// without leaving the orphan trace the Security section requires.
+		// without leaving the orphan trace the Security section requires. The
+		// GC runs whatever the activation state: a family delivered inactive
+		// by the finalizer hold of section 3 whose Backup was deleted by other
+		// means must not sit unowned forever.
 		return ctrl.Result{}, r.garbageCollectShard(ctx, shard, log)
+	}
+
+	// The retained-snapshot controller ignores an inactive ConfigMap, so a
+	// deletion whose repository step failed gathers records but never creates
+	// a temporary content.
+	if shard.Data[retainedsnapshot.ActiveKey] != "true" {
+		log.Debug("The record shard is not activated, ignoring it")
+		return ctrl.Result{}, nil
 	}
 
 	log = log.WithField("backup", backup.Name)
 
+	retry := false
 	pending := pendingShardKeys(shard)
 	for _, name := range pending {
-		done, requeue, err := r.deleteEntry(ctx, backup, shard, name, log)
+		outcome, err := r.deleteEntry(ctx, backup, shard, name, log)
 		if err != nil {
-			// The deletion of one entry fails the backup deletion, so it can
-			// be retried; a retry regathers from the ConfigMap, which is
-			// idempotent, and replays only the unfinished entries.
+			// An uncounted failure -- credentials, clear-status, an unknown
+			// message, an API error -- fails the backup deletion so it can be
+			// retried, and sets the family inactive so no unowned work
+			// continues; the retry is a new request that regathers from the
+			// ConfigMap, which is idempotent, re-activates the family and
+			// replays only the unfinished entries (design section 4).
+			if deactivateErr := retainedsnapshot.Deactivate(ctx, r.Client, backup); deactivateErr != nil {
+				log.WithError(deactivateErr).Error("Error deactivating the retained snapshot records")
+				return ctrl.Result{}, deactivateErr
+			}
 			if failErr := r.failDeleteBackupRequest(ctx, backup, err); failErr != nil {
 				log.WithError(failErr).Error("Error failing the backup deletion")
 				return ctrl.Result{}, failErr
@@ -169,15 +180,22 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			log.WithError(err).Errorf("Error deleting the retained snapshot of DataUpload %s, failing the backup deletion", name)
 			return ctrl.Result{}, nil
 		}
-		if !done {
+		switch outcome {
+		case entryOrphaned:
 			// The entry was skipped or escalated, its record moved to the
 			// orphan-snapshot ConfigMap; the deletion proceeds.
 			log.Infof("The retained snapshot of DataUpload %s was skipped, its record is in the orphan-snapshot ConfigMap", name)
-			continue
+		case entryRetrying:
+			// A counted DeleteSnapshot failure under the bound does not fail
+			// the request: it stays InProgress with its annotation, and this
+			// controller requeues on its own. Failing the request would kill
+			// the only object the wake can re-enter, and the backup would sit
+			// in Deleting until a manual retry (design section 4).
+			retry = true
 		}
-		if requeue {
-			return ctrl.Result{RequeueAfter: csi.RetainedSnapshotDeletionTimeout}, nil
-		}
+	}
+	if retry {
+		return ctrl.Result{RequeueAfter: retainedSnapshotRetryDelay}, nil
 	}
 
 	// Wake the waiting request when nothing is pending anymore: the request
@@ -226,15 +244,35 @@ func (r *retainedSnapshotReconciler) backupOfShard(ctx context.Context, shard *c
 	return backup, nil
 }
 
-// deleteEntry deletes the retained snapshot of one DataUpload. It returns
-// done=false when the record was moved to the orphan-snapshot ConfigMap --
-// skipped for an unknown driver, or escalated after the bounded number of
-// persisted DeleteSnapshot failures -- so the backup deletion proceeds, and
-// requeue=true when the entry stays pending.
-func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *velerov1api.Backup, shard *corev1api.ConfigMap, name string, log logrus.FieldLogger) (done, requeue bool, err error) {
+// entryOutcome is the result of one entry's deletion attempt.
+type entryOutcome int
+
+const (
+	// entryDeleted: the snapshot is confirmed deleted and the entry removed.
+	entryDeleted entryOutcome = iota
+	// entryOrphaned: the record was moved to the orphan-snapshot ConfigMap --
+	// skipped for an unknown driver, undecodable, or escalated after the
+	// bounded number of persisted DeleteSnapshot failures -- so the backup
+	// deletion proceeds.
+	entryOrphaned
+	// entryRetrying: a counted DeleteSnapshot failure under the bound; the
+	// entry stays pending with its attempt count persisted and the controller
+	// requeues on its own, the request untouched.
+	entryRetrying
+)
+
+// retainedSnapshotRetryDelay is the requeue delay after a counted
+// DeleteSnapshot failure under the bound. Each attempt is itself bounded by
+// the deletion timeout, so the delay only spaces the attempts.
+var retainedSnapshotRetryDelay = 10 * time.Second
+
+// deleteEntry deletes the retained snapshot of one DataUpload; see
+// entryOutcome for the results. A returned error is an uncounted failure that
+// fails the backup deletion so it can be retried.
+func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *velerov1api.Backup, shard *corev1api.ConfigMap, name string, log logrus.FieldLogger) (entryOutcome, error) {
 	value, ok := shard.Data[name]
 	if !ok {
-		return true, false, nil
+		return entryDeleted, nil
 	}
 	entry, err := retainedsnapshot.UnmarshalEntry(value)
 	if err != nil {
@@ -242,10 +280,10 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 		// the orphan ConfigMap for manual cleanup instead of failing the
 		// deletion forever.
 		r.eventf(shard, backup, "RetainedSnapshotRecordInvalid", "the retained snapshot record of DataUpload %s cannot be decoded and was moved to the orphan-snapshot ConfigMap: %v", name, err)
-		return false, false, r.moveToOrphan(ctx, backup, name, &retainedsnapshot.Entry{Attempts: retainedsnapshot.MaxAttempts})
+		return entryOrphaned, r.moveToOrphan(ctx, backup, name, &retainedsnapshot.Entry{Attempts: retainedsnapshot.MaxAttempts})
 	}
 	if entry.CSISnapshotHandle == "" {
-		return true, false, errors.Errorf("the retained snapshot record of DataUpload %s carries no handle", name)
+		return entryDeleted, errors.Errorf("the retained snapshot record of DataUpload %s carries no handle", name)
 	}
 
 	// Records sourced from DataUpload.status are trusted -- they entered
@@ -257,11 +295,11 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 	if !entry.Trusted {
 		known, err := r.driverExists(ctx, entry.Driver)
 		if err != nil {
-			return true, false, errors.Wrapf(err, "error checking whether the cluster runs driver %s", entry.Driver)
+			return entryDeleted, errors.Wrapf(err, "error checking whether the cluster runs driver %s", entry.Driver)
 		}
 		if !known {
 			r.eventf(shard, backup, "RetainedSnapshotDriverUnknown", "the cluster does not run driver %s, the retained snapshot of DataUpload %s was moved to the orphan-snapshot ConfigMap for manual cleanup", entry.Driver, name)
-			return false, false, r.moveToOrphan(ctx, backup, name, entry)
+			return entryOrphaned, r.moveToOrphan(ctx, backup, name, entry)
 		}
 	}
 
@@ -269,10 +307,10 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 	if err == nil {
 		// The entry is removed only after the snapshot is confirmed deleted.
 		if err := retainedsnapshot.MarkCompleted(ctx, r.Client, backup, name); err != nil {
-			return true, true, errors.Wrapf(err, "error marking the retained snapshot of DataUpload %s as deleted", name)
+			return entryDeleted, errors.Wrapf(err, "error marking the retained snapshot of DataUpload %s as deleted", name)
 		}
 		log.Infof("Deleted the retained snapshot %s of DataUpload %s", entry.CSISnapshotHandle, name)
-		return true, false, nil
+		return entryDeleted, nil
 	}
 
 	var callErr *csi.SnapshotDeleteCallError
@@ -291,20 +329,27 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 			r.eventf(shard, backup, "RetainedSnapshotDeleteEscalated",
 				"the CSI driver failed to delete the snapshot %s of DataUpload %s %d times (%v); it was moved to the orphan-snapshot ConfigMap for manual cleanup, and the backup deletion proceeds",
 				entry.CSISnapshotHandle, name, entry.Attempts, callErr)
-			return false, false, r.moveToOrphan(ctx, backup, name, entry)
+			return entryOrphaned, r.moveToOrphan(ctx, backup, name, entry)
 		}
 		// The counter is persisted, so a retry of `velero backup delete`,
 		// which is a new DeleteBackupRequest, still reaches the bound across
-		// retries instead of looping forever.
+		// retries instead of looping forever. The request itself is not
+		// failed while under the bound: it stays InProgress with its
+		// annotation, this controller requeues, and the per-attempt event is
+		// the operator's signal.
 		if err := retainedsnapshot.UpdateEntry(ctx, r.Client, backup, name, entry); err != nil {
-			return true, true, errors.Wrapf(err, "error persisting the failed attempt count of DataUpload %s", name)
+			return entryDeleted, errors.Wrapf(err, "error persisting the failed attempt count of DataUpload %s", name)
 		}
-		return true, false, errors.Wrapf(callErr, "the CSI driver failed to delete the snapshot of DataUpload %s, attempt %d of %d", name, entry.Attempts, retainedsnapshot.MaxAttempts)
+		r.eventf(shard, backup, "RetainedSnapshotDeleteFailed",
+			"the CSI driver failed to delete the snapshot %s of DataUpload %s, attempt %d of %d (%v); the deletion is retried",
+			entry.CSISnapshotHandle, name, entry.Attempts, retainedsnapshot.MaxAttempts, callErr)
+		log.WithError(callErr).Warnf("The CSI driver failed to delete the snapshot of DataUpload %s, attempt %d of %d; retrying", name, entry.Attempts, retainedsnapshot.MaxAttempts)
+		return entryRetrying, nil
 	}
 
 	// Any other failure -- a timeout, a credential failure, an API error --
 	// fails the backup deletion so it can be retried.
-	return true, false, err
+	return entryDeleted, err
 }
 
 // moveToOrphan moves an escalated or skipped record to the orphan-snapshot

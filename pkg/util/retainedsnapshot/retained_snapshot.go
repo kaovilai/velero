@@ -629,6 +629,31 @@ func Activate(ctx context.Context, c client.Client, backup *velerov1api.Backup) 
 	return nil
 }
 
+// Deactivate stamps the inactive state on every shard of the family, so no
+// unowned work continues after the DeleteBackupRequest waiting on the family
+// is failed: a credential, clear-status or unknown failure marks the request
+// Processed and sets the family inactive, and the retry is a new request that
+// re-activates it (design section 4).
+func Deactivate(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
+	family, err := LoadFamily(ctx, c, backup)
+	if err != nil {
+		return err
+	}
+	for _, shard := range family.Shards {
+		if shard.Data[ActiveKey] == inactiveValue {
+			continue
+		}
+		if shard.Data == nil {
+			shard.Data = map[string]string{}
+		}
+		shard.Data[ActiveKey] = inactiveValue
+		if err := c.Update(ctx, shard); err != nil {
+			return errors.Wrapf(err, "error deactivating the retained snapshot shard %s", shard.Name)
+		}
+	}
+	return nil
+}
+
 // Delete removes the shard family of the backup. The tail of the deletion
 // removes the family itself; it is not left to the Backup's garbage collection.
 func Delete(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {

@@ -363,6 +363,75 @@ func TestRetainedSnapshotControllerFailsRequestOnRetryableError(t *testing.T) {
 	entry, ok := family.Entry("foo-du")
 	require.True(t, ok, "the entry stays pending")
 	assert.Zero(t, entry.Attempts, "a credential failure does not count toward the escalation bound")
+	// The family is set inactive so no unowned work continues; the retry is a
+	// new request that re-activates it (design section 4).
+	assert.False(t, family.IsActivated(), "an uncounted failure deactivates the family")
+}
+
+// TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive proves design
+// section 4: a "Failed to delete snapshot" error under the bound does not
+// fail the DeleteBackupRequest. The request stays InProgress with its
+// annotation, the attempt count is persisted, a per-attempt event is emitted
+// and the controller requeues on its own; only the escalation wakes the
+// request. Failing the request would kill the only object the wake can
+// re-enter, leaving the backup in Deleting until a manual retry.
+func TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive(t *testing.T) {
+	originalTimeout := csi.RetainedSnapshotDeletionTimeout
+	t.Cleanup(func() { csi.RetainedSnapshotDeletionTimeout = originalTimeout })
+	csi.RetainedSnapshotDeletionTimeout = 200 * time.Millisecond
+
+	backend := &fakeSnapshotBackend{snapshots: map[string]bool{retainedTestHandle: true}, deleteErrorMessage: "Failed to delete snapshot"}
+	backup := retainedTestBackup()
+	c := backend.client(t, backup)
+
+	shard := retainedTestFamily(t, c, backup, map[string]*retainedsnapshot.Entry{
+		"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
+	})
+	dbr := retainedTestRequest(t, c, backup)
+	recorder := &fakeEventRecorder{}
+	r := NewRetainedSnapshotReconcilerWithRecorder(velerotest.NewLogger(), c, c, clock.RealClock{}, recorder)
+
+	for attempt := 1; attempt < retainedsnapshot.MaxAttempts; attempt++ {
+		result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+		require.NoError(t, err)
+		assert.Equal(t, retainedSnapshotRetryDelay, result.RequeueAfter, "a counted failure under the bound requeues the controller itself")
+
+		req := getRequest(t, c, dbr)
+		assert.Equal(t, velerov1api.DeleteBackupRequestPhaseInProgress, req.Status.Phase, "the request stays InProgress under the bound")
+		assert.Empty(t, req.Status.Errors)
+		assert.Equal(t, "true", req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation], "the annotation stays in place")
+		assert.Empty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation], "the request is not woken while the entry is pending")
+
+		family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
+		require.NoError(t, err)
+		entry, ok := family.Entry("foo-du")
+		require.True(t, ok, "the entry stays pending")
+		assert.Equal(t, attempt, entry.Attempts, "the attempt count is persisted")
+		assert.True(t, family.IsActivated(), "the family stays active for the retry")
+		assert.Contains(t, recorder.reasons, "RetainedSnapshotDeleteFailed")
+	}
+
+	// The bound: the record escalates to the orphan ConfigMap and the request
+	// is woken, without any manual retry.
+	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.NotContains(t, getShard(t, c, shard).Data, "foo-du")
+	orphans := &corev1api.ConfigMapList{}
+	require.NoError(t, c.List(t.Context(), orphans, client.MatchingLabels{retainedsnapshot.OrphanLabel: "true"}))
+	require.Len(t, orphans.Items, 1)
+	assert.Contains(t, recorder.reasons, "RetainedSnapshotDeleteEscalated")
+	req := getRequest(t, c, dbr)
+	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseInProgress, req.Status.Phase)
+	assert.NotEmpty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation], "the escalation wakes the request")
+}
+
+type fakeEventRecorder struct {
+	reasons []string
+}
+
+func (f *fakeEventRecorder) Event(_ runtime.Object, _ bool, reason string, _ string, _ ...any) {
+	f.reasons = append(f.reasons, reason)
 }
 
 // TestRetainedSnapshotControllerGarbageCollects proves the GC rule: a family
