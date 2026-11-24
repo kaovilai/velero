@@ -31,10 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/datamover"
 	"github.com/velero-io/velero/pkg/util/kube"
+	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 // The retention path below runs in the node agent, on the DataUpload
@@ -609,5 +611,71 @@ func (r *DataUploadReconciler) releaseRetainedSnapshot(ctx context.Context, du *
 		}
 		log.Infof("Released the retained snapshot %s of DataUpload %s, the record is cleared", record.CSISnapshotHandle, du.Name)
 	}
+	return nil
+}
+
+// owningBackupOf returns the name and UID of the Backup that owns the
+// DataUpload, from its controller owner reference, falling back to the backup
+// labels the backup action sets.
+func owningBackupOf(du *velerov2alpha1api.DataUpload) (name, uid string) {
+	for _, ref := range du.OwnerReferences {
+		if ref.Kind == "Backup" {
+			return ref.Name, string(ref.UID)
+		}
+	}
+	return du.Labels[velerov1api.BackupNameLabel], du.Labels[velerov1api.BackupUIDLabel]
+}
+
+// deliverRetainedSnapshotRecord delivers the record of a final-state
+// DataUpload that is being deleted through the API to a durable home, so the
+// finalizer can be removed without losing the only copy of the record. The
+// durable home is the backup-UID family ConfigMap, created inactive when the
+// Backup still exists and has no family yet, so the later backup deletion
+// gathers the entry as a trusted record; the orphan-snapshot ConfigMap is the
+// home only when the Backup is already gone (design section 3). A record the
+// family already holds, or already confirmed deleted, needs no delivery: the
+// backup deletion's own DataUpload removal reaches this path after its gather.
+func (r *DataUploadReconciler) deliverRetainedSnapshotRecord(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) error {
+	entry := retainedsnapshot.FromDataUploadStatus(du)
+	if entry == nil {
+		return nil
+	}
+	backupName, backupUID := owningBackupOf(du)
+	if backupName == "" {
+		return errors.Errorf("DataUpload %s carries a retained snapshot record but names no owning backup", du.Name)
+	}
+
+	backup := &velerov1api.Backup{}
+	err := r.uncachedReader().Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: backupName}, backup)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "error getting the backup %s of DataUpload %s", backupName, du.Name)
+	}
+	if err == nil && (backupUID == "" || string(backup.UID) == backupUID) {
+		family, err := retainedsnapshot.LoadFamily(ctx, r.uncachedReader(), backup)
+		if err != nil {
+			return errors.Wrapf(err, "error reading the retained snapshot records of backup %s", backupName)
+		}
+		if _, held := family.Entry(du.Name); held {
+			log.Infof("The retained snapshot record of DataUpload %s is already held by the record family of backup %s", du.Name, backupName)
+			return nil
+		}
+		if _, done := family.CompletedSet()[du.Name]; done {
+			log.Infof("The retained snapshot of DataUpload %s was already deleted by the backup deletion", du.Name)
+			return nil
+		}
+		if err := retainedsnapshot.WriteEntries(ctx, r.client, backup, map[string]*retainedsnapshot.Entry{du.Name: entry}); err != nil {
+			return errors.Wrapf(err, "error delivering the retained snapshot record of DataUpload %s to the record family of backup %s", du.Name, backupName)
+		}
+		log.Infof("Delivered the retained snapshot record %s of the deleted DataUpload %s to the record family of backup %s", entry.CSISnapshotHandle, du.Name, backupName)
+		return nil
+	}
+
+	// The Backup is gone, or the name was reused by another Backup: the
+	// orphan-snapshot ConfigMap is the durable home for manual cleanup.
+	gone := &velerov1api.Backup{ObjectMeta: metav1.ObjectMeta{Namespace: du.Namespace, Name: backupName, UID: types.UID(backupUID)}}
+	if err := retainedsnapshot.WriteOrphanEntry(ctx, r.client, gone, du.Name, entry); err != nil {
+		return errors.Wrapf(err, "error delivering the retained snapshot record of DataUpload %s to the orphan-snapshot ConfigMap", du.Name)
+	}
+	log.Warnf("The backup %s of the deleted DataUpload %s is gone; its retained snapshot record %s was moved to the orphan-snapshot ConfigMap for manual cleanup", backupName, du.Name, entry.CSISnapshotHandle)
 	return nil
 }
