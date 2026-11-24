@@ -407,12 +407,7 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 		for _, shard := range shards {
 			if value, ok := shard.Data[name]; ok {
 				if existing, err := UnmarshalEntry(value); err == nil {
-					if existing.Attempts > entry.Attempts {
-						entry.Attempts = existing.Attempts
-					}
-					if entry.CSISnapshotHandle == "" && existing.CSISnapshotHandle != "" {
-						entry.CSISnapshotHandle = existing.CSISnapshotHandle
-					}
+					entry = mergeEntry(existing, entry)
 				}
 			}
 		}
@@ -467,6 +462,32 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 		}
 	}
 	return nil
+}
+
+// mergeEntry merges an incoming entry into the one the family already holds
+// for the same DataUpload. The persisted attempt count is never reset, and a
+// handle a previous attempt resolved from the repository snapshot's tag is
+// kept when the incoming entry carries none. A family entry gathered from a
+// live DataUpload keeps its trusted provenance and its handle: a tarball
+// record never overwrites it, only its attempt count merges (design section
+// 5). Without that rule a regather after a failed attempt -- the live
+// DataUploads are gone by then -- would downgrade every record to untrusted,
+// and a rewritten tarball could swap the handle a trusted record selected.
+func mergeEntry(existing, incoming *Entry) *Entry {
+	if existing.Trusted && !incoming.Trusted {
+		merged := *existing
+		if incoming.Attempts > merged.Attempts {
+			merged.Attempts = incoming.Attempts
+		}
+		return &merged
+	}
+	if existing.Attempts > incoming.Attempts {
+		incoming.Attempts = existing.Attempts
+	}
+	if incoming.CSISnapshotHandle == "" && existing.CSISnapshotHandle != "" {
+		incoming.CSISnapshotHandle = existing.CSISnapshotHandle
+	}
+	return incoming
 }
 
 // findShardWithRoom returns the shard the key belongs in: the shard that

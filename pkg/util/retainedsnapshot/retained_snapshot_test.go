@@ -228,6 +228,53 @@ func TestWriteEntriesPreservesResolvedHandle(t *testing.T) {
 		"the resolved handle must survive a regather whose incoming entry carries none")
 }
 
+// TestWriteEntriesKeepsTrustedEntryOnRegather proves the trusted-entry rule
+// of design section 5: a family entry gathered from a live DataUpload keeps
+// its trusted provenance and its handle on a later regather; a tarball record
+// never overwrites it, only its attempt count merges. Without it, a regather
+// after a failed attempt -- the live DataUploads are gone by then -- downgrades
+// every record to untrusted, and a rewritten tarball could swap the handle.
+func TestWriteEntriesKeepsTrustedEntryOnRegather(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	backup := testBackup()
+
+	// The controller's own gather from the live DataUpload: trusted.
+	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{
+		"du-1": {CSISnapshotHandle: "live-handle", Driver: "d", Trusted: true,
+			DeletionSecretRef: &corev1api.SecretReference{Name: "live-secret", Namespace: "ns"}},
+	}))
+
+	// A retry regathers from the tarball after the DataUpload is gone: the
+	// record is untrusted, names a different handle, and carries the attempt
+	// count the orphan merge handed it.
+	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{
+		"du-1": {CSISnapshotHandle: "tarball-handle", Driver: "evil", Trusted: false, Attempts: 2,
+			DeletionSecretRef: &corev1api.SecretReference{Name: "other-secret", Namespace: "ns"}},
+	}))
+
+	family, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	entry, ok := family.Entry("du-1")
+	require.True(t, ok)
+	assert.True(t, entry.Trusted, "the trusted provenance survives the regather")
+	assert.Equal(t, "live-handle", entry.CSISnapshotHandle, "the tarball record never overwrites a trusted handle")
+	assert.Equal(t, "d", entry.Driver)
+	assert.Equal(t, "live-secret", entry.DeletionSecretRef.Name)
+	assert.Equal(t, 2, entry.Attempts, "only the attempt count merges")
+
+	// A trusted regather of a trusted entry still takes the incoming record,
+	// as the local record wins.
+	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{
+		"du-1": {CSISnapshotHandle: "live-handle-2", Driver: "d", Trusted: true},
+	}))
+	family, err = LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	entry, ok = family.Entry("du-1")
+	require.True(t, ok)
+	assert.Equal(t, "live-handle-2", entry.CSISnapshotHandle)
+	assert.Equal(t, 2, entry.Attempts, "the persisted count is never reset")
+}
+
 // TestWriteEntriesDoesNotDuplicateKeyAcrossShards proves that a retry writes
 // an existing key into the shard that already carries it, not into a
 // different shard with room: a duplicate would survive MarkCompleted, which
