@@ -550,9 +550,10 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// in InProgress or Processed is not reconciled again, and the
 	// backup-deletion controller runs with one worker, so any wait inside it
 	// would block the deletion of every unrelated backup behind it. The step
-	// writes the pending annotation and activates the record family in one
-	// write -- annotate first, then activate, never the reverse -- and
-	// returns with the backstop RequeueAfter, leaving the request InProgress
+	// writes the pending annotation and then shard 0 of the record family,
+	// the manifest that activates it -- annotate first, then shard 0, never
+	// the reverse -- and returns with the backstop RequeueAfter, leaving the
+	// request InProgress
 	// for the retained-snapshot controller, which runs its own workers and is
 	// keyed by the record ConfigMaps. The primary wake is the pair of watches
 	// in SetupWithManager.
@@ -570,8 +571,8 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			})
 			if annotateErr != nil {
 				errs = append(errs, errors.Wrap(annotateErr, "error marking the request as waiting on retained snapshots").Error())
-			} else if activateErr := retainedsnapshot.Activate(ctx, r.Client, backup); activateErr != nil {
-				errs = append(errs, errors.Wrap(activateErr, "error activating the retained snapshot records").Error())
+			} else if activateErr := retainedsnapshot.WriteManifest(ctx, r.Client, backup); activateErr != nil {
+				errs = append(errs, errors.Wrap(activateErr, "error writing the retained snapshot record manifest").Error())
 			} else {
 				log.Info("Waiting for the retained-snapshot controller to delete the retained snapshots")
 				return ctrl.Result{RequeueAfter: retainedSnapshotsBackstopRequeue}, nil
@@ -710,13 +711,14 @@ func (r *backupDeletionReconciler) runDeletionTail(
 
 // reconcileRetainedSnapshots is the re-entry path of a request waiting on the
 // retained-snapshot controller. It is level-triggered, not edge-triggered: on
-// re-entry it first repairs activation -- the annotation write and the shard
-// activations cannot be one atomic write, and a crash in between must not
-// strand shards -- so every nonempty shard in the family that is not yet
-// activated is activated before anything else; only then does it re-read the
-// family, and when there is nothing active it clears its own annotation and
-// runs the tail in the same reconcile, so a retry that starts after the family
-// is gone cannot wedge waiting for a transition that already fired.
+// re-entry it first repairs shard 0 -- the annotation write and the shard-0
+// write cannot be one atomic write, and a crash in between must not strand
+// the inert entry shards -- so when the family has entry shards but no shard
+// 0, shard 0 is written before anything else, one idempotent write; only then
+// does it re-read the family, shard 0 then exactly the entry shards it counts,
+// and when there is nothing active it clears its own annotation and runs the
+// tail in the same reconcile, so a retry that starts after the family is gone
+// cannot wedge waiting for a transition that already fired.
 func (r *backupDeletionReconciler) reconcileRetainedSnapshots(
 	ctx context.Context,
 	dbr *velerov1api.DeleteBackupRequest,
@@ -726,19 +728,18 @@ func (r *backupDeletionReconciler) reconcileRetainedSnapshots(
 ) (ctrl.Result, error) {
 	log.Info("Evaluating the retained snapshot records of the backup")
 
-	// Repair the activation a crash may have interrupted.
-	if err := retainedsnapshot.Activate(ctx, r.Client, backup); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "error repairing the retained snapshot record activation")
+	// Repair the shard-0 write a crash may have interrupted.
+	if err := retainedsnapshot.WriteManifest(ctx, r.Client, backup); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "error repairing the retained snapshot record manifest")
 	}
 
 	family, err := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error reading the retained snapshot records")
 	}
-	// The wait is on pending entries regardless of the activation state, not
-	// only on active shards: an activation the repair above has not covered
-	// yet must hold the tail back, not let it through while the shard is
-	// still inactive.
+	// The wait is on pending entries whether or not the family has its shard
+	// 0: an inert shard the repair above has not covered yet must hold the
+	// tail back, not let it through.
 	if family.PendingEntries() > 0 {
 		log.Info("The retained snapshots are still being deleted, going back to waiting")
 		return ctrl.Result{RequeueAfter: retainedSnapshotsBackstopRequeue}, nil
@@ -914,7 +915,7 @@ func (r *backupDeletionReconciler) resolveRetainedSnapshotHandles(ctx context.Co
 func pendingShardKeys(shard *corev1api.ConfigMap) []string {
 	keys := []string{}
 	for key := range shard.Data {
-		if key == retainedsnapshot.ActiveKey || key == retainedsnapshot.CompletedKey {
+		if key == retainedsnapshot.ShardCountKey || key == retainedsnapshot.CompletedKey {
 			continue
 		}
 		keys = append(keys, key)

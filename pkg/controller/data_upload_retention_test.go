@@ -1375,7 +1375,7 @@ func TestReconcileHoldsFinalizerUntilRecordDelivered(t *testing.T) {
 		du := deletedRecordDataUpload("bak", "bak-uid")
 		// The backup deletion's gather already holds the entry and activated it.
 		require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), r.client, backup, map[string]*retainedsnapshot.Entry{du.Name: retainedsnapshot.FromDataUploadStatus(du)}))
-		require.NoError(t, retainedsnapshot.Activate(t.Context(), r.client, backup))
+		require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), r.client, backup))
 		createDeletedDataUpload(t, r, du)
 
 		require.NoError(t, reconcileDeletedDataUpload(t, r, du))

@@ -1046,7 +1046,7 @@ func TestDescribeOrphanSnapshotRecords(t *testing.T) {
 	require.NoError(t, err)
 	orphans := &corev1api.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "orphan-snapshots-0", Labels: map[string]string{retainedsnapshot.OrphanLabel: "true"}},
-		Data:       map[string]string{"bak-uid.du-a": string(mine), "other-uid.du-b": string(theirs), "earlier-uid.du-c": string(stale), retainedsnapshot.ActiveKey: "false"},
+		Data:       map[string]string{"bak-uid.du-a": string(mine), "other-uid.du-b": string(theirs), "earlier-uid.du-c": string(stale), retainedsnapshot.CompletedKey: "[]"},
 	}
 	kbClient := velerotest.NewFakeControllerRuntimeClient(t, orphans)
 

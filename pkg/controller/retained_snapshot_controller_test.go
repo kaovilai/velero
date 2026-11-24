@@ -146,16 +146,26 @@ func retainedTestBackup() *velerov1api.Backup {
 	return backup
 }
 
-// retainedTestFamily writes one activated shard with the given entries and
-// returns the shard.
+// retainedTestFamily writes one entry shard with the given entries and the
+// shard 0 that activates the family, and returns the entry shard.
 func retainedTestFamily(t *testing.T, c client.Client, backup *velerov1api.Backup, entries map[string]*retainedsnapshot.Entry) *corev1api.ConfigMap {
 	t.Helper()
 	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), c, backup, entries))
-	require.NoError(t, retainedsnapshot.Activate(t.Context(), c, backup))
+	require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), c, backup))
 	family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
 	require.NoError(t, err)
+	require.NotNil(t, family.Manifest)
 	require.Len(t, family.Shards, 1)
 	return family.Shards[0]
+}
+
+// manifestRequest is the reconcile request of shard 0 of the family the shard
+// belongs to: the controller is keyed by shard 0, not by the entry shards.
+func manifestRequest(shard *corev1api.ConfigMap) ctrl.Request {
+	return ctrl.Request{NamespacedName: types.NamespacedName{
+		Namespace: shard.Namespace,
+		Name:      retainedsnapshot.ManifestName(shard.Labels[velerov1api.BackupUIDLabel]),
+	}}
 }
 
 // retainedTestRequest creates the DeleteBackupRequest that waits on the
@@ -175,9 +185,10 @@ func newRetainedTestReconciler(c client.Client) *retainedSnapshotReconciler {
 	return NewRetainedSnapshotReconciler(velerotest.NewLogger(), c, nil, clock.RealClock{})
 }
 
+// reconcileShard reconciles the family the shard belongs to, through its shard 0.
 func reconcileShard(t *testing.T, r *retainedSnapshotReconciler, shard *corev1api.ConfigMap) {
 	t.Helper()
-	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+	_, err := r.Reconcile(t.Context(), manifestRequest(shard))
 	require.NoError(t, err)
 }
 
@@ -236,10 +247,12 @@ func TestRetainedSnapshotControllerDeletesEntry(t *testing.T) {
 	assert.True(t, apierrors.IsNotFound(err), "the temp content is gone, which is the content watch's event")
 }
 
-// TestRetainedSnapshotControllerIgnoresInactiveShard proves the activation
-// guard: a deletion whose repository step failed gathers records but never has
-// them deleted, because the controller ignores an inactive ConfigMap.
-func TestRetainedSnapshotControllerIgnoresInactiveShard(t *testing.T) {
+// TestRetainedSnapshotControllerIgnoresInertShard proves the shard-0 guard: a
+// deletion whose repository step failed gathers records into entry shards but
+// never writes shard 0, and the controller, keyed by shard 0, never has them
+// deleted; an entry shard of a live Backup only re-checks, slowly, whether the
+// Backup is gone, for the sweep.
+func TestRetainedSnapshotControllerIgnoresInertShard(t *testing.T) {
 	backend := &fakeSnapshotBackend{snapshots: map[string]bool{retainedTestHandle: true}}
 	backup := retainedTestBackup()
 	c := backend.client(t, backup)
@@ -249,11 +262,21 @@ func TestRetainedSnapshotControllerIgnoresInactiveShard(t *testing.T) {
 	}))
 	family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
 	require.NoError(t, err)
+	require.Nil(t, family.Manifest)
 	shard := family.Shards[0]
+	r := newRetainedTestReconciler(c)
 
-	reconcileShard(t, newRetainedTestReconciler(c), shard)
+	// The manifest does not exist: nothing to reconcile.
+	result, err := r.Reconcile(t.Context(), manifestRequest(shard))
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
 
-	assert.Empty(t, backend.deleteCallsTo, "an inactive shard must not create a temporary content")
+	// The entry shard itself: inert, re-checked for the sweep.
+	result, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+	require.NoError(t, err)
+	assert.Equal(t, inertShardRecheckDelay, result.RequeueAfter)
+
+	assert.Empty(t, backend.deleteCallsTo, "an inert shard must not create a temporary content")
 	current := getShard(t, c, shard)
 	assert.Contains(t, current.Data, "foo-du")
 }
@@ -404,7 +427,7 @@ func TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive(t *testing.T) {
 	r := NewRetainedSnapshotReconcilerWithRecorder(velerotest.NewLogger(), c, c, clock.RealClock{}, recorder)
 
 	for attempt := 1; attempt < retainedsnapshot.MaxAttempts; attempt++ {
-		result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+		result, err := r.Reconcile(t.Context(), manifestRequest(shard))
 		require.NoError(t, err)
 		assert.Equal(t, retainedSnapshotRetryDelay, result.RequeueAfter, "a counted failure under the bound requeues the controller itself")
 
@@ -428,7 +451,7 @@ func TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive(t *testing.T) {
 	// backup-deletion controller's family watch admits, so the request
 	// re-enters without being written.
 	before := getShard(t, c, shard)
-	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+	result, err := r.Reconcile(t.Context(), manifestRequest(shard))
 	require.NoError(t, err)
 	assert.Zero(t, result.RequeueAfter)
 	after := getShard(t, c, shard)
@@ -505,7 +528,7 @@ func TestRetainedSnapshotControllerGarbageCollects(t *testing.T) {
 			"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
 		}))
 		require.NoError(t, retainedsnapshot.MarkCompleted(t.Context(), c, backup, "foo-du"))
-		require.NoError(t, retainedsnapshot.Activate(t.Context(), c, backup))
+		require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), c, backup))
 		family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
 		require.NoError(t, err)
 		require.Len(t, family.Shards, 1)
@@ -515,6 +538,42 @@ func TestRetainedSnapshotControllerGarbageCollects(t *testing.T) {
 
 		err = c.Get(t.Context(), client.ObjectKeyFromObject(shard), &corev1api.ConfigMap{})
 		assert.True(t, apierrors.IsNotFound(err), "the empty shard is garbage collected")
+		err = c.Get(t.Context(), client.ObjectKey{Namespace: shard.Namespace, Name: retainedsnapshot.ManifestName(string(backup.UID))}, &corev1api.ConfigMap{})
+		assert.True(t, apierrors.IsNotFound(err), "shard 0 is garbage collected")
+	})
+
+	t.Run("an inert family without shard 0 is swept", func(t *testing.T) {
+		// A crash leftover or a finalizer-hold delivery whose Backup is gone:
+		// entry shards, no shard 0, keyed on the backup-uid label.
+		backup := retainedTestBackup()
+		backup.UID = "inert-uid"
+		require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), c, backup, map[string]*retainedsnapshot.Entry{
+			"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
+		}))
+		family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
+		require.NoError(t, err)
+		require.Nil(t, family.Manifest)
+		shard := family.Shards[0]
+		recorder := &fakeEventRecorder{}
+		r := NewRetainedSnapshotReconcilerWithRecorder(velerotest.NewLogger(), c, c, clock.RealClock{}, recorder)
+
+		result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
+		require.NoError(t, err)
+		assert.Zero(t, result.RequeueAfter)
+
+		assert.Empty(t, backend.deleteCallsTo, "no DeleteSnapshot call without the Backup")
+		err = c.Get(t.Context(), client.ObjectKeyFromObject(shard), &corev1api.ConfigMap{})
+		assert.True(t, apierrors.IsNotFound(err), "the inert shard is swept")
+		orphans, err := retainedsnapshot.LoadOrphanEntries(t.Context(), c, backup.Namespace)
+		require.NoError(t, err)
+		found := false
+		for _, o := range orphans {
+			if o.BackupUID == "inert-uid" && o.DataUpload == "foo-du" {
+				found = true
+			}
+		}
+		assert.True(t, found, "the pending entry is moved to the orphan ConfigMap first")
+		assert.Contains(t, recorder.reasons, "RetainedSnapshotOrphaned")
 	})
 
 	t.Run("pending entries are moved to the orphan ConfigMap first", func(t *testing.T) {
@@ -535,14 +594,14 @@ func TestRetainedSnapshotControllerGarbageCollects(t *testing.T) {
 	})
 }
 
-// TestRetainedSnapshotControllerRetriggersItself proves the convergence of a
-// multi-shard family: a reconcile that finishes its own shard while a sibling
-// shard still has pending work re-enqueues itself with a requeue instead of
-// waking the request, so the deletion converges one bounded cycle at a time
-// without relying on a further write to trigger the next reconcile; the last
-// shard to empty wakes the request.
-func TestRetainedSnapshotControllerRetriggersItself(t *testing.T) {
-	backend := &fakeSnapshotBackend{snapshots: map[string]bool{retainedTestHandle: true, "another-snapshot": true}}
+// TestRetainedSnapshotControllerWalksEveryCountedShard proves the shard-0
+// read rule of design section 5: the controller is keyed by shard 0 and reads
+// exactly the entry shards the manifest counts, so one reconcile of the
+// manifest deletes the snapshots of every entry shard, a shard the manifest
+// does not count is left alone, and the request is never written by this
+// controller.
+func TestRetainedSnapshotControllerWalksEveryCountedShard(t *testing.T) {
+	backend := &fakeSnapshotBackend{snapshots: map[string]bool{retainedTestHandle: true, "another-snapshot": true, "uncounted-snapshot": true}}
 	backup := retainedTestBackup()
 	c := backend.client(t, backup)
 
@@ -550,41 +609,59 @@ func TestRetainedSnapshotControllerRetriggersItself(t *testing.T) {
 		"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
 	})
 	dbr := retainedTestRequest(t, c, backup)
-	// A sibling shard the gather split the family into, with its own pending
-	// entry, activated like the first.
+	// A sibling entry shard the gather split the family into, with its own
+	// pending entry; the manifest is rewritten to count it.
 	siblingEntry, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "another-snapshot", Driver: retainedTestDriver, Trusted: true})
 	require.NoError(t, err)
 	shardB := &corev1api.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      retainedsnapshot.FamilyNamePrefix(string(backup.UID)) + "1",
+			Name:      retainedsnapshot.FamilyNamePrefix(string(backup.UID)) + "2",
 			Namespace: backup.Namespace,
-			Labels:    retainedsnapshot.FamilyLabels(backup),
+			Labels:    retainedsnapshot.EntryShardLabels(backup),
 		},
-		Data: map[string]string{
-			retainedsnapshot.ActiveKey: "true",
-			"bar-du":                   string(siblingEntry),
-		},
+		Data: map[string]string{"bar-du": string(siblingEntry)},
 	}
 	require.NoError(t, c.Create(t.Context(), shardB))
+	require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), c, backup))
+	family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Equal(t, "2", family.Manifest.Data[retainedsnapshot.ShardCountKey])
+
+	// A shard written after the manifest, outside its count: not part of the
+	// activated view until a repair recounts it.
+	uncountedEntry, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "uncounted-snapshot", Driver: retainedTestDriver, Trusted: true})
+	require.NoError(t, err)
+	shardC := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      retainedsnapshot.FamilyNamePrefix(string(backup.UID)) + "3",
+			Namespace: backup.Namespace,
+			Labels:    retainedsnapshot.EntryShardLabels(backup),
+		},
+		Data: map[string]string{"baz-du": string(uncountedEntry)},
+	}
+	require.NoError(t, c.Create(t.Context(), shardC))
 
 	r := newRetainedTestReconciler(c)
 
-	// Reconciling the first shard deletes its own snapshot but leaves the
-	// sibling pending: the controller re-enqueues itself rather than waking
-	// the request early or stalling until an external write re-triggers it.
-	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shardA.Namespace, Name: shardA.Name}})
-	require.NoError(t, err)
-	assert.Equal(t, csi.RetainedSnapshotDeletionTimeout, result.RequeueAfter,
-		"a reconcile with pending work left in the family must re-enqueue itself")
-	assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
-
-	// The self-requeue reconciles the sibling shard and empties the family;
-	// the request is never written by this controller.
-	result, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shardB.Namespace, Name: shardB.Name}})
+	// One reconcile of shard 0 walks shards 1 and 2 and deletes both
+	// snapshots; the uncounted shard 3 is untouched.
+	result, err := r.Reconcile(t.Context(), manifestRequest(shardA))
 	require.NoError(t, err)
 	assert.Zero(t, result.RequeueAfter, "an emptied family needs no further requeue")
-	assert.Equal(t, []string{retainedTestHandle, "another-snapshot"}, backend.deleteCallsTo)
+	assert.ElementsMatch(t, []string{retainedTestHandle, "another-snapshot"}, backend.deleteCallsTo)
+	assert.NotContains(t, getShard(t, c, shardA).Data, "foo-du")
+	assert.NotContains(t, getShard(t, c, shardB).Data, "bar-du")
+	assert.Contains(t, getShard(t, c, shardC).Data, "baz-du", "a shard the manifest does not count is not read")
 	assert.Equal(t, dbr.ResourceVersion, getRequest(t, c, dbr).ResourceVersion, "the request is never written by the retained-snapshot controller")
+
+	// The request's re-entry repairs the manifest, which recounts shard 3,
+	// and the next reconcile deletes its snapshot too.
+	require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), c, backup))
+	result, err = r.Reconcile(t.Context(), manifestRequest(shardA))
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.ElementsMatch(t, []string{retainedTestHandle, "another-snapshot", "uncounted-snapshot"}, backend.deleteCallsTo)
+	assert.NotContains(t, getShard(t, c, shardC).Data, "baz-du")
 }
 
 // TestBackupDeletionHandsOffToRetainedSnapshotController proves the handoff of
@@ -969,7 +1046,7 @@ func TestBackupDeletionWaitsOnFamilyMissedByCache(t *testing.T) {
 	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), apiClient, backup, map[string]*retainedsnapshot.Entry{
 		"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
 	}))
-	require.NoError(t, retainedsnapshot.Activate(t.Context(), apiClient, backup))
+	require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), apiClient, backup))
 	td.controller.apiReader = apiClient
 
 	_, err := td.controller.Reconcile(t.Context(), td.req)

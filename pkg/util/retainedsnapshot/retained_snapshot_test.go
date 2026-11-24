@@ -18,12 +18,15 @@ package retainedsnapshot
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -71,7 +74,8 @@ func listShards(t *testing.T, c client.Client) []*corev1api.ConfigMap {
 }
 
 // TestWriteEntriesGathersByKey proves the family is keyed by the DataUpload
-// name, stamped inactive, and merged on a retry instead of rejected.
+// name, written as inert entry shards from -1 with no shard 0, and merged on a
+// retry instead of rejected.
 func TestWriteEntriesGathersByKey(t *testing.T) {
 	c := velerotest.NewFakeControllerRuntimeClient(t)
 	backup := testBackup()
@@ -84,8 +88,12 @@ func TestWriteEntriesGathersByKey(t *testing.T) {
 	shards := listShards(t, c)
 	require.Len(t, shards, 1)
 	shard := shards[0]
-	assert.Equal(t, FamilyNamePrefix("backup-uid")+"0", shard.Name)
-	assert.Equal(t, "false", shard.Data[ActiveKey], "the gather stamps the inactive activation state")
+	assert.Equal(t, FamilyNamePrefix("backup-uid")+"1", shard.Name, "entry shards start at 1; shard 0 is the manifest")
+	assert.Equal(t, EntryShardLabels(backup), shard.Labels, "an entry shard carries the backup labels, not the family label")
+	assert.NotContains(t, shard.Data, ShardCountKey)
+	family, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Nil(t, family.Manifest, "the gather writes no shard 0")
 	entry, err := UnmarshalEntry(shard.Data["du-1"])
 	require.NoError(t, err)
 	assert.Equal(t, "handle-1", entry.CSISnapshotHandle)
@@ -122,7 +130,7 @@ func TestWriteEntriesShardsBeforeLimit(t *testing.T) {
 	total := 0
 	for _, shard := range shards {
 		for key, value := range shard.Data {
-			if key == ActiveKey || key == CompletedKey {
+			if key == ShardCountKey || key == CompletedKey {
 				continue
 			}
 			total++
@@ -369,30 +377,138 @@ func TestTombstoneEntrySuppressesRegather(t *testing.T) {
 	assert.Zero(t, family.PendingEntries(), "a regather does not recreate an escalated entry")
 }
 
-// TestActivateIsolatedFromPending proves the activation semantics: the
-// retained-snapshot controller ignores an inactive ConfigMap, activation is
-// idempotent, and HasPendingWork counts only active shards.
-func TestActivateIsolatedFromPending(t *testing.T) {
+// TestWriteManifestActivates proves the shard-0 semantics: the entry shards
+// are inert until shard 0 exists, the manifest counts the entry shards and
+// carries the family label, its write is idempotent, deleting it deactivates
+// the family, and no manifest is written for a family with zero entries.
+func TestWriteManifestActivates(t *testing.T) {
 	c := velerotest.NewFakeControllerRuntimeClient(t)
 	backup := testBackup()
+
+	// Zero entries: no family at all.
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	family, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Nil(t, family.Manifest, "no manifest is written for a backup with zero entries")
+	assert.Empty(t, family.Shards)
 
 	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{
 		"du-1": testEntry("handle-1"),
 	}))
 
-	family, err := LoadFamily(t.Context(), c, backup)
-	require.NoError(t, err)
-	assert.False(t, family.IsActivated())
-	assert.False(t, family.HasPendingWork(), "an inactive shard has no work for the retained-snapshot controller")
-
-	require.NoError(t, Activate(t.Context(), c, backup))
 	family, err = LoadFamily(t.Context(), c, backup)
 	require.NoError(t, err)
+	assert.False(t, family.IsActivated())
+	assert.Equal(t, 1, family.PendingEntries(), "the inert view still counts the pending entries")
+	assert.False(t, family.HasPendingWork(), "an inert family has no work for the retained-snapshot controller")
+
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	family, err = LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	require.NotNil(t, family.Manifest)
+	assert.Equal(t, ManifestName("backup-uid"), family.Manifest.Name)
+	assert.Equal(t, "1", family.Manifest.Data[ShardCountKey])
+	assert.Equal(t, FamilyLabels(backup), family.Manifest.Labels)
+	assert.Equal(t, backup.Name, family.Manifest.Annotations[velerov1api.RetainedSnapshotsBackupNameAnnotation])
+	assert.True(t, IsManifest(family.Manifest))
+	assert.False(t, IsEntryShard(family.Manifest))
+	require.Len(t, family.Shards, 1)
+	assert.True(t, IsEntryShard(family.Shards[0]))
 	assert.True(t, family.IsActivated())
 	assert.True(t, family.HasPendingWork())
 
-	// Activation is idempotent and repairs a shard without the key.
-	require.NoError(t, Activate(t.Context(), c, backup))
+	// The write is idempotent.
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	again, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Equal(t, family.Manifest.ResourceVersion, again.Manifest.ResourceVersion, "an unchanged manifest is not rewritten")
+
+	// Deleting shard 0 deactivates the family; the entry shards stay for the
+	// retry's regather.
+	require.NoError(t, DeleteManifest(t.Context(), c, backup))
+	family, err = LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.False(t, family.IsActivated())
+	assert.Equal(t, 1, family.PendingEntries())
+	require.NoError(t, DeleteManifest(t.Context(), c, backup), "deleting a gone manifest is not an error")
+}
+
+// TestManifestSurvivesCrashBetweenShards proves the crash coverage of the
+// shard-0 design: entry shards written before a crash have no shard 0 and are
+// inert; a later manifest write counts exactly the shards that exist and the
+// reader loads exactly those by name; the tail deletes shard 0 first, so a
+// crash inside the tail leaves only inert shards behind.
+func TestManifestSurvivesCrashBetweenShards(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	backup := testBackup()
+
+	// A gather large enough to split into several entry shards, then a crash
+	// before shard 0 is written.
+	entries := map[string]*Entry{}
+	for i := 0; i < 5; i++ {
+		entries[duName(i)] = testEntry(strings.Repeat("h", 300*1024))
+	}
+	require.NoError(t, WriteEntries(t.Context(), c, backup, entries))
+	inert, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	require.Greater(t, len(inert.Shards), 1)
+	assert.Nil(t, inert.Manifest)
+	assert.False(t, inert.HasPendingWork(), "nothing is active until shard 0 exists")
+	for i, shard := range inert.Shards {
+		assert.Equal(t, fmt.Sprintf("%s%d", FamilyNamePrefix("backup-uid"), i+1), shard.Name, "entry shards are numbered from 1 without gaps")
+	}
+
+	// The retry's regather merges into the inert shards, and the manifest
+	// write counts them.
+	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{duName(0): testEntry(strings.Repeat("h", 300*1024))}))
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	active, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	require.NotNil(t, active.Manifest)
+	assert.Equal(t, strconv.Itoa(len(inert.Shards)), active.Manifest.Data[ShardCountKey])
+	assert.Len(t, active.Shards, len(inert.Shards), "the reader loads exactly the counted shards")
+	assert.Equal(t, 5, active.PendingEntries())
+	assert.True(t, active.HasPendingWork())
+
+	// A shard the manifest does not count is not part of the activated view,
+	// but the inert listing and the sweep still see it.
+	stray := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: backup.Namespace,
+			Name:      fmt.Sprintf("%s%d", FamilyNamePrefix("backup-uid"), len(inert.Shards)+1),
+			Labels:    EntryShardLabels(backup),
+		},
+		Data: map[string]string{"du-stray": mustMarshal(t, testEntry("stray"))},
+	}
+	require.NoError(t, c.Create(t.Context(), stray))
+	counted, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Len(t, counted.Shards, len(inert.Shards), "the activated view reads exactly shards 1..shardCount")
+	all, err := ListInertShards(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Len(t, all, len(inert.Shards)+1)
+	// A manifest repair counts it in.
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	repaired, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Len(t, repaired.Shards, len(inert.Shards)+1)
+
+	// The tail: shard 0 first, then the entry shards.
+	require.NoError(t, Delete(t.Context(), c, backup))
+	gone, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Nil(t, gone.Manifest)
+	assert.Empty(t, gone.Shards)
+	left, err := ListInertShards(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Empty(t, left)
+}
+
+func mustMarshal(t *testing.T, entry *Entry) string {
+	t.Helper()
+	value, err := marshalEntry(entry)
+	require.NoError(t, err)
+	return value
 }
 
 // TestOrphanEntriesOutliveBackup proves the orphan-snapshot ConfigMap is not
@@ -427,7 +543,7 @@ func TestSplitOrphanKey(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, "backup-uid", uid)
 	assert.Equal(t, "my.backup-abcde", du)
-	for _, key := range []string{ActiveKey, CompletedKey, "", ".du", "uid."} {
+	for _, key := range []string{ShardCountKey, CompletedKey, "", ".du", "uid."} {
 		_, _, ok := SplitOrphanKey(key)
 		assert.False(t, ok, key)
 	}
@@ -529,7 +645,7 @@ func shardPendingKeys(t *testing.T, shard *corev1api.ConfigMap) []string {
 	t.Helper()
 	keys := []string{}
 	for key := range shard.Data {
-		if key == ActiveKey || key == CompletedKey {
+		if key == ShardCountKey || key == CompletedKey {
 			continue
 		}
 		keys = append(keys, key)

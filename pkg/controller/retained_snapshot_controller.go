@@ -107,8 +107,11 @@ func (r *retainedSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&corev1api.ConfigMap{}).
 		WithEventFilter(predicate.NewPredicateFuncs(func(object client.Object) bool {
 			// Keyed by the record ConfigMap family, not by the backup or the
-			// request.
-			return object.GetLabels()[retainedsnapshot.FamilyLabel] == "true"
+			// request: shard 0, the manifest, for the deletion work, and the
+			// entry shards for the sweep of an inert family whose Backup is
+			// gone.
+			cm, ok := object.(*corev1api.ConfigMap)
+			return ok && (retainedsnapshot.IsManifest(cm) || retainedsnapshot.IsEntryShard(cm))
 		})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Named(constant.ControllerRetainedSnapshot).
@@ -128,7 +131,8 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 		return ctrl.Result{}, errors.Wrap(err, "error getting the retained snapshot record shard")
 	}
-	if shard.Labels[retainedsnapshot.FamilyLabel] != "true" {
+	isManifest := retainedsnapshot.IsManifest(shard)
+	if !isManifest && !retainedsnapshot.IsEntryShard(shard) {
 		return ctrl.Result{}, nil
 	}
 	backup, err := r.backupOfShard(ctx, shard)
@@ -137,61 +141,73 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 	if backup == nil {
 		// The Backup is gone by other means. A GC that finds a family whose
-		// Backup is gone removes it only when it has no pending entries; when
-		// pending entries exist, they are moved to the orphan-snapshot
-		// ConfigMap with an event, the same path as escalation and skip, and
-		// only then is the family removed, so no path deletes a pending record
-		// without leaving the orphan trace the Security section requires. The
-		// GC runs whatever the activation state: a family delivered inactive
-		// by the finalizer hold of section 3 whose Backup was deleted by other
-		// means must not sit unowned forever.
+		// Backup is gone, with or without a shard 0, removes it only when it
+		// has no pending entries; when pending entries exist, they are moved
+		// to the orphan-snapshot ConfigMap with an event, the same path as
+		// escalation and skip, and only then is the family removed, so no
+		// path deletes a pending record without leaving the orphan trace the
+		// Security section requires. The sweep covers an inert family too: an
+		// entry parked by the finalizer hold of section 3, or a crash
+		// leftover, whose Backup was deleted by other means must not sit
+		// unowned forever.
 		return ctrl.Result{}, r.garbageCollectShard(ctx, shard, log)
 	}
 
-	// The retained-snapshot controller ignores an inactive ConfigMap, so a
-	// deletion whose repository step failed gathers records but never creates
-	// a temporary content.
-	if shard.Data[retainedsnapshot.ActiveKey] != "true" {
-		log.Debug("The record shard is not activated, ignoring it")
-		return ctrl.Result{}, nil
+	// An entry shard of a live Backup is inert until the backup deletion
+	// writes shard 0: the controller is keyed by shard 0 and never lists entry
+	// shards on its own, so a deletion whose repository step failed gathers
+	// records but never creates a temporary content. The requeue re-checks
+	// whether the Backup is still there, for the sweep above.
+	if !isManifest {
+		log.Debug("The entry shard has no manifest, ignoring it")
+		return ctrl.Result{RequeueAfter: inertShardRecheckDelay}, nil
 	}
 
 	log = log.WithField("backup", backup.Name)
 
+	// Shard 0 then exactly the entry shards it counts.
+	family, err := retainedsnapshot.LoadFamily(ctx, r.Client, backup)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "error reading the retained snapshot records")
+	}
+
 	retry := false
-	pending := pendingShardKeys(shard)
-	for _, name := range pending {
-		outcome, err := r.deleteEntry(ctx, backup, shard, name, log)
-		if err != nil {
-			// An uncounted failure -- credentials, clear-status, an unknown
-			// message, an API error -- fails the backup deletion so it can be
-			// retried, and sets the family inactive so no unowned work
-			// continues; the retry is a new request that regathers from the
-			// ConfigMap, which is idempotent, re-activates the family and
-			// replays only the unfinished entries (design section 4).
-			if deactivateErr := retainedsnapshot.Deactivate(ctx, r.Client, backup); deactivateErr != nil {
-				log.WithError(deactivateErr).Error("Error deactivating the retained snapshot records")
-				return ctrl.Result{}, deactivateErr
+	for _, entryShard := range family.Shards {
+		for _, name := range pendingShardKeys(entryShard) {
+			outcome, err := r.deleteEntry(ctx, backup, entryShard, name, log)
+			if err != nil {
+				// An uncounted failure -- credentials, clear-status, an
+				// unknown message, an API error -- fails the backup deletion
+				// so it can be retried, and deletes shard 0 so no unowned
+				// work continues; the retry is a new request that regathers
+				// into the inert entry shards, which is idempotent, writes
+				// shard 0 again and replays only the unfinished entries
+				// (design section 4).
+				if deactivateErr := retainedsnapshot.DeleteManifest(ctx, r.Client, backup); deactivateErr != nil {
+					log.WithError(deactivateErr).Error("Error deleting the retained snapshot record manifest")
+					return ctrl.Result{}, deactivateErr
+				}
+				if failErr := r.failDeleteBackupRequest(ctx, backup, err); failErr != nil {
+					log.WithError(failErr).Error("Error failing the backup deletion")
+					return ctrl.Result{}, failErr
+				}
+				log.WithError(err).Errorf("Error deleting the retained snapshot of DataUpload %s, failing the backup deletion", name)
+				return ctrl.Result{}, nil
 			}
-			if failErr := r.failDeleteBackupRequest(ctx, backup, err); failErr != nil {
-				log.WithError(failErr).Error("Error failing the backup deletion")
-				return ctrl.Result{}, failErr
+			switch outcome {
+			case entryOrphaned:
+				// The entry was skipped or escalated, its record moved to the
+				// orphan-snapshot ConfigMap; the deletion proceeds.
+				log.Infof("The retained snapshot of DataUpload %s was skipped, its record is in the orphan-snapshot ConfigMap", name)
+			case entryRetrying:
+				// A counted DeleteSnapshot failure under the bound does not
+				// fail the request: it stays InProgress with its annotation,
+				// and this controller requeues on its own. Failing the request
+				// would kill the only object the watches can re-enter, and
+				// the backup would sit in Deleting until a manual retry
+				// (design section 4).
+				retry = true
 			}
-			log.WithError(err).Errorf("Error deleting the retained snapshot of DataUpload %s, failing the backup deletion", name)
-			return ctrl.Result{}, nil
-		}
-		switch outcome {
-		case entryOrphaned:
-			// The entry was skipped or escalated, its record moved to the
-			// orphan-snapshot ConfigMap; the deletion proceeds.
-			log.Infof("The retained snapshot of DataUpload %s was skipped, its record is in the orphan-snapshot ConfigMap", name)
-		case entryRetrying:
-			// A counted DeleteSnapshot failure under the bound does not fail
-			// the request: it stays InProgress with its annotation, and this
-			// controller requeues on its own. Failing the request would kill
-			// the only object the wake can re-enter, and the backup would sit
-			// in Deleting until a manual retry (design section 4).
-			retry = true
 		}
 	}
 	if retry {
@@ -207,7 +223,7 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// section 4). While pending work remains, this reconcile's writes
 	// re-enqueue the shard, and the requeue below is the backstop for a
 	// deletion whose wait expired without a further write.
-	family, err := retainedsnapshot.LoadFamily(ctx, r.Client, backup)
+	family, err = retainedsnapshot.LoadFamily(ctx, r.Client, backup)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error re-reading the retained snapshot records")
 	}
@@ -266,6 +282,11 @@ const (
 // DeleteSnapshot failure under the bound. Each attempt is itself bounded by
 // the deletion timeout, so the delay only spaces the attempts.
 var retainedSnapshotRetryDelay = 10 * time.Second
+
+// inertShardRecheckDelay is the requeue delay of an entry shard whose family
+// has no shard 0 while its Backup still exists: the shard is inert, and the
+// requeue only re-checks whether the Backup is gone, for the sweep.
+var inertShardRecheckDelay = time.Hour
 
 // deleteEntry deletes the retained snapshot of one DataUpload; see
 // entryOutcome for the results. A returned error is an uncounted failure that
@@ -423,16 +444,14 @@ func (r *retainedSnapshotReconciler) driverExists(ctx context.Context, driver st
 	return false, nil
 }
 
-// garbageCollectShard removes a record family whose Backup is gone by other
-// means: without pending entries the shard is simply deleted; with pending
-// entries they are moved to the orphan-snapshot ConfigMap with an event first,
-// so no path deletes a pending record without leaving the orphan trace.
+// garbageCollectShard sweeps a record family whose Backup is gone by other
+// means, keyed on the backup-uid label: shard 0, when there is one, and every
+// entry shard of the UID. A shard without pending entries is simply deleted;
+// pending entries are moved to the orphan-snapshot ConfigMap with an event
+// first, so no path deletes a pending record without leaving the orphan trace.
+// An inert family -- entry shards and no shard 0, parked by the finalizer hold
+// or left by a crash -- is swept the same way.
 func (r *retainedSnapshotReconciler) garbageCollectShard(ctx context.Context, shard *corev1api.ConfigMap, log logrus.FieldLogger) error {
-	pending := pendingShardKeys(shard)
-	if len(pending) == 0 {
-		return client.IgnoreNotFound(r.Delete(ctx, shard))
-	}
-
 	// The Backup is gone, so the orphan entries are keyed by the backup name
 	// and UID the shard still carries.
 	backup := &velerov1api.Backup{
@@ -442,18 +461,61 @@ func (r *retainedSnapshotReconciler) garbageCollectShard(ctx context.Context, sh
 			UID:       types.UID(shard.Labels[velerov1api.BackupUIDLabel]),
 		},
 	}
-	for _, name := range pending {
-		entry, err := retainedsnapshot.UnmarshalEntry(shard.Data[name])
-		if err != nil {
-			entry = &retainedsnapshot.Entry{Attempts: retainedsnapshot.MaxAttempts}
-		}
-		if err := retainedsnapshot.WriteOrphanEntry(ctx, r.Client, backup, name, entry); err != nil {
-			return errors.Wrapf(err, "error moving the record of DataUpload %s to the orphan-snapshot ConfigMap", name)
+	if name := shard.Annotations[velerov1api.RetainedSnapshotsBackupNameAnnotation]; name != "" {
+		backup.Name = name
+	}
+	family, err := retainedsnapshot.LoadFamily(ctx, r.Client, backup)
+	if err != nil {
+		return err
+	}
+	// Shard 0 counts exactly the entry shards it was written for; the sweep
+	// also takes the inert shards a crash or a later delivery left outside
+	// that count.
+	shards := map[string]*corev1api.ConfigMap{shard.Name: shard}
+	for _, s := range family.Shards {
+		shards[s.Name] = s
+	}
+	if family.Manifest != nil {
+		shards[family.Manifest.Name] = family.Manifest
+	}
+	inert, err := retainedsnapshot.ListInertShards(ctx, r.Client, backup)
+	if err != nil {
+		return err
+	}
+	for _, s := range inert {
+		shards[s.Name] = s
+	}
+
+	moved := 0
+	for _, s := range shards {
+		for _, name := range pendingShardKeys(s) {
+			entry, err := retainedsnapshot.UnmarshalEntry(s.Data[name])
+			if err != nil {
+				entry = &retainedsnapshot.Entry{Attempts: retainedsnapshot.MaxAttempts}
+			}
+			if err := retainedsnapshot.WriteOrphanEntry(ctx, r.Client, backup, name, entry); err != nil {
+				return errors.Wrapf(err, "error moving the record of DataUpload %s to the orphan-snapshot ConfigMap", name)
+			}
+			moved++
 		}
 	}
-	r.eventf(shard, backup, "RetainedSnapshotOrphaned", "the backup is gone; %d pending retained snapshot records were moved to the orphan-snapshot ConfigMap for manual cleanup", len(pending))
-	log.Warnf("The backup is gone; moved %d pending retained snapshot records to the orphan-snapshot ConfigMap", len(pending))
-	return client.IgnoreNotFound(r.Delete(ctx, shard))
+	if moved > 0 {
+		r.eventf(shard, backup, "RetainedSnapshotOrphaned", "the backup is gone; %d pending retained snapshot records were moved to the orphan-snapshot ConfigMap for manual cleanup", moved)
+		log.Warnf("The backup is gone; moved %d pending retained snapshot records to the orphan-snapshot ConfigMap", moved)
+	}
+	// Shard 0 first, then the entry shards, as the tail does.
+	if family.Manifest != nil {
+		if err := client.IgnoreNotFound(r.Delete(ctx, family.Manifest)); err != nil {
+			return errors.Wrapf(err, "error deleting the retained snapshot record manifest %s", family.Manifest.Name)
+		}
+		delete(shards, family.Manifest.Name)
+	}
+	for _, s := range shards {
+		if err := client.IgnoreNotFound(r.Delete(ctx, s)); err != nil {
+			return errors.Wrapf(err, "error deleting the retained snapshot record shard %s", s.Name)
+		}
+	}
+	return nil
 }
 
 // failDeleteBackupRequest marks the DeleteBackupRequest that waits on this

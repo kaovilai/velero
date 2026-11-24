@@ -23,10 +23,15 @@ limitations under the License.
 // create-or-update, so a retry of `velero backup delete` merges into the map
 // an earlier, failed attempt left behind instead of failing on AlreadyExists.
 // ConfigMap data is limited to 1 MiB and a record is a few hundred bytes, so
-// the records are sharded, split before the limit and labeled by backup for
-// discovery. A surviving record means the snapshot was not released; even a
-// stale record is harmless, because a deletion that finds the snapshot already
-// gone is a success.
+// the records are sharded into entry shards -1 through -n, split before the
+// limit and labeled by backup for discovery. Shard -0 is the manifest: written
+// last, with shardCount n in its data and the family label, and that single
+// write activates the family. Readers load shard 0, then exactly shards 1
+// through n by name; a family without a shard 0 is inert -- an entry parked by
+// the DataUpload finalizer hold, or a crash leftover -- until the next deletion
+// merges into it and writes shard 0. A surviving record means the snapshot was
+// not released; even a stale record is harmless, because a deletion that finds
+// the snapshot already gone is a success.
 package retainedsnapshot
 
 import (
@@ -34,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -50,8 +56,11 @@ import (
 )
 
 const (
-	// FamilyLabel marks the ConfigMaps of a backup's retained snapshot record
-	// family. The retained-snapshot controller is keyed by it.
+	// FamilyLabel marks shard 0, the manifest, of a backup's retained snapshot
+	// record family. The retained-snapshot controller is keyed by it: it
+	// reads shard 0, then exactly the entry shards the manifest counts, and
+	// never lists entry shards on its own. The entry shards carry the backup
+	// labels but not this one, so a family without a shard 0 is inert.
 	FamilyLabel = "velero.io/retained-snapshots"
 
 	// OrphanLabel marks the ConfigMaps that hold snapshots the deletion
@@ -61,25 +70,27 @@ const (
 	// after the Backup object is gone.
 	OrphanLabel = "velero.io/orphan-snapshots"
 
-	// ActiveKey is the ConfigMap data key carrying the family's persisted
-	// activation state. The gather writes it as inactive; the DeleteBackupRequest
-	// stamps it active only after every prerequisite step -- repository data and
-	// DataUploads -- has succeeded. The retained-snapshot controller ignores an
-	// inactive ConfigMap, so a deletion whose repository step failed gathers
-	// records but never creates a temporary content. A shard without the key is
-	// never treated as complete or empty while unactivated.
-	ActiveKey = "active"
+	// ShardCountKey is the data key of shard 0, the manifest, carrying the
+	// number n of entry shards -1 through -n the family has. Shard 0 is the
+	// persisted activation: the gather writes the entry shards without it,
+	// and the DeleteBackupRequest writes it only after every prerequisite
+	// step -- repository data and DataUploads -- has succeeded. The
+	// retained-snapshot controller ignores a family without shard 0, so a
+	// deletion whose repository step failed gathers records but never creates
+	// a temporary content.
+	ShardCountKey = "shardCount"
 
 	// CompletedKey holds the JSON array of DataUpload names whose snapshots
-	// were confirmed deleted. A shard with no pending entries keeps its
+	// were confirmed deleted. An entry shard with no pending entries keeps its
 	// completed set -- the evidence that suppresses replay -- until the
 	// deletion finishes, so a later regather from the unchanged tarball does
 	// not recreate an entry.
 	CompletedKey = "completed"
 
-	// activeValue / inactiveValue are the two states of ActiveKey.
-	activeValue   = "true"
-	inactiveValue = "false"
+	// manifestIndex is the index of the manifest shard; entry shards start at
+	// firstEntryShardIndex.
+	manifestIndex        = 0
+	firstEntryShardIndex = 1
 
 	// dataBudget is the ConfigMap data size limit; the records are split into
 	// shards before the limit is reached.
@@ -105,12 +116,65 @@ func OrphanNamePrefix() string {
 	return "orphan-snapshots-"
 }
 
-// FamilyLabels returns the discovery labels of a backup's record family.
+// ManifestName returns the name of shard 0, the manifest, of a backup's
+// record family.
+func ManifestName(backupUID string) string {
+	return fmt.Sprintf("%s%d", FamilyNamePrefix(backupUID), manifestIndex)
+}
+
+// IsManifest reports whether the ConfigMap is a family's shard 0: a family
+// member -- prefixed and labeled with its backup UID -- that carries the family
+// label. Entry shards carry the backup labels only.
+func IsManifest(cm *corev1api.ConfigMap) bool {
+	uid := cm.Labels[velerov1api.BackupUIDLabel]
+	return uid != "" && cm.Labels[FamilyLabel] == "true" && cm.Name == ManifestName(uid)
+}
+
+// IsEntryShard reports whether the ConfigMap is an entry shard of a record
+// family: named retained-snapshots-<backup-UID>-<n> with n >= 1 for its own
+// backup UID label, and without the family label.
+func IsEntryShard(cm *corev1api.ConfigMap) bool {
+	uid := cm.Labels[velerov1api.BackupUIDLabel]
+	if uid == "" || cm.Labels[FamilyLabel] == "true" {
+		return false
+	}
+	_, ok := entryShardIndex(cm.Name, FamilyNamePrefix(uid))
+	return ok
+}
+
+// entryShardIndex parses the index of an entry shard name under the prefix.
+func entryShardIndex(name, prefix string) (int, bool) {
+	if !strings.HasPrefix(name, prefix) {
+		return 0, false
+	}
+	var index int
+	if _, err := fmt.Sscanf(name[len(prefix):], "%d", &index); err != nil || fmt.Sprintf("%s%d", prefix, index) != name {
+		return 0, false
+	}
+	if index < firstEntryShardIndex {
+		return 0, false
+	}
+	return index, true
+}
+
+// FamilyLabels returns the labels of shard 0, the manifest, of a backup's
+// record family: the backup labels and the family label the retained-snapshot
+// controller is keyed by.
 func FamilyLabels(backup *velerov1api.Backup) map[string]string {
+	labels := EntryShardLabels(backup)
+	labels[FamilyLabel] = "true"
+	return labels
+}
+
+// EntryShardLabels returns the labels of the entry shards of a backup's record
+// family: the backup labels only, so that an entry shard without a shard 0 is
+// inert for the retained-snapshot controller and still discoverable, by the
+// backup UID, for the gather that merges into it and for the sweep of a family
+// whose Backup is gone.
+func EntryShardLabels(backup *velerov1api.Backup) map[string]string {
 	return map[string]string{
 		velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
 		velerov1api.BackupUIDLabel:  string(backup.UID),
-		FamilyLabel:                 "true",
 	}
 }
 
@@ -199,39 +263,104 @@ func UnmarshalEntry(value string) (*Entry, error) {
 	return entry, nil
 }
 
-// Family is the shard family of one backup's records, discovered by label.
-// No shard is special, and "the family empties" means every shard of the
-// family is empty of pending entries.
+// Family is the shard family of one backup's records: the manifest, shard 0,
+// when the family is activated, and the entry shards -1 through -n. "The
+// family empties" means every entry shard is empty of pending entries.
 type Family struct {
+	// Manifest is shard 0, nil while the family is inert.
+	Manifest *corev1api.ConfigMap
+	// Shards are the entry shards, in name order.
 	Shards []*corev1api.ConfigMap
 }
 
-// LoadFamily discovers a backup's shard family by label. A backup whose
-// records were never gathered, or whose family a previous attempt already
-// emptied and deleted, returns an empty family. The reader may be an uncached
-// API reader: the backup-deletion controller's safety decisions must not be
-// made on an informer-lagged list that misses a shard a gather just created.
+// LoadFamily loads a backup's shard family. With a shard 0 it reads the
+// manifest, then exactly entry shards 1 through shardCount by name; a shard
+// the manifest counts but that is gone is skipped. Without a shard 0 the
+// family is inert and the entry shards are discovered by the backup labels
+// and the name prefix, which is the view the gather merges into and the
+// manifest write counts. A backup whose records were never gathered, or whose
+// family a previous attempt already emptied and deleted, returns an empty
+// family. The reader may be an uncached API reader: the backup-deletion
+// controller's safety decisions must not be made on an informer-lagged read
+// that misses a shard a gather just created.
 func LoadFamily(ctx context.Context, c client.Reader, backup *velerov1api.Backup) (*Family, error) {
+	family := &Family{}
+	manifest := &corev1api.ConfigMap{}
+	err := c.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: ManifestName(string(backup.UID))}, manifest)
+	switch {
+	case err == nil:
+		family.Manifest = manifest
+		count, err := shardCountOf(manifest)
+		if err != nil {
+			return nil, err
+		}
+		prefix := FamilyNamePrefix(string(backup.UID))
+		for index := firstEntryShardIndex; index <= count; index++ {
+			shard := &corev1api.ConfigMap{}
+			if err := c.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: fmt.Sprintf("%s%d", prefix, index)}, shard); err != nil {
+				if isNotFound(err) {
+					continue
+				}
+				return nil, errors.Wrapf(err, "error getting the retained snapshot record shard %s%d", prefix, index)
+			}
+			family.Shards = append(family.Shards, shard)
+		}
+		return family, nil
+	case isNotFound(err):
+		shards, err := listEntryShards(ctx, c, backup)
+		if err != nil {
+			return nil, err
+		}
+		family.Shards = shards
+		return family, nil
+	default:
+		return nil, errors.Wrap(err, "error getting the retained snapshot record manifest")
+	}
+}
+
+// ListInertShards discovers the entry shards of a backup by its labels and the
+// family name prefix, whether or not the family has a shard 0: the view the
+// gather merges into, the manifest write counts, and the sweep of a family
+// whose Backup is gone removes. A reader working a live deletion uses
+// LoadFamily instead, which reads exactly the shards the manifest counts.
+func ListInertShards(ctx context.Context, c client.Reader, backup *velerov1api.Backup) ([]*corev1api.ConfigMap, error) {
+	return listEntryShards(ctx, c, backup)
+}
+
+// listEntryShards discovers the entry shards of a backup by its labels and the
+// family name prefix, the inert view a manifest write counts.
+func listEntryShards(ctx context.Context, c client.Reader, backup *velerov1api.Backup) ([]*corev1api.ConfigMap, error) {
 	list := &corev1api.ConfigMapList{}
 	if err := c.List(ctx, list, &client.ListOptions{
 		Namespace:     backup.Namespace,
-		LabelSelector: labels.SelectorFromSet(FamilyLabels(backup)),
+		LabelSelector: labels.SelectorFromSet(EntryShardLabels(backup)),
 	}); err != nil {
-		return nil, errors.Wrap(err, "error listing the retained snapshot record family")
+		return nil, errors.Wrap(err, "error listing the retained snapshot record shards")
 	}
-	family := &Family{}
+	prefix := FamilyNamePrefix(string(backup.UID))
+	shards := []*corev1api.ConfigMap{}
 	for i := range list.Items {
-		family.Shards = append(family.Shards, &list.Items[i])
+		if _, ok := entryShardIndex(list.Items[i].Name, prefix); ok && list.Items[i].Labels[FamilyLabel] != "true" {
+			shards = append(shards, &list.Items[i])
+		}
 	}
-	sort.Slice(family.Shards, func(i, j int) bool {
-		return family.Shards[i].Name < family.Shards[j].Name
+	sort.Slice(shards, func(i, j int) bool {
+		return shards[i].Name < shards[j].Name
 	})
-	return family, nil
+	return shards, nil
 }
 
-// IsEmpty reports whether no shard of the family carries a pending entry. A
-// shard with no pending entries still counts its completed set, and an
-// inactive shard is never treated as complete or empty for the activation
+func shardCountOf(manifest *corev1api.ConfigMap) (int, error) {
+	var count int
+	if _, err := fmt.Sscanf(manifest.Data[ShardCountKey], "%d", &count); err != nil || count < 0 {
+		return 0, errors.Errorf("the retained snapshot record manifest %s carries no valid %s: %q", manifest.Name, ShardCountKey, manifest.Data[ShardCountKey])
+	}
+	return count, nil
+}
+
+// IsEmpty reports whether no entry shard of the family carries a pending
+// entry. A shard with no pending entries still counts its completed set, and
+// an inert family is never treated as complete or empty for the activation
 // decision; see HasPendingWork.
 func (f *Family) IsEmpty() bool {
 	return f.PendingEntries() == 0
@@ -247,31 +376,16 @@ func (f *Family) PendingEntries() int {
 }
 
 // HasPendingWork reports whether the family has work for the retained-snapshot
-// controller: an active shard with a pending entry. An inactive shard is never
-// treated as complete or empty while unactivated, so a family that is entirely
-// inactive has no work but also does not count as finished for a request that
-// has not activated it yet; the request decides through IsActivated.
+// controller: a shard 0 and a pending entry. An inert family has no work but
+// also does not count as finished for a request that has not activated it
+// yet; the request decides through IsActivated.
 func (f *Family) HasPendingWork() bool {
-	for _, shard := range f.Shards {
-		if shard.Data[ActiveKey] != activeValue {
-			continue
-		}
-		if len(pendingKeys(shard)) > 0 {
-			return true
-		}
-	}
-	return false
+	return f.IsActivated() && f.PendingEntries() > 0
 }
 
-// IsActivated reports whether every shard of the family carries the active
-// state. A shard without the key counts as unactivated.
+// IsActivated reports whether the family has its shard 0, the manifest.
 func (f *Family) IsActivated() bool {
-	for _, shard := range f.Shards {
-		if shard.Data[ActiveKey] != activeValue {
-			return false
-		}
-	}
-	return len(f.Shards) > 0
+	return f.Manifest != nil
 }
 
 // Entry returns the pending entry of the named DataUpload.
@@ -308,7 +422,7 @@ func (f *Family) CompletedSet() map[string]struct{} {
 func pendingKeys(shard *corev1api.ConfigMap) []string {
 	var keys []string
 	for key := range shard.Data {
-		if key == ActiveKey || key == CompletedKey {
+		if key == ShardCountKey || key == CompletedKey {
 			continue
 		}
 		keys = append(keys, key)
@@ -325,16 +439,18 @@ func shardSize(shard *corev1api.ConfigMap) int {
 	return size
 }
 
-// WriteEntries merges entries into the backup's shard family, create-or-update,
-// keyed by the DataUpload name, and stamps the inactive activation state on
-// every shard it creates or merges. An existing map from an earlier, failed
-// attempt of the same deletion is merged into, never rejected. An entry whose
-// DataUpload name is in a shard's completed set is not resurrected; where both
-// the family and the given entries carry a record for the same DataUpload, the
-// given entry wins, except that its persisted attempt count merges with, never
-// resets, the count already in the family.
+// WriteEntries merges entries into the backup's entry shards -1 through -n,
+// create-or-update, keyed by the DataUpload name. The entry shards are written
+// inert, with the backup labels but not the family label; the manifest, shard
+// 0, is WriteManifest's. An existing shard from an earlier, failed attempt of
+// the same deletion is merged into, never rejected. An entry whose DataUpload
+// name is in a shard's completed set is not resurrected; where both the family
+// and the given entries carry a record for the same DataUpload, the given
+// entry wins, except that its persisted attempt count merges with, never
+// resets, the count already in the family. No shard is written for zero
+// entries.
 func WriteEntries(ctx context.Context, c client.Client, backup *velerov1api.Backup, entries map[string]*Entry) error {
-	return writeShardedEntries(ctx, c, backup, FamilyLabels(backup), FamilyNamePrefix(string(backup.UID)), entries)
+	return writeShardedEntries(ctx, c, backup, EntryShardLabels(backup), FamilyNamePrefix(string(backup.UID)), firstEntryShardIndex, entries)
 }
 
 // WriteOrphanEntry merges one escalated or skipped entry into the
@@ -345,7 +461,7 @@ func WriteEntries(ctx context.Context, c client.Client, backup *velerov1api.Back
 // cleaned up by hand is the operator's action.
 func WriteOrphanEntry(ctx context.Context, c client.Client, backup *velerov1api.Backup, duName string, entry *Entry) error {
 	entries := map[string]*Entry{string(backup.UID) + "." + duName: entry}
-	return writeShardedEntries(ctx, c, backup, map[string]string{OrphanLabel: "true"}, OrphanNamePrefix(), entries)
+	return writeShardedEntries(ctx, c, backup, map[string]string{OrphanLabel: "true"}, OrphanNamePrefix(), 0, entries)
 }
 
 // OrphanEntry is one entry of the orphan-snapshot ConfigMaps, with the
@@ -360,7 +476,7 @@ type OrphanEntry struct {
 
 // SplitOrphanKey splits an orphan entry key into its backup UID and DataUpload
 // name. A UID carries no dot, so the first dot is the separator; the shard's
-// bookkeeping keys (active, completed) carry none and are not entries.
+// bookkeeping keys (completed, shardCount) carry none and are not entries.
 func SplitOrphanKey(key string) (uid, duName string, ok bool) {
 	i := strings.IndexByte(key, '.')
 	if i <= 0 || i == len(key)-1 {
@@ -450,14 +566,19 @@ func RemoveOrphanEntriesForSnapshot(ctx context.Context, c client.Client, namesp
 	return removed, nil
 }
 
-func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1api.Backup, shardLabels map[string]string, namePrefix string, entries map[string]*Entry) error {
+// writeShardedEntries merges entries into the shards carrying shardLabels under
+// namePrefix, numbering new shards from firstIndex upward. The family's entry
+// shards start at 1, shard 0 being the manifest; the orphan shards start at 0.
+func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1api.Backup, shardLabels map[string]string, namePrefix string, firstIndex int, entries map[string]*Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
 	// Discover the shards carrying the same labels and prefix: an orphan write
 	// and a family write must not see each other's shards, so both the labels
-	// and the name prefix narrow the list.
+	// and the name prefix narrow the list. The family's shard 0 carries the
+	// family label on top of these labels and is listed too; it holds no
+	// entries and is never written here.
 	list := &corev1api.ConfigMapList{}
 	if err := c.List(ctx, list, &client.ListOptions{
 		Namespace:     backup.Namespace,
@@ -466,9 +587,19 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 		return errors.Wrap(err, "error listing the retained snapshot shards")
 	}
 	shards := map[string]*corev1api.ConfigMap{}
+	nextIndex := firstIndex
 	for i := range list.Items {
-		if len(list.Items[i].Name) > len(namePrefix) && list.Items[i].Name[:len(namePrefix)] == namePrefix {
-			shards[list.Items[i].Name] = &list.Items[i]
+		cm := &list.Items[i]
+		if !strings.HasPrefix(cm.Name, namePrefix) || cm.Labels[FamilyLabel] == "true" {
+			continue
+		}
+		var index int
+		if _, err := fmt.Sscanf(cm.Name[len(namePrefix):], "%d", &index); err != nil || fmt.Sprintf("%s%d", namePrefix, index) != cm.Name || index < firstIndex {
+			continue
+		}
+		shards[cm.Name] = cm
+		if index >= nextIndex {
+			nextIndex = index + 1
 		}
 	}
 
@@ -486,7 +617,6 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 	}
 	sort.Strings(names)
 
-	nextIndex := len(shards)
 	// Only the shards an entry was written into are persisted: the delete
 	// action gathers once per DataUpload in the tarball, and rewriting every
 	// shard on each of those calls would make the API traffic quadratic in
@@ -545,7 +675,6 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 		}
 		shard.Annotations[velerov1api.RetainedSnapshotsBackupNameAnnotation] = backup.Name
 		shard.Data[name] = value
-		shard.Data[ActiveKey] = inactiveValue
 		shards[shard.Name] = shard
 		dirty[shard.Name] = struct{}{}
 	}
@@ -707,64 +836,99 @@ func RemoveEntry(ctx context.Context, c client.Client, backup *velerov1api.Backu
 	return nil
 }
 
-// Activate stamps the active state on every shard of the family, so a
-// deletion whose repository step failed gathers records but never has them
-// deleted: the retained-snapshot controller ignores an inactive ConfigMap.
-// Shards without the key are activated here too, which is how the request's
-// re-entry repairs an activation a crash interrupted.
-func Activate(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
-	family, err := LoadFamily(ctx, c, backup)
+// WriteManifest writes shard 0 of the family, the manifest, with the count of
+// the entry shards discovered by the backup labels in its data and the family
+// label, which is the single write that activates the family: the
+// retained-snapshot controller is keyed by shard 0 and reads exactly the entry
+// shards it counts. It is written only after every prerequisite step of the
+// deletion -- repository data and DataUploads -- has succeeded, so a deletion
+// whose repository step failed gathers records but never has them deleted. It
+// is idempotent, create-or-update, which is how the request's re-entry repairs
+// a manifest write a crash interrupted. No manifest is written for a family
+// without entry shards, so a backup with zero entries has no family.
+func WriteManifest(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
+	shards, err := listEntryShards(ctx, c, backup)
 	if err != nil {
 		return err
 	}
-	for _, shard := range family.Shards {
-		if shard.Data[ActiveKey] == activeValue {
-			continue
+	if len(shards) == 0 {
+		return nil
+	}
+	prefix := FamilyNamePrefix(string(backup.UID))
+	count := 0
+	for _, shard := range shards {
+		if index, ok := entryShardIndex(shard.Name, prefix); ok && index > count {
+			count = index
 		}
-		if shard.Data == nil {
-			shard.Data = map[string]string{}
+	}
+
+	manifest := &corev1api.ConfigMap{}
+	err = c.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: ManifestName(string(backup.UID))}, manifest)
+	switch {
+	case isNotFound(err):
+		manifest = &corev1api.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   backup.Namespace,
+				Name:        ManifestName(string(backup.UID)),
+				Labels:      FamilyLabels(backup),
+				Annotations: map[string]string{velerov1api.RetainedSnapshotsBackupNameAnnotation: backup.Name},
+			},
+			Data: map[string]string{ShardCountKey: strconv.Itoa(count)},
 		}
-		shard.Data[ActiveKey] = activeValue
-		if err := c.Update(ctx, shard); err != nil {
-			return errors.Wrapf(err, "error activating the retained snapshot shard %s", shard.Name)
+		if err := c.Create(ctx, manifest); err != nil && !apierrors.IsAlreadyExists(err) {
+			return errors.Wrapf(err, "error creating the retained snapshot record manifest %s", manifest.Name)
 		}
+		return nil
+	case err != nil:
+		return errors.Wrap(err, "error getting the retained snapshot record manifest")
+	}
+	if manifest.Data[ShardCountKey] == strconv.Itoa(count) && manifest.Labels[FamilyLabel] == "true" {
+		return nil
+	}
+	if manifest.Data == nil {
+		manifest.Data = map[string]string{}
+	}
+	manifest.Data[ShardCountKey] = strconv.Itoa(count)
+	if manifest.Labels == nil {
+		manifest.Labels = map[string]string{}
+	}
+	for key, value := range FamilyLabels(backup) {
+		manifest.Labels[key] = value
+	}
+	if err := c.Update(ctx, manifest); err != nil {
+		return errors.Wrapf(err, "error updating the retained snapshot record manifest %s", manifest.Name)
 	}
 	return nil
 }
 
-// Deactivate stamps the inactive state on every shard of the family, so no
-// unowned work continues after the DeleteBackupRequest waiting on the family
-// is failed: a credential, clear-status or unknown failure marks the request
-// Processed and sets the family inactive, and the retry is a new request that
-// re-activates it (design section 4).
-func Deactivate(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
-	family, err := LoadFamily(ctx, c, backup)
-	if err != nil {
-		return err
-	}
-	for _, shard := range family.Shards {
-		if shard.Data[ActiveKey] == inactiveValue {
-			continue
-		}
-		if shard.Data == nil {
-			shard.Data = map[string]string{}
-		}
-		shard.Data[ActiveKey] = inactiveValue
-		if err := c.Update(ctx, shard); err != nil {
-			return errors.Wrapf(err, "error deactivating the retained snapshot shard %s", shard.Name)
-		}
+// DeleteManifest removes shard 0 of the family, so no unowned work continues
+// after the DeleteBackupRequest waiting on the family is failed: a credential,
+// clear-status or unknown failure marks the request Processed and deletes
+// shard 0, and the retry is a new request that regathers into the inert entry
+// shards and writes shard 0 again (design section 4). A manifest that is
+// already gone is not an error.
+func DeleteManifest(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
+	manifest := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: backup.Namespace, Name: ManifestName(string(backup.UID))}}
+	if err := c.Delete(ctx, manifest); err != nil && !isNotFound(err) {
+		return errors.Wrapf(err, "error deleting the retained snapshot record manifest %s", manifest.Name)
 	}
 	return nil
 }
 
-// Delete removes the shard family of the backup. The tail of the deletion
-// removes the family itself; it is not left to the Backup's garbage collection.
+// Delete removes the shard family of the backup: shard 0 first, then the
+// entry shards, so a crash inside the tail leaves only inert shards behind,
+// which the sweep of a family whose Backup is gone removes. The tail of the
+// deletion removes the family itself; it is not left to the Backup's garbage
+// collection.
 func Delete(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
-	family, err := LoadFamily(ctx, c, backup)
+	if err := DeleteManifest(ctx, c, backup); err != nil {
+		return err
+	}
+	shards, err := listEntryShards(ctx, c, backup)
 	if err != nil {
 		return err
 	}
-	for _, shard := range family.Shards {
+	for _, shard := range shards {
 		if err := c.Delete(ctx, shard); err != nil && !isNotFound(err) {
 			return errors.Wrapf(err, "error deleting the retained snapshot shard %s", shard.Name)
 		}
