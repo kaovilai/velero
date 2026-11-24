@@ -33,6 +33,8 @@ import (
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
+	"github.com/velero-io/velero/pkg/datapath"
+	"github.com/velero-io/velero/pkg/uploader/block"
 	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/datamover"
 	"github.com/velero-io/velero/pkg/util/kube"
@@ -678,4 +680,66 @@ func (r *DataUploadReconciler) deliverRetainedSnapshotRecord(ctx context.Context
 	}
 	log.Warnf("The backup %s of the deleted DataUpload %s is gone; its retained snapshot record %s was moved to the orphan-snapshot ConfigMap for manual cleanup", backupName, du.Name, entry.CSISnapshotHandle)
 	return nil
+}
+
+// fallbackReasonOf returns the reason a velero-block incremental fell back to
+// a full read, as the uploader classified it, refined with what the node-agent
+// can see: when the driver failed to compute the delta, and the previous
+// completed DataUpload of the same PVC carries no retention record, the base
+// snapshot was not retained -- the most common Case 2 cause, which the
+// driver's own error (Ceph RBD answers a deleted base with an internal error)
+// cannot name. The uploader's reason stays as the detail.
+func (r *DataUploadReconciler) fallbackReasonOf(ctx context.Context, du *velerov2alpha1api.DataUpload, result datapath.BackupResult, log logrus.FieldLogger) string {
+	if !result.FallbackFull {
+		return ""
+	}
+	reason := result.FallbackReason
+	if reason == "" {
+		reason = "fallen back to a full read"
+	}
+	if !datamover.IsVeleroBlockDataMover(du.Spec.DataMover) ||
+		strings.HasPrefix(reason, block.FallbackReasonNoParent) ||
+		strings.HasPrefix(reason, block.FallbackReasonCBTUnavailable) {
+		return reason
+	}
+
+	previous := r.previousCompletedDataUpload(ctx, du, log)
+	if previous == nil {
+		return reason
+	}
+	if previous.Status.RetainedCSIStorageSnapshot == nil {
+		return fmt.Sprintf("base snapshot not retained by the previous backup (DataUpload %s); %s", previous.Name, reason)
+	}
+	return fmt.Sprintf("base snapshot %s of the previous backup (DataUpload %s) was retained but could not be used; %s",
+		previous.Status.RetainedCSIStorageSnapshot.CSISnapshotHandle, previous.Name, reason)
+}
+
+// previousCompletedDataUpload returns the most recently completed DataUpload
+// of the same PVC, by the pvc-uid label, or nil when there is none or the
+// lookup fails; the lookup only refines a diagnostic and never fails the
+// completion.
+func (r *DataUploadReconciler) previousCompletedDataUpload(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) *velerov2alpha1api.DataUpload {
+	pvcUID := du.Labels[velerov1api.PVCUIDLabel]
+	if pvcUID == "" {
+		return nil
+	}
+	list := &velerov2alpha1api.DataUploadList{}
+	if err := r.client.List(ctx, list, crclient.InNamespace(du.Namespace), crclient.MatchingLabels{velerov1api.PVCUIDLabel: pvcUID}); err != nil {
+		log.WithError(err).Debug("Failed to list the previous DataUploads of the PVC for the fallback reason")
+		return nil
+	}
+	var previous *velerov2alpha1api.DataUpload
+	for i := range list.Items {
+		candidate := &list.Items[i]
+		if candidate.Name == du.Name || candidate.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted || candidate.Status.CompletionTimestamp == nil {
+			continue
+		}
+		if du.Status.StartTimestamp != nil && candidate.Status.CompletionTimestamp.After(du.Status.StartTimestamp.Time) {
+			continue
+		}
+		if previous == nil || candidate.Status.CompletionTimestamp.After(previous.Status.CompletionTimestamp.Time) {
+			previous = candidate
+		}
+	}
+	return previous
 }

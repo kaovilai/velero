@@ -18,6 +18,7 @@ package output
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 	"text/tabwriter"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	"github.com/velero-io/velero/internal/volume"
@@ -32,6 +34,8 @@ import (
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/builder"
 	"github.com/velero-io/velero/pkg/itemoperation"
+	velerotest "github.com/velero-io/velero/pkg/test"
+	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 func TestDescribeUploaderConfig(t *testing.T) {
@@ -934,4 +938,129 @@ func TestDescribeBackupItemOperation(t *testing.T) {
 	describeBackupItemOperation(d, input)
 	d.out.Flush()
 	assert.Equal(t, expected, d.buf.String())
+}
+
+// TestDescribeDataMovementRetentionAndFallback covers the diagnostics the
+// retention design adds to `velero backup describe --details`: the fallback
+// reason next to the backup type, and the per-volume retention outcome with
+// the matching policy entry and the retained handle.
+func TestDescribeDataMovementRetentionAndFallback(t *testing.T) {
+	testcases := []struct {
+		name       string
+		volumeInfo *volume.BackupVolumeInfo
+		expect     string
+	}{
+		{
+			name: "retention applied with policy and handle",
+			volumeInfo: &volume.BackupVolumeInfo{
+				BackupMethod: volume.CSISnapshot, PVCNamespace: "ns", PVCName: "pvc", Result: volume.VolumeResultSucceeded,
+				SnapshotDataMoved: true, BackupType: velerov1api.BackupTypeIncremental,
+				SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{
+					DataMover: "velero-block", UploaderType: "kopia", OperationID: "op", Size: 10,
+					RetainSnapshotRequested: true, RetainSnapshotPolicy: "volumePolicies[1]", RetainedCSISnapshotHandle: "0001-handle",
+				},
+			},
+			expect: `  CSI Snapshots:
+    ns/pvc:
+      Data Movement:
+        Operation ID: op
+        Data Mover: velero-block
+        Backup Type: Incremental
+        Base Snapshot Retention: applied
+        Retention Policy: volumePolicies[1]
+        Retained Snapshot Handle: 0001-handle
+        Uploader Type: kopia
+        Moved data Size (bytes): 10
+        Result: succeeded
+`,
+		},
+		{
+			name: "retention requested but not retained, fallback with reason",
+			volumeInfo: &volume.BackupVolumeInfo{
+				BackupMethod: volume.CSISnapshot, PVCNamespace: "ns", PVCName: "pvc", Result: volume.VolumeResultSucceeded,
+				SnapshotDataMoved: true, BackupType: velerov1api.BackupTypeIncremental, FallbackFull: true,
+				FallbackReason: "base snapshot not retained by the previous backup (DataUpload prev); driver error: rbd",
+				SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{
+					DataMover: "velero-block", UploaderType: "kopia", OperationID: "op", Size: 10,
+					RetainSnapshotRequested: true, RetainSnapshotPolicy: "volumePolicies[0]",
+				},
+			},
+			expect: `  CSI Snapshots:
+    ns/pvc:
+      Data Movement:
+        Operation ID: op
+        Data Mover: velero-block
+        Backup Type: Incremental (fallen back to Full)
+        Fallback Reason: base snapshot not retained by the previous backup (DataUpload prev); driver error: rbd
+        Base Snapshot Retention: requested but not retained
+        Retention Policy: volumePolicies[0]
+        Uploader Type: kopia
+        Moved data Size (bytes): 10
+        Result: succeeded
+`,
+		},
+		{
+			name: "no retention requested prints no retention lines",
+			volumeInfo: &volume.BackupVolumeInfo{
+				BackupMethod: volume.CSISnapshot, PVCNamespace: "ns", PVCName: "pvc", Result: volume.VolumeResultSucceeded,
+				SnapshotDataMoved: true, BackupType: velerov1api.BackupTypeFull,
+				SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{DataMover: "velero-block", UploaderType: "kopia", OperationID: "op", Size: 10},
+			},
+			expect: `  CSI Snapshots:
+    ns/pvc:
+      Data Movement:
+        Operation ID: op
+        Data Mover: velero-block
+        Backup Type: Full
+        Uploader Type: kopia
+        Moved data Size (bytes): 10
+        Result: succeeded
+`,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
+			d.out.Init(d.buf, 0, 8, 2, ' ', 0)
+			describeCSISnapshots(d, true, []*volume.BackupVolumeInfo{tc.volumeInfo}, false)
+			d.out.Flush()
+			assert.Equal(t, tc.expect, d.buf.String())
+		})
+	}
+}
+
+// TestDescribeOrphanSnapshotRecords proves describe names the orphan-snapshot
+// ConfigMap holding this backup's skipped or escalated records, and only this
+// backup's: the entries are keyed by backup UID.
+func TestDescribeOrphanSnapshotRecords(t *testing.T) {
+	backup := builder.ForBackup("velero", "bak").Result()
+	backup.UID = "bak-uid"
+	mine, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-1", Driver: "rbd.csi.ceph.com", Attempts: 5})
+	require.NoError(t, err)
+	theirs, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-2", Driver: "rbd.csi.ceph.com"})
+	require.NoError(t, err)
+	orphans := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "orphan-snapshots-0", Labels: map[string]string{retainedsnapshot.OrphanLabel: "true"}},
+		Data:       map[string]string{"bak-uid.du-a": string(mine), "other-uid.du-b": string(theirs), retainedsnapshot.ActiveKey: "false"},
+	}
+	kbClient := velerotest.NewFakeControllerRuntimeClient(t, orphans)
+
+	d := &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
+	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
+	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, backup)
+	d.out.Flush()
+	assert.Equal(t, `
+Orphan Snapshot Records: 1 retained snapshot(s) were skipped or escalated and need manual cleanup
+  ConfigMap velero/orphan-snapshots-0:
+    DataUpload du-a: driver rbd.csi.ceph.com, snapshot handle h-1, attempts 5
+`, d.buf.String())
+
+	// A backup with no orphan records prints nothing.
+	none := builder.ForBackup("velero", "clean").Result()
+	none.UID = "clean-uid"
+	d = &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
+	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
+	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, none)
+	d.out.Flush()
+	assert.Empty(t, d.buf.String())
 }

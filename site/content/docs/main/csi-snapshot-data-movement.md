@@ -147,6 +147,9 @@ When retention applies, Velero owns the retained snapshot's lifecycle:
 - The retained snapshot is deleted when its backup is deleted, after the backup's repository data and `DataUpload`s, and only if every earlier step succeeded. Any earlier failure leaves the snapshot and its record in place, and the backup deletion can be retried. This is also how superseded snapshots are reclaimed: a retained snapshot that a newer backup of the same volume replaces is deleted when its own backup is deleted, not eagerly.
 - A failed, canceled or interrupted data movement never retains; its snapshot is reclaimed.
 - Before enabling `retainSnapshot`, the cluster's `DataUpload` CRD must carry the `retainedCSIStorageSnapshot` status field. On clusters that ship the CRD separately (for example OADp), upgrade the CRD first: while it predates the field, the API server prunes the record on write and every data movement that opts into retention fails.
+- Every `velero-block` `DataUpload` carries the retention decision in `spec.dataMoverConfig.retainSnapshot`, `"true"` or `"false"`, whether or not a policy matched, and `spec.dataMoverConfig.retainSnapshotPolicy` names the matching policy entry (for example `volumePolicies[1]`) when retention applies.
+- `velero backup describe --details` reports, per volume, whether retention was applied, which policy entry matched and the retained snapshot handle, and names the orphan-snapshot ConfigMap for records the deletion skipped or escalated.
+- A `DataUpload` deleted through the API while its backup still exists keeps its finalizer until the record is handed to the backup's `retained-snapshots-<backup-UID>-<n>` ConfigMap family, so the snapshot stays deletable with the backup; when the Backup is already gone, the record goes to the orphan-snapshot ConfigMap.
 
 Some CSI drivers need a secret to delete a snapshot. The secret is recorded with the retained snapshot; for a backup synced to another cluster, the secret must exist in that cluster too, or the backup deletion fails and can be retried once the secret is recreated.
 
@@ -323,7 +326,7 @@ For incremental backups using `velero-block`, Velero will automatically fall bac
 - The critical information is missing or cannot be retrieved from the parent snapshot.
 - The parent snapshot is missing in the backup repository.
 
-When fallback occurs, unallocated regions are still skipped and identical data blocks remain deduplicated by the backup repository. The backup description will clearly indicate that a fallback took place: `Backup Type: Incremental (fallen back to Full)`. In addition, the reason for the fallback is captured in the `status.activities` field of the corresponding `DataUpload` CR.
+When fallback occurs, unallocated regions are still skipped and identical data blocks remain deduplicated by the backup repository. The backup description will clearly indicate that a fallback took place: `Backup Type: Incremental (fallen back to Full)`, followed by a `Fallback Reason` line. The reason is also recorded in the `status.fallbackReason` field of the corresponding `DataUpload` CR: `no usable parent backup`, `base snapshot gone`, `CBT service unavailable` or `driver error`, each with the underlying error, and, when the previous backup of the volume did not retain its snapshot, `base snapshot not retained by the previous backup`. Operational detail is still captured in `status.activities`.
 
 ### Monitoring Backup Progress
 

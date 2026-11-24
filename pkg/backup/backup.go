@@ -1336,6 +1336,12 @@ func updateVolumeInfos(
 				volumeInfos[index].SnapshotDataMovementInfo.SourceSize = dataUpload.Status.SourceSize
 				volumeInfos[index].SnapshotDataMovementInfo.Phase = dataUpload.Status.Phase
 				volumeInfos[index].FallbackFull = dataUpload.Status.FallbackFull
+				volumeInfos[index].FallbackReason = dataUpload.Status.FallbackReason
+				volumeInfos[index].SnapshotDataMovementInfo.RetainSnapshotRequested = dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] == "true"
+				volumeInfos[index].SnapshotDataMovementInfo.RetainSnapshotPolicy = dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey]
+				if record := dataUpload.Status.RetainedCSIStorageSnapshot; record != nil {
+					volumeInfos[index].SnapshotDataMovementInfo.RetainedCSISnapshotHandle = record.CSISnapshotHandle
+				}
 
 				if dataUpload.Status.Phase == velerov2alpha1.DataUploadPhaseCompleted {
 					volumeInfos[index].Result = volume.VolumeResultSucceeded

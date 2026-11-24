@@ -601,6 +601,11 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 		return
 	}
 
+	// The fall back to a full read is otherwise silent; the reason is recorded
+	// on the DataUpload, refined with what the node-agent can see of the
+	// previous backup's retention (design, Implementation: diagnostics).
+	fallbackReason := r.fallbackReasonOf(ctx, &du, result.Backup, log)
+
 	// Update status to Completed with path & snapshot ID.
 	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
 		if isDataUploadInFinalState(du) {
@@ -613,6 +618,7 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 		du.Status.IncrementalBytes = result.Backup.IncrementalBytes
 		du.Status.SourceSize = result.Backup.SourceSize
 		du.Status.FallbackFull = result.Backup.FallbackFull
+		du.Status.FallbackReason = fallbackReason
 
 		du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
 		if result.Backup.EmptySnapshot {

@@ -210,6 +210,13 @@ spec:
                 description: FallbackFull indicates whether the incremental backup
                   has fallen back to full backup
                 type: boolean
+              fallbackReason:
+                description: |-
+                  FallbackReason records why an incremental backup fell back to a full read: the base
+                  snapshot was not retained, the base snapshot is gone, the CBT service failed, or no
+                  parent backup was usable. It is set for every velero-block incremental that fell back,
+                  with retention or without, because the fall back is otherwise silent.
+                type: string
               incrementalBytes:
                 description: |-
                   IncrementalBytes holds the number of bytes new or changed since the last backup.

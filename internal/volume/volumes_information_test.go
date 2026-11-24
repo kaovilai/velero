@@ -1031,6 +1031,92 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 				},
 			},
 		},
+		{
+			// The retention and fallback diagnostics of the block data mover
+			// travel from the DataUpload into the volume info describe reads.
+			name: "velero-block DataUpload with retention and fallback",
+			dataUpload: func() *velerov2alpha1.DataUpload {
+				du := builder.ForDataUpload("velero", "testDU").
+					DataMover("velero-block").
+					DataMoverConfig(map[string]string{
+						velerov2alpha1.RetainSnapshotDataMoverConfigKey:       "true",
+						velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey: "volumePolicies[1]",
+					}).
+					CSISnapshot(&velerov2alpha1.CSISnapshotSpec{VolumeSnapshot: "vs-01", SnapshotClass: "testClass", Driver: "rbd.csi.ceph.com"}).
+					SnapshotID("testSnapshotHandle").
+					StartTimestamp(&now).
+					CompletionTimestamp(&now).
+					TotalBytes(1024).
+					IncrementalBytes(1024).
+					Phase(velerov2alpha1.DataUploadPhaseCompleted).
+					Result()
+				du.Status.FallbackFull = true
+				du.Status.FallbackReason = "base snapshot gone: not found"
+				du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: "0001-retained", Driver: "rbd.csi.ceph.com"}
+				return du
+			}(),
+			vs:  builder.ForVolumeSnapshot(velerov1api.DefaultNamespace, "vs-01").Status().BoundVolumeSnapshotContentName("vsc-01").Result(),
+			vsc: builder.ForVolumeSnapshotContent("vsc-01").Driver("rbd.csi.ceph.com").Result(),
+			operation: &itemoperation.BackupOperation{
+				Spec: itemoperation.BackupOperationSpec{
+					OperationID: "testOperation",
+					ResourceIdentifier: velero.ResourceIdentifier{
+						GroupResource: schema.GroupResource{Group: "", Resource: "persistentvolumeclaims"},
+						Namespace:     "velero",
+						Name:          "testPVC",
+					},
+					PostOperationItems: []velero.ResourceIdentifier{{
+						GroupResource: schema.GroupResource{Group: "velero.io", Resource: "datauploads"},
+						Namespace:     "velero",
+						Name:          "testDU",
+					}},
+				},
+			},
+			pvMap: map[string]pvcPvInfo{
+				"testPV": {
+					PVCName:      "testPVC",
+					PVCNamespace: "velero",
+					PV: corev1api.PersistentVolume{
+						ObjectMeta: metav1.ObjectMeta{Name: "testPV"},
+						Spec:       corev1api.PersistentVolumeSpec{PersistentVolumeReclaimPolicy: corev1api.PersistentVolumeReclaimDelete},
+					},
+				},
+			},
+			expectedVolumeInfos: []*BackupVolumeInfo{
+				{
+					PVCName:             "testPVC",
+					PVCNamespace:        "velero",
+					PVName:              "testPV",
+					BackupMethod:        CSISnapshot,
+					SnapshotDataMoved:   true,
+					BackupType:          velerov1api.BackupTypeIncremental,
+					FallbackFull:        true,
+					FallbackReason:      "base snapshot gone: not found",
+					Result:              VolumeResultSucceeded,
+					StartTimestamp:      &now,
+					CompletionTimestamp: &now,
+					CSISnapshotInfo: &CSISnapshotInfo{
+						VSCName:        FieldValueIsUnknown,
+						SnapshotHandle: FieldValueIsUnknown,
+						OperationID:    FieldValueIsUnknown,
+						Driver:         "rbd.csi.ceph.com",
+					},
+					SnapshotDataMovementInfo: &BackupSnapshotDataMovementInfo{
+						DataMover:                 "velero-block",
+						UploaderType:              "velero-block",
+						OperationID:               "testOperation",
+						Phase:                     velerov2alpha1.DataUploadPhaseCompleted,
+						SnapshotHandle:            "testSnapshotHandle",
+						Size:                      1024,
+						IncrementalSize:           ptr.To(int64(1024)),
+						RetainSnapshotRequested:   true,
+						RetainSnapshotPolicy:      "volumePolicies[1]",
+						RetainedCSISnapshotHandle: "0001-retained",
+					},
+					PVInfo: &PVInfo{ReclaimPolicy: string(corev1api.PersistentVolumeReclaimDelete)},
+				},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -1071,6 +1157,8 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 				require.Equal(t, tc.expectedVolumeInfos[0].SnapshotDataMovementInfo, volumesInfo.volumeInfos[0].SnapshotDataMovementInfo)
 				require.Equal(t, tc.expectedVolumeInfos[0].CSISnapshotInfo, volumesInfo.volumeInfos[0].CSISnapshotInfo)
 				require.Equal(t, tc.expectedVolumeInfos[0].Result, volumesInfo.volumeInfos[0].Result)
+				require.Equal(t, tc.expectedVolumeInfos[0].FallbackFull, volumesInfo.volumeInfos[0].FallbackFull)
+				require.Equal(t, tc.expectedVolumeInfos[0].FallbackReason, volumesInfo.volumeInfos[0].FallbackReason)
 				if tc.expectedVolumeInfos[0].StartTimestamp != nil {
 					require.NotNil(t, volumesInfo.volumeInfos[0].StartTimestamp)
 					require.True(t, tc.expectedVolumeInfos[0].StartTimestamp.Equal(volumesInfo.volumeInfos[0].StartTimestamp))

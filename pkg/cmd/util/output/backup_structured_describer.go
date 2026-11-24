@@ -73,7 +73,36 @@ func DescribeBackupInSF(
 		if len(deleteRequests) > 0 {
 			DescribeDeleteBackupRequestsInSF(d, deleteRequests)
 		}
+
+		DescribeOrphanSnapshotRecordsInSF(ctx, kbClient, d, backup)
 	}, outputFormat)
+}
+
+// DescribeOrphanSnapshotRecordsInSF names the orphan-snapshot ConfigMaps that
+// hold retained snapshot records of this backup, in structured format.
+func DescribeOrphanSnapshotRecordsInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, backup *velerov1api.Backup) {
+	records, err := orphanSnapshotRecordsOf(ctx, kbClient, backup)
+	if err != nil {
+		d.Describe("orphanSnapshotRecords", map[string]any{"error": err.Error()})
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+	out := map[string]any{}
+	for _, cm := range sortedKeys(records) {
+		entries := []map[string]any{}
+		for _, rec := range records[cm] {
+			entries = append(entries, map[string]any{
+				"dataUpload":     rec.dataUpload,
+				"driver":         rec.entry.Driver,
+				"snapshotHandle": rec.entry.CSISnapshotHandle,
+				"attempts":       rec.entry.Attempts,
+			})
+		}
+		out[backup.Namespace+"/"+cm] = entries
+	}
+	d.Describe("orphanSnapshotRecords", out)
 }
 
 // DescribeBackupSpecInSF describes a backup spec in structured format.
@@ -428,6 +457,19 @@ func describeDataMovementInSF(details bool, info *volume.BackupVolumeInfo, snaps
 			}
 
 			dataMovement["backupType"] = backupType
+			if info.FallbackFull && info.FallbackReason != "" {
+				dataMovement["fallbackReason"] = info.FallbackReason
+			}
+		}
+
+		if retention := describeRetention(info.SnapshotDataMovementInfo); retention != "" {
+			dataMovement["baseSnapshotRetention"] = retention
+			if info.SnapshotDataMovementInfo.RetainSnapshotPolicy != "" {
+				dataMovement["retentionPolicy"] = info.SnapshotDataMovementInfo.RetainSnapshotPolicy
+			}
+			if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
+				dataMovement["retainedSnapshotHandle"] = info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle
+			}
 		}
 
 		dataMover := "velero"

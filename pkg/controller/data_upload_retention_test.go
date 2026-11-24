@@ -36,6 +36,7 @@ import (
 	clientgofake "k8s.io/client-go/kubernetes/fake"
 	clientTesting "k8s.io/client-go/testing"
 	testclocks "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -46,6 +47,7 @@ import (
 	"github.com/velero-io/velero/pkg/datapath"
 	"github.com/velero-io/velero/pkg/exposer"
 	velerotest "github.com/velero-io/velero/pkg/test"
+	"github.com/velero-io/velero/pkg/uploader/block"
 	"github.com/velero-io/velero/pkg/util/csi"
 	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
@@ -1422,5 +1424,90 @@ func TestReconcileHoldsFinalizerUntilRecordDelivered(t *testing.T) {
 		list := &corev1api.ConfigMapList{}
 		require.NoError(t, r.client.List(t.Context(), list))
 		assert.Empty(t, list.Items, "nothing is delivered without a record")
+	})
+}
+
+// TestFallbackReasonOf proves the node-agent's refinement of the uploader's
+// fallback reason (design, Implementation: diagnostics): a driver-side failure
+// is named "base snapshot not retained" when the previous completed
+// DataUpload of the PVC carries no retention record, kept as the retained
+// handle's failure when it does, and passed through for a missing parent or
+// an absent CBT service, where the previous backup's retention is beside the
+// point.
+func TestFallbackReasonOf(t *testing.T) {
+	start := metav1.NewTime(time.Now())
+	earlier := metav1.NewTime(start.Add(-time.Hour))
+	later := metav1.NewTime(start.Add(time.Hour))
+
+	newDU := func(name string, phase velerov2alpha1api.DataUploadPhase, completed *metav1.Time, record *velerov2alpha1api.RetainedCSIStorageSnapshot) *velerov2alpha1api.DataUpload {
+		du := builder.ForDataUpload(velerov1api.DefaultNamespace, name).
+			DataMover("velero-block").
+			Labels(map[string]string{velerov1api.PVCUIDLabel: "pvc-uid"}).
+			Phase(phase).
+			Result()
+		du.Status.CompletionTimestamp = completed
+		du.Status.RetainedCSIStorageSnapshot = record
+		return du
+	}
+	current := newDU("current", velerov2alpha1api.DataUploadPhaseInProgress, nil, nil)
+	current.Status.StartTimestamp = &start
+
+	tests := []struct {
+		name     string
+		result   datapath.BackupResult
+		previous []*velerov2alpha1api.DataUpload
+		want     string
+	}{
+		{name: "no fallback", result: datapath.BackupResult{}, want: ""},
+		{name: "no parent passes through", result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonNoParent + ": first backup"}, want: block.FallbackReasonNoParent + ": first backup"},
+		{name: "CBT unavailable passes through", result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonCBTUnavailable + ": none"}, want: block.FallbackReasonCBTUnavailable + ": none"},
+		{name: "driver error without a previous DataUpload", result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"}, want: block.FallbackReasonDriverError + ": rbd"},
+		{
+			name:     "previous backup did not retain",
+			result:   datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
+			previous: []*velerov2alpha1api.DataUpload{newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, nil)},
+			want:     "base snapshot not retained by the previous backup (DataUpload prev); " + block.FallbackReasonDriverError + ": rbd",
+		},
+		{
+			name:     "previous backup retained but the base could not be used",
+			result:   datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
+			previous: []*velerov2alpha1api.DataUpload{newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h-1", Driver: retentionDriver})},
+			want:     "base snapshot h-1 of the previous backup (DataUpload prev) was retained but could not be used; " + block.FallbackReasonBaseGone + ": not found",
+		},
+		{
+			name:   "the latest completed previous DataUpload wins, later and unfinished ones are ignored",
+			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
+			previous: []*velerov2alpha1api.DataUpload{
+				newDU("older", velerov2alpha1api.DataUploadPhaseCompleted, ptr.To(metav1.NewTime(earlier.Add(-time.Hour))), &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "old", Driver: retentionDriver}),
+				newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, nil),
+				newDU("after", velerov2alpha1api.DataUploadPhaseCompleted, &later, &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "new", Driver: retentionDriver}),
+				newDU("failed", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil),
+			},
+			want: "base snapshot not retained by the previous backup (DataUpload prev); " + block.FallbackReasonDriverError + ": rbd",
+		},
+		{
+			name:   "an empty uploader reason still records the fall back",
+			result: datapath.BackupResult{FallbackFull: true},
+			want:   "fallen back to a full read",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := initDataUploaderReconciler()
+			require.NoError(t, err)
+			for _, du := range tc.previous {
+				require.NoError(t, r.client.Create(t.Context(), du))
+			}
+			assert.Equal(t, tc.want, r.fallbackReasonOf(t.Context(), current, tc.result, velerotest.NewLogger()))
+		})
+	}
+
+	t.Run("the file system data mover keeps the uploader's reason", func(t *testing.T) {
+		r, err := initDataUploaderReconciler()
+		require.NoError(t, err)
+		require.NoError(t, r.client.Create(t.Context(), newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, nil)))
+		fs := current.DeepCopy()
+		fs.Spec.DataMover = "velero"
+		assert.Equal(t, "no usable parent repository snapshot", r.fallbackReasonOf(t.Context(), fs, datapath.BackupResult{FallbackFull: true, FallbackReason: "no usable parent repository snapshot"}, velerotest.NewLogger()))
 	})
 }

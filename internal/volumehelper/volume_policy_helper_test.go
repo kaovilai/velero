@@ -2366,8 +2366,11 @@ func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
 			obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(tc.inputObj)
 			require.NoError(t, err)
 
-			actual := vh.GetRetainSnapshotFromActionParameters(&unstructured.Unstructured{Object: obj}, tc.groupResource)
+			actual, entry := vh.GetRetainSnapshotFromActionParameters(&unstructured.Unstructured{Object: obj}, tc.groupResource)
 			assert.Equal(t, tc.expected, actual)
+			if actual {
+				assert.Regexp(t, `^volumePolicies\[\d+\]$`, entry, "a retention decision names the policy entry it came from")
+			}
 		})
 	}
 }

@@ -32,6 +32,12 @@ import (
 // ignores unknown keys, so this controller-owned key in that map is safe.
 const RetainSnapshotDataMoverConfigKey = "retainSnapshot"
 
+// RetainSnapshotPolicyDataMoverConfigKey is the key of the DataMoverConfig entry
+// that names the volume policy entry the retention decision came from, e.g.
+// "volumePolicies[1]", so that `velero backup describe` can report which policy
+// entry matched. It is written only when a policy matched.
+const RetainSnapshotPolicyDataMoverConfigKey = "retainSnapshotPolicy"
+
 // DataUploadSpec is the specification for a DataUpload.
 type DataUploadSpec struct {
 	// SnapshotType is the type of the snapshot to be backed up.
@@ -215,6 +221,13 @@ type DataUploadStatus struct {
 
 	// FallbackFull indicates whether the incremental backup has fallen back to full backup
 	FallbackFull bool `json:"fallbackFull,omitempty"`
+
+	// FallbackReason records why an incremental backup fell back to a full read: the base
+	// snapshot was not retained, the base snapshot is gone, the CBT service failed, or no
+	// parent backup was usable. It is set for every velero-block incremental that fell back,
+	// with retention or without, because the fall back is otherwise silent.
+	// +optional
+	FallbackReason string `json:"fallbackReason,omitempty"`
 
 	// Activities contains one or more messages about what have been done for this DataUpload.
 	// +optional

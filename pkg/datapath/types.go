@@ -41,6 +41,8 @@ type BackupResult struct {
 	IncrementalBytes *int64 `json:"incrementalBytes,omitempty"`
 	SourceSize       int64  `json:"sourceSize,omitempty"`
 	FallbackFull     bool   `json:"fallbackFull,omitempty"`
+	// FallbackReason says why the incremental backup fell back to a full read.
+	FallbackReason string `json:"fallbackReason,omitempty"`
 }
 
 // RestoreResult represents the result of a restore

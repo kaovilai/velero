@@ -128,7 +128,7 @@ func TestAsyncBackup(t *testing.T) {
 			if test.result.Backup.IncrementalBytes != nil {
 				incrementalBytes = *test.result.Backup.IncrementalBytes
 			}
-			mockProvider.On("RunBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(test.result.Backup.SnapshotID, test.result.Backup.EmptySnapshot, test.result.Backup.TotalBytes, incrementalBytes, test.result.Backup.SourceSize, test.result.Backup.FallbackFull, test.err)
+			mockProvider.On("RunBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(test.result.Backup.SnapshotID, test.result.Backup.EmptySnapshot, test.result.Backup.TotalBytes, incrementalBytes, test.result.Backup.SourceSize, test.result.Backup.FallbackFull, test.result.Backup.FallbackReason, test.err)
 			mockProvider.On("Close", mock.Anything).Return(nil)
 			dp.uploaderProv = mockProvider
 			dp.initialized = true

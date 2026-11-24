@@ -44,6 +44,7 @@ import (
 	"github.com/velero-io/velero/internal/volume"
 	"github.com/velero-io/velero/pkg/util/collections"
 	"github.com/velero-io/velero/pkg/util/results"
+	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 // DescribeBackup describes a backup in human-readable format.
@@ -123,7 +124,102 @@ func DescribeBackup(
 			d.Println()
 			DescribeDeleteBackupRequests(d, deleteRequests)
 		}
+
+		DescribeOrphanSnapshotRecords(ctx, kbClient, d, backup)
 	})
+}
+
+// describeRetention summarizes the base snapshot retention of a data movement:
+// empty when retention was neither requested nor applied, so the line does not
+// appear for the file system data mover or for users who did not opt in.
+func describeRetention(info *volume.BackupSnapshotDataMovementInfo) string {
+	switch {
+	case info == nil:
+		return ""
+	case info.RetainedCSISnapshotHandle != "":
+		return "applied"
+	case info.RetainSnapshotRequested:
+		return "requested but not retained"
+	default:
+		return ""
+	}
+}
+
+// DescribeOrphanSnapshotRecords names the orphan-snapshot ConfigMaps that hold
+// retained snapshot records of this backup the deletion skipped or escalated:
+// the ConfigMap is the post-deletion lookup for manual cleanup, and describing
+// it while the Backup exists is how the operator learns its name (design
+// section 4, Security Considerations). A lookup failure is reported, not fatal.
+func DescribeOrphanSnapshotRecords(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup) {
+	records, err := orphanSnapshotRecordsOf(ctx, kbClient, backup)
+	if err != nil {
+		d.Println()
+		d.Printf("Orphan Snapshot Records: <error looking up the orphan-snapshot ConfigMaps: %v>\n", err)
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+	d.Println()
+	d.Printf("Orphan Snapshot Records: %d retained snapshot(s) were skipped or escalated and need manual cleanup\n", countOrphanRecords(records))
+	for _, cm := range sortedKeys(records) {
+		d.Printf("\tConfigMap %s/%s:\n", backup.Namespace, cm)
+		for _, rec := range records[cm] {
+			d.Printf("\t\tDataUpload %s: driver %s, snapshot handle %s, attempts %d\n", rec.dataUpload, rec.entry.Driver, rec.entry.CSISnapshotHandle, rec.entry.Attempts)
+		}
+	}
+}
+
+// orphanRecord is one orphan-snapshot ConfigMap entry of the backup.
+type orphanRecord struct {
+	dataUpload string
+	entry      *retainedsnapshot.Entry
+}
+
+// orphanSnapshotRecordsOf lists the orphan-snapshot ConfigMaps of the backup's
+// namespace and returns the entries keyed by this backup's UID, by ConfigMap.
+func orphanSnapshotRecordsOf(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup) (map[string][]orphanRecord, error) {
+	if kbClient == nil || backup.UID == "" {
+		return nil, nil
+	}
+	list := &corev1api.ConfigMapList{}
+	if err := kbClient.List(ctx, list, kbclient.InNamespace(backup.Namespace), kbclient.MatchingLabels{retainedsnapshot.OrphanLabel: "true"}); err != nil {
+		return nil, err
+	}
+	prefix := string(backup.UID) + "."
+	records := map[string][]orphanRecord{}
+	for i := range list.Items {
+		cm := &list.Items[i]
+		keys := sortedKeys(cm.Data)
+		for _, key := range keys {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			entry, err := retainedsnapshot.UnmarshalEntry(cm.Data[key])
+			if err != nil {
+				entry = &retainedsnapshot.Entry{}
+			}
+			records[cm.Name] = append(records[cm.Name], orphanRecord{dataUpload: strings.TrimPrefix(key, prefix), entry: entry})
+		}
+	}
+	return records, nil
+}
+
+func countOrphanRecords(records map[string][]orphanRecord) int {
+	n := 0
+	for _, recs := range records {
+		n += len(recs)
+	}
+	return n
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // DescribeResourcePolicies describes resource policies in human-readable format
@@ -687,6 +783,23 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 			}
 
 			d.Printf("\t\t\t\tBackup Type: %s\n", backupType)
+			if info.FallbackFull && info.FallbackReason != "" {
+				d.Printf("\t\t\t\tFallback Reason: %s\n", info.FallbackReason)
+			}
+		}
+
+		// Base snapshot retention is a velero-block decision; the line is
+		// printed whenever the policy asked for it or a snapshot was retained,
+		// so an operator can tell a missing policy from a retention that did
+		// not hold.
+		if retention := describeRetention(info.SnapshotDataMovementInfo); retention != "" {
+			d.Printf("\t\t\t\tBase Snapshot Retention: %s\n", retention)
+			if info.SnapshotDataMovementInfo.RetainSnapshotPolicy != "" {
+				d.Printf("\t\t\t\tRetention Policy: %s\n", info.SnapshotDataMovementInfo.RetainSnapshotPolicy)
+			}
+			if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
+				d.Printf("\t\t\t\tRetained Snapshot Handle: %s\n", info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle)
+			}
 		}
 
 		d.Printf("\t\t\t\tUploader Type: %s\n", info.SnapshotDataMovementInfo.UploaderType)

@@ -31,6 +31,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/utils/ptr"
 
 	"github.com/velero-io/velero/pkg/cbtservice"
@@ -369,7 +371,7 @@ func TestSnapshotSource(t *testing.T) {
 				forceFull = *tc.forceFull
 			}
 
-			snapID, size, snapshotSize, fallback, err := snapshotSource(
+			snapID, size, snapshotSize, fallback, _, err := snapshotSource(
 				ctx, mockRepo, mockBlkup,
 				baseSource,
 				forceFull, tc.parentSnapshot,
@@ -1083,6 +1085,36 @@ func TestRestore(t *testing.T) {
 			}
 
 			mockBlkup.AssertExpectations(t)
+		})
+	}
+}
+
+// TestClassifyFallbackReason covers the fallback reasons recorded on the
+// DataUpload (design, Implementation: diagnostics): a failed parent lookup,
+// an absent CBT service, a gone base snapshot and any other driver error.
+func TestClassifyFallbackReason(t *testing.T) {
+	tests := []struct {
+		name      string
+		parentErr error
+		cbtErr    error
+		wantHead  string
+	}{
+		{name: "no fallback", wantHead: ""},
+		{name: "parent lookup failed", parentErr: errors.New("error searching previous snapshot"), wantHead: FallbackReasonNoParent},
+		{name: "parent wins over cbt", parentErr: errors.New("no parent"), cbtErr: errors.New("x"), wantHead: FallbackReasonNoParent},
+		{name: "CBT service absent", cbtErr: errors.New("CBT service is absent, fallback to real full"), wantHead: FallbackReasonCBTUnavailable},
+		{name: "base gone (NotFound)", cbtErr: errors.Wrap(status.Error(codes.NotFound, "snapshot not found"), "error getting changed blocks"), wantHead: FallbackReasonBaseGone},
+		{name: "other driver error", cbtErr: errors.Wrap(status.Error(codes.Internal, "rbd: diff failed"), "error getting changed blocks"), wantHead: FallbackReasonDriverError},
+		{name: "plain error", cbtErr: errors.New("boom"), wantHead: FallbackReasonDriverError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyFallbackReason(tc.parentErr, tc.cbtErr)
+			if tc.wantHead == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.True(t, strings.HasPrefix(got, tc.wantHead+": "), got)
 		})
 	}
 }

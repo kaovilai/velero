@@ -56,6 +56,9 @@ type SnapshotInfo struct {
 	IncrementalSize int64
 	SourceSize      int64
 	Fallback        bool
+	// FallbackReason says why the incremental backup fell back to a full
+	// read; empty when Fallback is false.
+	FallbackReason string
 }
 
 // Progress which defined two variables to record progress
