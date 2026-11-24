@@ -172,17 +172,21 @@ else
 fi
 
 echo "==> Starting MinIO"
-# Published on an ephemeral host port rather than 9000, so a MinIO already
-# running on the usual port does not stop the run. The port is published on all
-# interfaces because the cluster reaches it over the kind gateway, so this is a
-# throwaway store with throwaway credentials and nothing else should use it.
+# MinIO joins the kind network and the cluster reaches it by its address on
+# that network, port 9000, so nothing is published on the host and a MinIO
+# already running on the usual port does not stop the run. A published port
+# would not do: under rootless podman (kind's experimental podman provider, or
+# docker as podman's CLI shim) a host-published port is reachable neither
+# through the kind gateway nor through the host address from inside the
+# cluster. This is a throwaway store with throwaway credentials and nothing
+# else should use it.
 # shellcheck disable=SC2086 # MINIO_ARGS is a command line and must word-split.
-docker run -d --name "${MINIO_CONTAINER}" -p 9000 \
+docker run -d --name "${MINIO_CONTAINER}" --network kind \
   -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
   -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
   "${MINIO_IMAGE}" ${MINIO_ARGS} > /dev/null
 minio_started=true
-minio_port="$(docker port "${MINIO_CONTAINER}" 9000/tcp | head -1 | sed 's/.*://')"
+minio_port=9000
 
 # mc ships inside the MinIO image. minio/mc is no longer available on Docker Hub.
 minio_ready=false
@@ -209,11 +213,15 @@ fi
 docker exec "${MINIO_CONTAINER}" mc mb --ignore-existing \
   "local/${BSL_BUCKET}" "local/${ADDITIONAL_BSL_BUCKET}" > /dev/null
 
-# The cluster reaches MinIO over the kind network's gateway. Do not use
-# `hostname -i`, which resolves to a different address under WSL2 and leaves the
+# The address of MinIO on the kind network. Do not use `hostname -i`, which
+# resolves to a different address under WSL2 and leaves the
 # BackupStorageLocation unreachable from inside the cluster.
-minio_host="$(docker network inspect kind \
-  -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' | tr ' ' '\n' | grep -m1 '\.')"
+minio_host="$(docker inspect "${MINIO_CONTAINER}" \
+  -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' | tr ' ' '\n' | grep -m1 '\.' || true)"
+if [ -z "${minio_host}" ]; then
+  echo "ERROR: could not read the address of ${MINIO_CONTAINER} on the kind network from 'docker inspect'." >&2
+  exit 1
+fi
 bsl_config="region=minio,s3ForcePathStyle=\"true\",s3Url=http://${minio_host}:${minio_port}"
 echo "==> MinIO reachable at ${minio_host}:${minio_port}"
 
