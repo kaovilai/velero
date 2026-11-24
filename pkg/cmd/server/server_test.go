@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	storagev1api "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
@@ -42,6 +43,7 @@ import (
 	"github.com/velero-io/velero/pkg/metrics"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	"github.com/velero-io/velero/pkg/uploader"
+	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 func TestVeleroResourcesExist(t *testing.T) {
@@ -457,4 +459,31 @@ func Test_setDefaultBackupLocation(t *testing.T) {
 	// no default location created
 	err = setDefaultBackupLocation(t.Context(), c, "velero", "default", logrus.New())
 	assert.NoError(t, err)
+}
+
+// Test_newVeleroServerScheme builds a manager-style client with the production
+// scheme and performs the reads the retained-snapshot controller issues through
+// it. The driver cross-check of an untrusted record lists storage.k8s.io
+// CSIDrivers; a scheme without that group fails the list with "no kind is
+// registered for the type v1.CSIDriverList" and leaves every tarball- or
+// tag-sourced record backup deletion stuck in Deleting.
+func Test_newVeleroServerScheme(t *testing.T) {
+	scheme, err := newVeleroServerScheme()
+	require.NoError(t, err)
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&storagev1api.CSIDriver{ObjectMeta: metav1.ObjectMeta{Name: "rbd.csi.ceph.com"}},
+		builder.ForBackup("velero", "bak").Result(),
+		builder.ForDataUpload("velero", "du").Result(),
+		&corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "retained-snapshots-uid-0", Labels: map[string]string{retainedsnapshot.FamilyLabel: "true"}}},
+	).Build()
+
+	drivers := &storagev1api.CSIDriverList{}
+	require.NoError(t, c.List(t.Context(), drivers), "the driver cross-check lists CSIDrivers through the manager client")
+	require.Len(t, drivers.Items, 1)
+	assert.Equal(t, "rbd.csi.ceph.com", drivers.Items[0].Name)
+
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: "velero", Name: "bak"}, &velerov1api.Backup{}))
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: "velero", Name: "du"}, &velerov2alpha1api.DataUpload{}))
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: "velero", Name: "retained-snapshots-uid-0"}, &corev1api.ConfigMap{}))
 }
