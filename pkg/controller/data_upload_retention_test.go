@@ -1411,6 +1411,35 @@ func TestReconcileHoldsFinalizerUntilRecordDelivered(t *testing.T) {
 		assert.NotNil(t, held.Status.RetainedCSIStorageSnapshot)
 	})
 
+	t.Run("a completed record-carrying DataUpload keeps its finalizer until deleted", func(t *testing.T) {
+		// Live finding (v3-3): the final-state branch removed the finalizer
+		// as soon as the DataUpload completed, so a later API delete had
+		// nothing to hold and the record died with the object.
+		r, err := initDataUploaderReconciler()
+		require.NoError(t, err)
+		du := deletedRecordDataUpload("bak", "bak-uid")
+		require.NoError(t, r.client.Create(t.Context(), du))
+
+		_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
+		require.NoError(t, err)
+		kept := &velerov2alpha1api.DataUpload{}
+		require.NoError(t, r.client.Get(t.Context(), types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, kept))
+		assert.Contains(t, kept.Finalizers, DataUploadDownloadFinalizer, "the finalizer stays on a completed record-carrying DataUpload")
+		list := &corev1api.ConfigMapList{}
+		require.NoError(t, r.client.List(t.Context(), list))
+		assert.Empty(t, list.Items, "nothing is delivered while the DataUpload is not being deleted")
+
+		// A completed DataUpload without a record still drops the finalizer.
+		plain := deletedRecordDataUpload("bak", "bak-uid")
+		plain.Name = "plain"
+		plain.Status.RetainedCSIStorageSnapshot = nil
+		require.NoError(t, r.client.Create(t.Context(), plain))
+		_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: plain.Namespace, Name: plain.Name}})
+		require.NoError(t, err)
+		require.NoError(t, r.client.Get(t.Context(), types.NamespacedName{Namespace: plain.Namespace, Name: plain.Name}, kept))
+		assert.NotContains(t, kept.Finalizers, DataUploadDownloadFinalizer)
+	})
+
 	t.Run("a deleted DataUpload without a record removes the finalizer as before", func(t *testing.T) {
 		r, err := initDataUploaderReconciler()
 		require.NoError(t, err)
