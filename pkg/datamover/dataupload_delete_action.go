@@ -143,6 +143,19 @@ func (d *DataUploadDeleteAction) unrecordedRetainedSnapshotEntry(bak *velerov1.B
 	}
 
 	log := d.logger.WithField("dataupload", du.Namespace+"/"+du.Name)
+
+	// The legacy trigger applies only to marker-less DataUploads from
+	// pre-rollback builds. Every velero-block DataUpload created by a build
+	// with this design carries the retention-evaluated marker -- the
+	// retainSnapshot key of spec.dataMoverConfig with its explicit value --
+	// so a marked DataUpload without a record was evaluated and not retained,
+	// whatever its VolumeSnapshotClass says (design section 7). Without this
+	// gate every no-retention backup under a Retain class, the common CBT
+	// setup, would fabricate a record for an already-deleted snapshot.
+	if retainedsnapshot.IsRetentionEvaluated(&du) {
+		log.Debug("DataUpload carries the retention-evaluated marker and no record, nothing was retained")
+		return nil
+	}
 	driver := du.Spec.CSISnapshot.Driver
 	if driver == "" || driver == util.VSphereCSIDriverName {
 		// The vSphere change ID is not the snapshot handle.

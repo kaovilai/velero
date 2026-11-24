@@ -331,6 +331,24 @@ func TestDataUploadDeleteActionGathersUnrecordedRetainedSnapshot(t *testing.T) {
 			mutate:    func(du *velerov2alpha1.DataUpload) { du.Status.Phase = velerov2alpha1.DataUploadPhaseFailed },
 			wantEntry: false,
 		},
+		{
+			// The legacy trigger applies only to marker-less DataUploads: a
+			// DataUpload with the retention-evaluated marker and no record was
+			// evaluated and not retained, whatever its Retain class says
+			// (design section 7).
+			name: "a marked DataUpload without a record under a Retain class is not a legacy candidate",
+			mutate: func(du *velerov2alpha1.DataUpload) {
+				du.Spec.DataMoverConfig = map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"}
+			},
+			wantEntry: false,
+		},
+		{
+			name: "a marked DataUpload whose retention did not hold is not a legacy candidate either",
+			mutate: func(du *velerov2alpha1.DataUpload) {
+				du.Spec.DataMoverConfig = map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "true"}
+			},
+			wantEntry: false,
+		},
 	}
 
 	for _, tc := range tests {

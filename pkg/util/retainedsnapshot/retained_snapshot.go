@@ -145,6 +145,17 @@ type Entry struct {
 	Trusted bool `json:"trusted,omitempty"`
 }
 
+// IsRetentionEvaluated reports whether the DataUpload carries the
+// retention-evaluated marker: the retainSnapshot key of spec.dataMoverConfig,
+// written with its explicit value for every velero-block DataUpload created
+// by a build with this design, whether or not a policy matched. A DataUpload
+// without the marker is from a pre-rollback build and is the only kind the
+// legacy tag recovery of design section 7 applies to.
+func IsRetentionEvaluated(du *velerov2alpha1api.DataUpload) bool {
+	_, marked := du.Spec.DataMoverConfig[velerov2alpha1api.RetainSnapshotDataMoverConfigKey]
+	return marked
+}
+
 // FromDataUploadStatus builds the entry of a DataUpload's persisted record.
 func FromDataUploadStatus(du *velerov2alpha1api.DataUpload) *Entry {
 	record := du.Status.RetainedCSIStorageSnapshot

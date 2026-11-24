@@ -800,7 +800,19 @@ func TestGatherKeepsLegacyEntryForPreRollbackDataUpload(t *testing.T) {
 	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), c, backup, map[string]*retainedsnapshot.Entry{
 		"foo-du": legacyEntry(),
 		"bar-du": legacyEntry(),
+		"baz-du": legacyEntry(),
 	}))
+
+	// A completed DataUpload with the retention-evaluated marker and no
+	// record was evaluated and not retained: it is not a legacy candidate,
+	// and a tarball entry for it is dropped (design section 7).
+	marked := builder.ForDataUpload(velerov1api.DefaultNamespace, "baz-du").
+		Labels(map[string]string{velerov1api.BackupNameLabel: "foo"}).
+		Phase(velerov2alpha1api.DataUploadPhaseCompleted).
+		DataMoverConfig(map[string]string{velerov2alpha1api.RetainSnapshotDataMoverConfigKey: "false"}).
+		Result()
+	marked.Status.SnapshotID = "kopia-3"
+	require.NoError(t, c.Create(t.Context(), marked))
 
 	// The local DataUpload of the pre-rollback backup: completed, no record.
 	preRollback := builder.ForDataUpload(velerov1api.DefaultNamespace, "foo-du").
@@ -827,5 +839,7 @@ func TestGatherKeepsLegacyEntryForPreRollbackDataUpload(t *testing.T) {
 	assert.True(t, ok, "the legacy entry of a pre-rollback backup survives the gather")
 	_, ok = family.Entry("bar-du")
 	assert.False(t, ok, "the tarball entry of a released DataUpload is dropped")
+	_, ok = family.Entry("baz-du")
+	assert.False(t, ok, "a marked DataUpload without a record is not a legacy candidate")
 	assert.Equal(t, 1, family.PendingEntries())
 }

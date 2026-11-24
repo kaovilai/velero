@@ -701,11 +701,14 @@ func (r *backupDeletionReconciler) gatherRetainedSnapshotRecords(ctx context.Con
 		du := &duList.Items[i]
 		if entry := retainedsnapshot.FromDataUploadStatus(du); entry != nil {
 			local[du.Name] = entry
-		} else if du.Status.Phase == velerov2alpha1.DataUploadPhaseCompleted && du.Status.SnapshotID != "" {
-			// A completed DataUpload without a record is a pre-rollback
-			// backup, whose record field never existed: its legacy entry --
-			// the repository snapshot the handle is resolved from -- is the
-			// recovery path and must survive this gather.
+		} else if du.Status.Phase == velerov2alpha1.DataUploadPhaseCompleted && du.Status.SnapshotID != "" &&
+			!retainedsnapshot.IsRetentionEvaluated(du) {
+			// A completed, marker-less DataUpload without a record is a
+			// pre-rollback backup, whose record field never existed: its
+			// legacy entry -- the repository snapshot the handle is resolved
+			// from -- is the recovery path and must survive this gather. A
+			// marked DataUpload without a record was evaluated and not
+			// retained, so any tarball entry for it is dropped below.
 		} else {
 			dropped[du.Name] = struct{}{}
 		}
