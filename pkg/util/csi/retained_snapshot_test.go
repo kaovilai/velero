@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientTesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -862,6 +863,61 @@ func TestDeleteRetainedSnapshotStatusWriteFailure(t *testing.T) {
 
 	err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
 	assert.ErrorContains(t, err, "error writing the status of temp VolumeSnapshotContent "+TempVSCName(record.Driver, record.CSISnapshotHandle))
+}
+
+// TestDeleteRetainedSnapshotStatusConflictTolerated proves design section 4,
+// step 2: a conflict on the temp content's status write means the sidecar
+// wrote status concurrently, and a re-read showing any handle satisfies the
+// requirement, so the deletion proceeds instead of failing the request.
+func TestDeleteRetainedSnapshotStatusConflictTolerated(t *testing.T) {
+	record := retainedTestRecord()
+	tempName := TempVSCName(record.Driver, record.CSISnapshotHandle)
+
+	t.Run("conflict with a handle already in status proceeds", func(t *testing.T) {
+		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
+		base := backend.client(t)
+		conflicts := 0
+		c := interceptor.NewClient(base.(crclient.WithWatch), interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c crclient.Client, subResourceName string, obj crclient.Object, opts ...crclient.SubResourceUpdateOption) error {
+				vsc, ok := obj.(*snapshotv1api.VolumeSnapshotContent)
+				if !ok || vsc.Name != tempName {
+					return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+				}
+				conflicts++
+				// The sidecar's own status write landed first.
+				current := &snapshotv1api.VolumeSnapshotContent{}
+				if err := c.Get(ctx, crclient.ObjectKey{Name: tempName}, current); err != nil {
+					return err
+				}
+				current.Status = &snapshotv1api.VolumeSnapshotContentStatus{SnapshotHandle: ptr.To(retainedTestHandle)}
+				if err := c.SubResource(subResourceName).Update(ctx, current); err != nil {
+					return err
+				}
+				return apierrors.NewConflict(schema.GroupResource{Group: "snapshot.storage.k8s.io", Resource: "volumesnapshotcontents"}, tempName, errors.New("the object has been modified"))
+			},
+		})
+
+		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger()))
+		assert.Equal(t, 1, conflicts)
+		assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo, "the deletion proceeded through the concurrently written status")
+	})
+
+	t.Run("conflict with no handle in status fails", func(t *testing.T) {
+		fakeClient := velerotest.NewFakeControllerRuntimeClientBuilder(t).
+			WithStatusSubresource(&snapshotv1api.VolumeSnapshotContent{}).
+			Build()
+		c := interceptor.NewClient(fakeClient.(crclient.WithWatch), interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c crclient.Client, subResourceName string, obj crclient.Object, opts ...crclient.SubResourceUpdateOption) error {
+				return apierrors.NewConflict(schema.GroupResource{Group: "snapshot.storage.k8s.io", Resource: "volumesnapshotcontents"}, tempName, errors.New("the object has been modified"))
+			},
+		})
+
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		require.ErrorContains(t, err, "after a conflict")
+		// The content was not deleted without a handle in its status.
+		still := &snapshotv1api.VolumeSnapshotContent{}
+		require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Name: tempName}, still))
+	})
 }
 
 // TestDeleteRetainedSnapshotReadbackVerification proves the deletion is not

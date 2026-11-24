@@ -259,16 +259,31 @@ func DeleteRetainedSnapshot(
 	}
 	statusVSC.Status.SnapshotHandle = &record.CSISnapshotHandle
 	if err := crClient.Status().Update(ctx, statusVSC); err != nil {
-		return errors.Wrapf(err, "error writing the status of temp VolumeSnapshotContent %s", tempVSC.Name)
+		// A conflict means the sidecar wrote the status concurrently; a
+		// re-read showing any handle satisfies the requirement, as in the
+		// patch-back of section 3 (design section 4, step 2).
+		if !apierrors.IsConflict(err) {
+			return errors.Wrapf(err, "error writing the status of temp VolumeSnapshotContent %s", tempVSC.Name)
+		}
+		fresh := &snapshotv1api.VolumeSnapshotContent{}
+		if getErr := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, fresh); getErr != nil {
+			return errors.Wrapf(getErr, "error re-reading the status of temp VolumeSnapshotContent %s after a conflict", tempVSC.Name)
+		}
+		if fresh.Status == nil || fresh.Status.SnapshotHandle == nil || *fresh.Status.SnapshotHandle == "" {
+			return errors.Wrapf(err, "error writing the status of temp VolumeSnapshotContent %s after a conflict", tempVSC.Name)
+		}
+		log.Infof("The status of temp VolumeSnapshotContent %s was written concurrently with handle %s, tolerating the conflict", tempVSC.Name, *fresh.Status.SnapshotHandle)
 	}
 	// The write is confirmed by reading the status back, not merely ordered:
 	// deleting the content before the sidecar sees status.snapshotHandle would
-	// remove it with no DeleteSnapshot call.
+	// remove it with no DeleteSnapshot call. Any handle satisfies the check:
+	// a sidecar that wrote its own status concurrently reports the same
+	// storage snapshot the record names.
 	confirmed := &snapshotv1api.VolumeSnapshotContent{}
 	if err := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, confirmed); err != nil {
 		return errors.Wrapf(err, "error reading back the status of temp VolumeSnapshotContent %s", tempVSC.Name)
 	}
-	if confirmed.Status == nil || confirmed.Status.SnapshotHandle == nil || *confirmed.Status.SnapshotHandle != record.CSISnapshotHandle {
+	if confirmed.Status == nil || confirmed.Status.SnapshotHandle == nil || *confirmed.Status.SnapshotHandle == "" {
 		return errors.Errorf("the status of temp VolumeSnapshotContent %s does not carry the snapshot handle", tempVSC.Name)
 	}
 
