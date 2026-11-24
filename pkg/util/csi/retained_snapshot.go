@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/util/kube"
 )
@@ -173,6 +174,9 @@ func TempVSCName(driver, handle string) string {
 // VolumeSnapshotContent through which the CSI snapshotter deletes a retained
 // snapshot:
 //   - named vsc-<hash> of driver and handle, so a retry reuses the leftover;
+//   - labeled velero.io/backup-uid with the backup's UID, so the
+//     backup-deletion controller's content watch maps its delete event back
+//     to the pending DeleteBackupRequest;
 //   - deletionPolicy Delete and the retained handle in spec.source.snapshotHandle;
 //   - no volumeSnapshotClassName, so the deletion is independent of the class;
 //   - the existing legacy action's synthetic volumeSnapshotRef, which the
@@ -185,7 +189,7 @@ func TempVSCName(driver, handle string) string {
 //   - the managed-by label of the record, so distributed snapshots, which
 //     select contents by that label, process it too;
 //   - the deletion secret annotations of the record, when the driver needs one.
-func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorageSnapshot) *snapshotv1api.VolumeSnapshotContent {
+func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorageSnapshot, backupUID types.UID) *snapshotv1api.VolumeSnapshotContent {
 	id := TempVSCName(record.Driver, record.CSISnapshotHandle)
 	handle := record.CSISnapshotHandle
 
@@ -193,6 +197,12 @@ func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorag
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       id,
 			Finalizers: []string{VSCBoundProtectionFinalizer},
+			// The backup UID is what the backup-deletion controller's
+			// VolumeSnapshotContent watch maps this content's delete event
+			// back to the pending DeleteBackupRequest with (design section
+			// 4). The UID, not the name: names can repeat, and the sanitized
+			// name label cannot carry a long name.
+			Labels: map[string]string{velerov1api.BackupUIDLabel: string(backupUID)},
 		},
 		Spec: snapshotv1api.VolumeSnapshotContentSpec{
 			DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
@@ -210,7 +220,7 @@ func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorag
 		},
 	}
 	if record.ManagedByLabelValue != "" {
-		vsc.Labels = map[string]string{kube.VolumeSnapshotContentManagedByLabel: record.ManagedByLabelValue}
+		vsc.Labels[kube.VolumeSnapshotContentManagedByLabel] = record.ManagedByLabelValue
 	}
 	if record.DeletionSecretRef != nil {
 		vsc.Annotations = map[string]string{
@@ -223,7 +233,9 @@ func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorag
 
 // DeleteRetainedSnapshot has the CSI snapshotter delete the storage snapshot
 // identified by record, through a temporary statically provisioned
-// VolumeSnapshotContent. All reads go through the given reader, which must be
+// VolumeSnapshotContent labeled with the backup's UID, so the backup-deletion
+// controller's content watch can re-enter the pending DeleteBackupRequest when
+// the content goes away. All reads go through the given reader, which must be
 // uncached -- an API reader -- when the writing client is manager-cached:
 // the read-backs verify what the API server holds, and an informer-lagged
 // cache would fail the verification spuriously, or report a leftover content
@@ -254,6 +266,7 @@ func DeleteRetainedSnapshot(
 	crClient crclient.Client,
 	reader crclient.Reader,
 	record *velerov2alpha1api.RetainedCSIStorageSnapshot,
+	backupUID types.UID,
 	log logrus.FieldLogger,
 ) error {
 	if reader == nil {
@@ -263,7 +276,7 @@ func DeleteRetainedSnapshot(
 		return errors.New("invalid retained snapshot record, handle and driver are required")
 	}
 
-	tempVSC := BuildTempVSCForRetainedSnapshot(record)
+	tempVSC := BuildTempVSCForRetainedSnapshot(record, backupUID)
 
 	current := tempVSC
 	existing := &snapshotv1api.VolumeSnapshotContent{}

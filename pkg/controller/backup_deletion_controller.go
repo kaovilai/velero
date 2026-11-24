@@ -35,7 +35,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/velero-io/velero/internal/credentials"
 	"github.com/velero-io/velero/internal/delete"
@@ -65,6 +70,14 @@ import (
 
 const (
 	deleteBackupRequestMaxAge = 24 * time.Hour
+
+	// retainedSnapshotsBackstopRequeue is the RequeueAfter of a request
+	// waiting on the retained-snapshot controller. The primary wake is the
+	// pair of watches registered in SetupWithManager; this is the backstop
+	// for an event lost between the step's read and its return, and it keeps
+	// the request level-triggered even when both watches miss (design
+	// section 4).
+	retainedSnapshotsBackstopRequeue = 30 * time.Second
 )
 
 type backupDeletionReconciler struct {
@@ -135,12 +148,96 @@ func (r *backupDeletionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov1api.DeleteBackupRequest{}).
 		WatchesRawSource(s).
+		// Re-entry of a request waiting on the retained-snapshot controller
+		// is watch-driven (design section 4): the temp vsc-<hash> content
+		// disappearing after a successful DeleteSnapshot, and the record
+		// family update that marks an entry completed or escalated, both
+		// mapped to the pending request through the velero.io/backup-uid
+		// label. The retained-snapshot controller never writes to the
+		// request.
+		Watches(&snapshotv1api.VolumeSnapshotContent{},
+			handler.EnqueueRequestsFromMapFunc(r.pendingRequestsOfBackupUID),
+			builder.WithPredicates(tempVSCDeletedPredicate())).
+		Watches(&corev1api.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.pendingRequestsOfBackupUID),
+			builder.WithPredicates(familyEntriesSettledPredicate())).
 		Complete(r)
+}
+
+// tempVSCDeletedPredicate admits only the delete event of a VolumeSnapshotContent
+// labeled with a backup UID, which is a temp vsc-<hash> content of a retained
+// snapshot going away after the sidecar's DeleteSnapshot.
+func tempVSCDeletedPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		UpdateFunc:  func(event.UpdateEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return e.Object != nil && e.Object.GetLabels()[velerov1api.BackupUIDLabel] != ""
+		},
+	}
+}
+
+// familyEntriesSettledPredicate admits only an update of a record family shard
+// -- a ConfigMap labeled with a backup UID -- that settles a pending entry:
+// the entry was confirmed deleted and moved to the completed set, or escalated
+// or skipped to the orphan-snapshot ConfigMap. Writes that add entries or
+// persist an attempt count are not admitted; they change nothing the request
+// should act on.
+func familyEntriesSettledPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldShard, ok := e.ObjectOld.(*corev1api.ConfigMap)
+			if !ok {
+				return false
+			}
+			newShard, ok := e.ObjectNew.(*corev1api.ConfigMap)
+			if !ok || newShard.Labels[velerov1api.BackupUIDLabel] == "" {
+				return false
+			}
+			return len(pendingShardKeys(newShard)) < len(pendingShardKeys(oldShard))
+		},
+	}
+}
+
+// pendingRequestsOfBackupUID maps an object labeled with a backup UID to the
+// DeleteBackupRequests of that backup that are waiting on the retained-snapshot
+// controller: InProgress and annotated retained-snapshots-pending.
+func (r *backupDeletionReconciler) pendingRequestsOfBackupUID(ctx context.Context, obj client.Object) []reconcile.Request {
+	uid := obj.GetLabels()[velerov1api.BackupUIDLabel]
+	if uid == "" {
+		return nil
+	}
+	list := &velerov1api.DeleteBackupRequestList{}
+	if err := r.Client.List(ctx, list, &client.ListOptions{
+		LabelSelector: labels.SelectorFromSet(map[string]string{velerov1api.BackupUIDLabel: uid}),
+	}); err != nil {
+		r.logger.WithError(err).WithField("backupUID", uid).Warn("Error listing the DeleteBackupRequests of the backup UID")
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range list.Items {
+		req := &list.Items[i]
+		if req.Status.Phase != velerov1api.DeleteBackupRequestPhaseInProgress ||
+			req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation] == "" {
+			continue
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: req.Namespace, Name: req.Name}})
+	}
+	return requests
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=velero.io,resources=backups,verbs=delete
+// The two watches of SetupWithManager: the temp VolumeSnapshotContent of a
+// retained snapshot going away, and the record ConfigMap family settling an
+// entry, both mapped to the pending request by the backup UID label.
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
 func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.logger.WithFields(logrus.Fields{
@@ -455,9 +552,10 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// would block the deletion of every unrelated backup behind it. The step
 	// writes the pending annotation and activates the record family in one
 	// write -- annotate first, then activate, never the reverse -- and
-	// returns, leaving the request InProgress for the retained-snapshot
-	// controller, which runs its own workers and is keyed by the record
-	// ConfigMaps.
+	// returns with the backstop RequeueAfter, leaving the request InProgress
+	// for the retained-snapshot controller, which runs its own workers and is
+	// keyed by the record ConfigMaps. The primary wake is the pair of watches
+	// in SetupWithManager.
 	if len(errs) == 0 && boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
 		family, familyErr := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup)
 		if familyErr != nil {
@@ -476,7 +574,7 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				errs = append(errs, errors.Wrap(activateErr, "error activating the retained snapshot records").Error())
 			} else {
 				log.Info("Waiting for the retained-snapshot controller to delete the retained snapshots")
-				return ctrl.Result{}, nil
+				return ctrl.Result{RequeueAfter: retainedSnapshotsBackstopRequeue}, nil
 			}
 		}
 	}
@@ -643,7 +741,7 @@ func (r *backupDeletionReconciler) reconcileRetainedSnapshots(
 	// still inactive.
 	if family.PendingEntries() > 0 {
 		log.Info("The retained snapshots are still being deleted, going back to waiting")
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: retainedSnapshotsBackstopRequeue}, nil
 	}
 
 	// Nothing is active: no family, because a previous attempt already emptied

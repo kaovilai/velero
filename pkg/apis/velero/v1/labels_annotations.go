@@ -77,13 +77,6 @@ const (
 	// while an annotation value has no such limit.
 	RetainedSnapshotsBackupNameAnnotation = "velero.io/retained-snapshots-backup-name"
 
-	// RetainedSnapshotsWakeAnnotation is set by the retained-snapshot
-	// controller to enqueue a DeleteBackupRequest waiting on retained
-	// snapshots. The update leaves the pending annotation in place: the
-	// pending annotation is what lets the request back in, so the waker never
-	// clears it.
-	RetainedSnapshotsWakeAnnotation = "velero.io/retained-snapshots-wake"
-
 	// DataDownloadLabel is the label key used to identify the datadownload for snapshot restore pod
 	DataDownloadLabel = "velero.io/data-download"
 

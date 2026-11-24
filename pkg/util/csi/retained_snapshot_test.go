@@ -33,11 +33,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	clientTesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	"github.com/velero-io/velero/pkg/util/kube"
@@ -46,6 +48,8 @@ import (
 const (
 	retainedTestDriver = "rbd.csi.ceph.com"
 	retainedTestHandle = "0001-0009-rook-ceph-0000000000000001-snap"
+	// retainedTestBackupUID is the backup UID the temp content is labeled with.
+	retainedTestBackupUID types.UID = "3f6d2a3c-0000-4000-8000-000000000001"
 )
 
 func retainedTestRecord() *velerov2alpha1api.RetainedCSIStorageSnapshot {
@@ -214,7 +218,7 @@ func TestBuildTempVSCForRetainedSnapshot(t *testing.T) {
 	record.ManagedByLabelValue = "velero"
 	record.DeletionSecretRef = &corev1api.SecretReference{Name: "secret-name", Namespace: "secret-ns"}
 
-	vsc := BuildTempVSCForRetainedSnapshot(record)
+	vsc := BuildTempVSCForRetainedSnapshot(record, retainedTestBackupUID)
 
 	assert.Equal(t, TempVSCName(record.Driver, record.CSISnapshotHandle), vsc.Name)
 	assert.Equal(t, []string{VSCBoundProtectionFinalizer}, vsc.Finalizers)
@@ -232,15 +236,21 @@ func TestBuildTempVSCForRetainedSnapshot(t *testing.T) {
 	assert.NotEmpty(t, vsc.Spec.VolumeSnapshotRef.Namespace)
 	assert.NotEmpty(t, vsc.Spec.VolumeSnapshotRef.Name)
 
-	assert.Equal(t, map[string]string{kube.VolumeSnapshotContentManagedByLabel: "velero"}, vsc.Labels)
+	// The backup UID label maps the content's delete event back to the
+	// pending DeleteBackupRequest; the managed-by label selects the content
+	// for a distributed snapshotter.
+	assert.Equal(t, map[string]string{
+		velerov1api.BackupUIDLabel:               string(retainedTestBackupUID),
+		kube.VolumeSnapshotContentManagedByLabel: "velero",
+	}, vsc.Labels)
 	assert.Equal(t, map[string]string{
 		VSCDeletionSecretNameAnnotation:      "secret-name",
 		VSCDeletionSecretNamespaceAnnotation: "secret-ns",
 	}, vsc.Annotations)
 
-	// A minimal record carries neither labels nor annotations.
-	minimal := BuildTempVSCForRetainedSnapshot(retainedTestRecord())
-	assert.Nil(t, minimal.Labels)
+	// A minimal record carries only the backup UID label and no annotations.
+	minimal := BuildTempVSCForRetainedSnapshot(retainedTestRecord(), retainedTestBackupUID)
+	assert.Equal(t, map[string]string{velerov1api.BackupUIDLabel: string(retainedTestBackupUID)}, minimal.Labels)
 	assert.Nil(t, minimal.Annotations)
 }
 
@@ -781,7 +791,7 @@ func TestDeleteRetainedSnapshotSuccess(t *testing.T) {
 		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
 		c := backend.client(t)
 
-		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger()))
+		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger()))
 
 		// The driver was called exactly once, through the seeded status.
 		assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
@@ -797,7 +807,7 @@ func TestDeleteRetainedSnapshotSuccess(t *testing.T) {
 		}
 		c := backend.client(t)
 
-		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger()))
+		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger()))
 		assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
 	})
 
@@ -805,17 +815,17 @@ func TestDeleteRetainedSnapshotSuccess(t *testing.T) {
 		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
 		c := backend.client(t)
 
-		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, nil, record, velerotest.NewLogger()))
+		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, nil, record, retainedTestBackupUID, velerotest.NewLogger()))
 		assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
 	})
 
 	t.Run("an interrupted deletion reuses the leftover content", func(t *testing.T) {
 		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
 		record := retainedTestRecord()
-		leftover := BuildTempVSCForRetainedSnapshot(record)
+		leftover := BuildTempVSCForRetainedSnapshot(record, retainedTestBackupUID)
 		c := backend.client(t, leftover)
 
-		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger()))
+		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger()))
 
 		// The leftover content was reused, not duplicated: exactly one
 		// DeleteSnapshot call and no second content exists under any name.
@@ -836,7 +846,7 @@ func TestReleaseTempVSC(t *testing.T) {
 	name := TempVSCName(record.Driver, record.CSISnapshotHandle)
 
 	t.Run("a deleting content loses its finalizer and disappears", func(t *testing.T) {
-		leftover := BuildTempVSCForRetainedSnapshot(record)
+		leftover := BuildTempVSCForRetainedSnapshot(record, retainedTestBackupUID)
 		now := metav1.Now()
 		leftover.DeletionTimestamp = &now
 		c := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithRuntimeObjects(leftover).Build()
@@ -848,7 +858,7 @@ func TestReleaseTempVSC(t *testing.T) {
 	})
 
 	t.Run("a content that was never deleted is released and deleted", func(t *testing.T) {
-		leftover := BuildTempVSCForRetainedSnapshot(record)
+		leftover := BuildTempVSCForRetainedSnapshot(record, retainedTestBackupUID)
 		c := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithRuntimeObjects(leftover).Build()
 
 		require.NoError(t, ReleaseTempVSC(t.Context(), c, nil, record, velerotest.NewLogger()))
@@ -876,7 +886,7 @@ func TestDeleteRetainedSnapshotInvalidRecord(t *testing.T) {
 		{Driver: retainedTestDriver},
 		{CSISnapshotHandle: retainedTestHandle},
 	} {
-		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 		assert.EqualError(t, err, "invalid retained snapshot record, handle and driver are required")
 	}
 }
@@ -886,7 +896,7 @@ func TestDeleteRetainedSnapshotReadsGoThroughTheReader(t *testing.T) {
 	writer := backend.client(t)
 	reader := &failingReader{err: errors.New("fake-reader-error")}
 
-	err := DeleteRetainedSnapshot(t.Context(), writer, reader, retainedTestRecord(), velerotest.NewLogger())
+	err := DeleteRetainedSnapshot(t.Context(), writer, reader, retainedTestRecord(), retainedTestBackupUID, velerotest.NewLogger())
 	require.EqualError(t, err, "error getting temp VolumeSnapshotContent "+TempVSCName(retainedTestDriver, retainedTestHandle)+": fake-reader-error")
 	// Nothing was written through the writer either.
 	assert.Empty(t, backend.deleteCallsTo)
@@ -903,7 +913,7 @@ func TestDeleteRetainedSnapshotStatusWriteFailure(t *testing.T) {
 		},
 	})
 
-	err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+	err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 	assert.ErrorContains(t, err, "error writing the status of temp VolumeSnapshotContent "+TempVSCName(record.Driver, record.CSISnapshotHandle))
 }
 
@@ -939,7 +949,7 @@ func TestDeleteRetainedSnapshotStatusConflictTolerated(t *testing.T) {
 			},
 		})
 
-		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger()))
+		require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger()))
 		assert.Equal(t, 1, conflicts)
 		assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo, "the deletion proceeded through the concurrently written status")
 	})
@@ -954,7 +964,7 @@ func TestDeleteRetainedSnapshotStatusConflictTolerated(t *testing.T) {
 			},
 		})
 
-		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 		require.ErrorContains(t, err, "after a conflict")
 		// The content was not deleted without a handle in its status.
 		still := &snapshotv1api.VolumeSnapshotContent{}
@@ -971,7 +981,7 @@ func TestDeleteRetainedSnapshotReadbackVerification(t *testing.T) {
 
 	// The reader always reports the content without a status, as an
 	// informer-lagged cache would: the read-back must not pass.
-	leftover := BuildTempVSCForRetainedSnapshot(record)
+	leftover := BuildTempVSCForRetainedSnapshot(record, retainedTestBackupUID)
 	fakeClient := velerotest.NewFakeControllerRuntimeClientBuilder(t).
 		WithRuntimeObjects(leftover).
 		WithStatusSubresource(&snapshotv1api.VolumeSnapshotContent{}).
@@ -988,7 +998,7 @@ func TestDeleteRetainedSnapshotReadbackVerification(t *testing.T) {
 		},
 	})
 
-	err := DeleteRetainedSnapshot(t.Context(), fakeClient, reader, record, velerotest.NewLogger())
+	err := DeleteRetainedSnapshot(t.Context(), fakeClient, reader, record, retainedTestBackupUID, velerotest.NewLogger())
 	require.ErrorContains(t, err, "the status of temp VolumeSnapshotContent "+tempName+" does not carry the snapshot handle")
 
 	// The content was not deleted on the unconfirmed status.
@@ -1008,7 +1018,7 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		}
 		c := backend.client(t)
 
-		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 		require.Error(t, err)
 
 		var callErr *SnapshotDeleteCallError
@@ -1027,7 +1037,7 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		}
 		c := backend.client(t)
 
-		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 		require.Error(t, err)
 
 		var callErr *SnapshotDeleteCallError
@@ -1045,7 +1055,7 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		}
 		c := backend.client(t)
 
-		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 		require.Error(t, err)
 
 		var callErr *SnapshotDeleteCallError
@@ -1061,7 +1071,7 @@ func TestDeleteRetainedSnapshotFailureClassification(t *testing.T) {
 		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: false}}
 		c := backend.client(t)
 
-		err := DeleteRetainedSnapshot(t.Context(), c, c, record, velerotest.NewLogger())
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
 		require.Error(t, err)
 
 		var callErr *SnapshotDeleteCallError

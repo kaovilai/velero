@@ -198,20 +198,21 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{RequeueAfter: retainedSnapshotRetryDelay}, nil
 	}
 
-	// Wake the waiting request when nothing is pending anymore: the request
-	// re-enters, clears its own annotation and runs the tail. While pending
-	// work remains, this reconcile's writes re-enqueue the shard, and the
-	// requeue is the backstop for a deletion whose wait expired without a
-	// further write.
+	// This controller never writes to the request. Re-entry is watch-driven:
+	// the ConfigMap update that emptied or escalated the family fires the
+	// backup-deletion controller's family watch, and the temp content's
+	// deletion fires its content watch, both mapped to the request through
+	// the backup UID label; the request's own 30-second RequeueAfter is the
+	// backstop for an event lost between its read and its return (design
+	// section 4). While pending work remains, this reconcile's writes
+	// re-enqueue the shard, and the requeue below is the backstop for a
+	// deletion whose wait expired without a further write.
 	family, err := retainedsnapshot.LoadFamily(ctx, r.Client, backup)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error re-reading the retained snapshot records")
 	}
 	if !family.HasPendingWork() {
-		if err := r.wakeDeleteBackupRequest(ctx, backup); err != nil {
-			return ctrl.Result{}, err
-		}
-		log.Info("The retained snapshots are deleted, the backup deletion is woken up")
+		log.Info("The retained snapshots are deleted; the backup deletion re-enters through its watches")
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: csi.RetainedSnapshotDeletionTimeout}, nil
@@ -303,7 +304,7 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 		}
 	}
 
-	err = csi.DeleteRetainedSnapshot(ctx, r.Client, r.apiReader, entry.Record(), log)
+	err = csi.DeleteRetainedSnapshot(ctx, r.Client, r.apiReader, entry.Record(), backup.UID, log)
 	if err == nil {
 		// The entry is removed only after the snapshot is confirmed deleted.
 		if err := retainedsnapshot.MarkCompleted(ctx, r.Client, backup, name); err != nil {
@@ -453,18 +454,6 @@ func (r *retainedSnapshotReconciler) garbageCollectShard(ctx context.Context, sh
 	r.eventf(shard, backup, "RetainedSnapshotOrphaned", "the backup is gone; %d pending retained snapshot records were moved to the orphan-snapshot ConfigMap for manual cleanup", len(pending))
 	log.Warnf("The backup is gone; moved %d pending retained snapshot records to the orphan-snapshot ConfigMap", len(pending))
 	return client.IgnoreNotFound(r.Delete(ctx, shard))
-}
-
-// wakeDeleteBackupRequest enqueues the DeleteBackupRequest that waits on this
-// family with an update that leaves the pending annotation in place -- the
-// annotation is what lets the request back in, so the waker never clears it.
-func (r *retainedSnapshotReconciler) wakeDeleteBackupRequest(ctx context.Context, backup *velerov1api.Backup) error {
-	return r.patchWaitingRequest(ctx, backup, func(req *velerov1api.DeleteBackupRequest) {
-		if req.Annotations == nil {
-			req.Annotations = map[string]string{}
-		}
-		req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation] = r.clock.Now().UTC().Format(time.RFC3339)
-	})
 }
 
 // failDeleteBackupRequest marks the DeleteBackupRequest that waits on this

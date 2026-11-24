@@ -38,6 +38,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -221,12 +223,17 @@ func TestRetainedSnapshotControllerDeletesEntry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, family.CompletedSet(), "foo-du")
 
-	// The waiting request is woken, its pending annotation still in place.
+	// The controller never writes to the waiting request: its pending
+	// annotation and phase are untouched. Re-entry is the backup-deletion
+	// controller's watches, fed by the shard update above and the temp
+	// content's deletion.
 	req := getRequest(t, c, dbr)
-	assert.NotEmpty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation])
+	assert.Equal(t, dbr.ResourceVersion, req.ResourceVersion, "the retained-snapshot controller never writes to the request")
 	assert.NotEmpty(t, req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation],
-		"the waker never clears the pending annotation")
+		"the pending annotation stays in place for the request's own re-entry")
 	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseInProgress, req.Status.Phase)
+	err = c.Get(t.Context(), client.ObjectKey{Name: csi.TempVSCName(retainedTestDriver, retainedTestHandle)}, &snapshotv1api.VolumeSnapshotContent{})
+	assert.True(t, apierrors.IsNotFound(err), "the temp content is gone, which is the content watch's event")
 }
 
 // TestRetainedSnapshotControllerIgnoresInactiveShard proves the activation
@@ -405,7 +412,7 @@ func TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive(t *testing.T) {
 		assert.Equal(t, velerov1api.DeleteBackupRequestPhaseInProgress, req.Status.Phase, "the request stays InProgress under the bound")
 		assert.Empty(t, req.Status.Errors)
 		assert.Equal(t, "true", req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation], "the annotation stays in place")
-		assert.Empty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation], "the request is not woken while the entry is pending")
+		assert.Equal(t, dbr.ResourceVersion, req.ResourceVersion, "the request is not written while the entry is pending")
 
 		family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
 		require.NoError(t, err)
@@ -416,19 +423,25 @@ func TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive(t *testing.T) {
 		assert.Contains(t, recorder.reasons, "RetainedSnapshotDeleteFailed")
 	}
 
-	// The bound: the record escalates to the orphan ConfigMap and the request
-	// is woken, without any manual retry.
+	// The bound: the record escalates to the orphan ConfigMap, without any
+	// manual retry. The shard update that removes the entry is what the
+	// backup-deletion controller's family watch admits, so the request
+	// re-enters without being written.
+	before := getShard(t, c, shard)
 	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shard.Namespace, Name: shard.Name}})
 	require.NoError(t, err)
 	assert.Zero(t, result.RequeueAfter)
-	assert.NotContains(t, getShard(t, c, shard).Data, "foo-du")
+	after := getShard(t, c, shard)
+	assert.NotContains(t, after.Data, "foo-du")
+	assert.True(t, familyEntriesSettledPredicate().Update(event.UpdateEvent{ObjectOld: before, ObjectNew: after}),
+		"the escalation's shard update is admitted by the family watch")
 	orphans := &corev1api.ConfigMapList{}
 	require.NoError(t, c.List(t.Context(), orphans, client.MatchingLabels{retainedsnapshot.OrphanLabel: "true"}))
 	require.Len(t, orphans.Items, 1)
 	assert.Contains(t, recorder.reasons, "RetainedSnapshotDeleteEscalated")
 	req := getRequest(t, c, dbr)
 	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseInProgress, req.Status.Phase)
-	assert.NotEmpty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation], "the escalation wakes the request")
+	assert.Equal(t, dbr.ResourceVersion, req.ResourceVersion, "the escalation does not write to the request")
 }
 
 // TestRetainedSnapshotControllerResolvesStaleOrphan proves the stale-orphan
@@ -564,16 +577,14 @@ func TestRetainedSnapshotControllerRetriggersItself(t *testing.T) {
 	assert.Equal(t, csi.RetainedSnapshotDeletionTimeout, result.RequeueAfter,
 		"a reconcile with pending work left in the family must re-enqueue itself")
 	assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
-	assert.Empty(t, getRequest(t, c, dbr).Annotations[velerov1api.RetainedSnapshotsWakeAnnotation],
-		"the request must not be woken while the sibling shard is pending")
 
-	// The self-requeue reconciles the sibling shard, empties the family and
-	// wakes the request.
+	// The self-requeue reconciles the sibling shard and empties the family;
+	// the request is never written by this controller.
 	result, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: shardB.Namespace, Name: shardB.Name}})
 	require.NoError(t, err)
 	assert.Zero(t, result.RequeueAfter, "an emptied family needs no further requeue")
 	assert.Equal(t, []string{retainedTestHandle, "another-snapshot"}, backend.deleteCallsTo)
-	assert.NotEmpty(t, getRequest(t, c, dbr).Annotations[velerov1api.RetainedSnapshotsWakeAnnotation])
+	assert.Equal(t, dbr.ResourceVersion, getRequest(t, c, dbr).ResourceVersion, "the request is never written by the retained-snapshot controller")
 }
 
 // TestBackupDeletionHandsOffToRetainedSnapshotController proves the handoff of
@@ -821,7 +832,7 @@ func TestRetainedSnapshotControllerResolvesLongBackupName(t *testing.T) {
 // waiting request is selected by the backup UID alone: the requests carry a
 // sanitized backup-name label, which never matches the raw name of a backup
 // with a long name.
-func TestRetainedSnapshotControllerWakesRequestOfLongNamedBackup(t *testing.T) {
+func TestRetainedSnapshotControllerMapsLongNamedBackupByUID(t *testing.T) {
 	longName := strings.Repeat("n", 70)
 	backup := builder.ForBackup(velerov1api.DefaultNamespace, longName).StorageLocation("default").SnapshotMoveData(true).Result()
 	backup.UID = "long-uid"
@@ -845,9 +856,97 @@ func TestRetainedSnapshotControllerWakesRequestOfLongNamedBackup(t *testing.T) {
 	reconcileShard(t, newRetainedTestReconciler(c), shard)
 	assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
 
-	req := getRequest(t, c, dbr)
-	assert.NotEmpty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation],
-		"the waiting request of a long-named backup is woken through its UID label")
+	// The temp content and the shard carry the UID label, and the
+	// backup-deletion controller's map function finds the waiting request of
+	// the long-named backup through it, not through the hashed name label.
+	deletion := &backupDeletionReconciler{Client: c, logger: velerotest.NewLogger()}
+	requests := deletion.pendingRequestsOfBackupUID(t.Context(), getShard(t, c, shard))
+	assert.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: dbr.Namespace, Name: dbr.Name}}}, requests)
+}
+
+// TestBackupDeletionWatchMapsByBackupUID proves the watch mapping of design
+// section 4: an object labeled with a backup UID enqueues the
+// DeleteBackupRequests of that backup that are InProgress and annotated
+// pending, and nothing else -- not a Processed request, not a request without
+// the annotation, not another backup's request, not an unlabeled object.
+func TestBackupDeletionWatchMapsByBackupUID(t *testing.T) {
+	backup := retainedTestBackup()
+	c := velerotest.NewFakeControllerRuntimeClient(t, backup)
+
+	waiting := retainedTestRequest(t, c, backup)
+
+	processed := defaultTestDbr()
+	processed.Name = "processed"
+	processed.Status.Phase = velerov1api.DeleteBackupRequestPhaseProcessed
+	processed.Labels[velerov1api.BackupUIDLabel] = string(backup.UID)
+	processed.Annotations = map[string]string{velerov1api.RetainedSnapshotsPendingAnnotation: "true"}
+	require.NoError(t, c.Create(t.Context(), processed))
+
+	unannotated := defaultTestDbr()
+	unannotated.Name = "unannotated"
+	unannotated.Status.Phase = velerov1api.DeleteBackupRequestPhaseInProgress
+	unannotated.Labels[velerov1api.BackupUIDLabel] = string(backup.UID)
+	require.NoError(t, c.Create(t.Context(), unannotated))
+
+	other := defaultTestDbr()
+	other.Name = "other-backup"
+	other.Status.Phase = velerov1api.DeleteBackupRequestPhaseInProgress
+	other.Labels[velerov1api.BackupUIDLabel] = "other-uid"
+	other.Annotations = map[string]string{velerov1api.RetainedSnapshotsPendingAnnotation: "true"}
+	require.NoError(t, c.Create(t.Context(), other))
+
+	r := &backupDeletionReconciler{Client: c, logger: velerotest.NewLogger()}
+	want := []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: waiting.Namespace, Name: waiting.Name}}}
+
+	tempVSC := csi.BuildTempVSCForRetainedSnapshot(&velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver}, backup.UID)
+	assert.Equal(t, want, r.pendingRequestsOfBackupUID(t.Context(), tempVSC), "a temp content maps to the waiting request")
+
+	shard := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "shard", Namespace: backup.Namespace, Labels: retainedsnapshot.FamilyLabels(backup)}}
+	assert.Equal(t, want, r.pendingRequestsOfBackupUID(t.Context(), shard), "a family shard maps to the waiting request")
+
+	assert.Empty(t, r.pendingRequestsOfBackupUID(t.Context(), &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "unlabeled"}}),
+		"an object without the UID label maps to nothing")
+}
+
+// TestBackupDeletionWatchPredicates proves which events the two watches admit:
+// the content watch only a delete of a UID-labeled VolumeSnapshotContent, the
+// family watch only a shard update that settles a pending entry.
+func TestBackupDeletionWatchPredicates(t *testing.T) {
+	labeled := csi.BuildTempVSCForRetainedSnapshot(&velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver}, "uid")
+	unlabeled := &snapshotv1api.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: "backup-content"}}
+
+	contentWatch := tempVSCDeletedPredicate()
+	assert.True(t, contentWatch.Delete(event.DeleteEvent{Object: labeled}), "the temp content going away is admitted")
+	assert.False(t, contentWatch.Delete(event.DeleteEvent{Object: unlabeled}), "a backup content without the label is not")
+	assert.False(t, contentWatch.Create(event.CreateEvent{Object: labeled}), "creating the temp content is not")
+	assert.False(t, contentWatch.Update(event.UpdateEvent{ObjectOld: labeled, ObjectNew: labeled}), "the status seed and the deletion timestamp are not")
+
+	entry, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver})
+	require.NoError(t, err)
+	backup := retainedTestBackup()
+	pending := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "shard", Namespace: backup.Namespace, Labels: retainedsnapshot.FamilyLabels(backup)},
+		Data:       map[string]string{"foo-du": string(entry)},
+	}
+	counted := pending.DeepCopy()
+	attempted, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Attempts: 1})
+	require.NoError(t, err)
+	counted.Data["foo-du"] = string(attempted)
+	settled := pending.DeepCopy()
+	delete(settled.Data, "foo-du")
+	settled.Data[retainedsnapshot.CompletedKey] = `["foo-du"]`
+	grown := pending.DeepCopy()
+	grown.Data["bar-du"] = string(entry)
+	unlabeledShard := settled.DeepCopy()
+	unlabeledShard.Labels = nil
+
+	familyWatch := familyEntriesSettledPredicate()
+	assert.True(t, familyWatch.Update(event.UpdateEvent{ObjectOld: pending, ObjectNew: settled}), "an entry completed or escalated is admitted")
+	assert.False(t, familyWatch.Update(event.UpdateEvent{ObjectOld: pending, ObjectNew: counted}), "a persisted attempt count is not")
+	assert.False(t, familyWatch.Update(event.UpdateEvent{ObjectOld: pending, ObjectNew: grown}), "a gather adding an entry is not")
+	assert.False(t, familyWatch.Update(event.UpdateEvent{ObjectOld: pending, ObjectNew: unlabeledShard}), "a ConfigMap without the UID label is not")
+	assert.False(t, familyWatch.Create(event.CreateEvent{Object: pending}), "the gather creating a shard is not")
+	assert.False(t, familyWatch.Delete(event.DeleteEvent{Object: settled}), "the tail removing the family is not")
 }
 
 // TestBackupDeletionWaitsOnFamilyMissedByCache proves the re-entry safety
