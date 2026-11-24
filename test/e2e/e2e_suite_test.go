@@ -50,6 +50,7 @@ import (
 	. "github.com/velero-io/velero/test/e2e/resource-filtering"
 	. "github.com/velero-io/velero/test/e2e/resourcemodifiers"
 	. "github.com/velero-io/velero/test/e2e/resourcepolicies"
+	. "github.com/velero-io/velero/test/e2e/retainedsnapshot"
 	. "github.com/velero-io/velero/test/e2e/scale"
 	. "github.com/velero-io/velero/test/e2e/schedule"
 	. "github.com/velero-io/velero/test/e2e/upgrade"
@@ -731,6 +732,24 @@ var _ = Describe(
 	"Volume data in-place restore for file system backup",
 	Label("InPlaceRestoreForFSB", "InplaceRestore", "Restore"),
 	InplaceRestoreForFileSystemBackupTest,
+)
+
+var _ = Describe(
+	"Base snapshot retention of the block data mover: retain and delete",
+	Label("RetainedSnapshotLifecycle", "Backups", "Deletion"),
+	RetainedSnapshotLifecycleTest,
+)
+
+var _ = Describe(
+	"Base snapshot retention of the block data mover: backup chain",
+	Label("RetainedSnapshotChain", "Backups", "Deletion", "Restore"),
+	RetainedSnapshotChainTest,
+)
+
+var _ = Describe(
+	"Base snapshot retention of the block data mover: release",
+	Label("RetainedSnapshotRelease", "Backups", "Deletion"),
+	RetainedSnapshotReleaseTest,
 )
 
 func GetKubeConfigContext() error {
