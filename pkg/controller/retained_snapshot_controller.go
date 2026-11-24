@@ -329,7 +329,19 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 			r.eventf(shard, backup, "RetainedSnapshotDeleteEscalated",
 				"the CSI driver failed to delete the snapshot %s of DataUpload %s %d times (%v); it was moved to the orphan-snapshot ConfigMap for manual cleanup, and the backup deletion proceeds",
 				entry.CSISnapshotHandle, name, entry.Attempts, callErr)
-			return entryOrphaned, r.moveToOrphan(ctx, backup, name, entry)
+			if err := r.moveToOrphan(ctx, backup, name, entry); err != nil {
+				return entryOrphaned, err
+			}
+			// Escalation also releases the temp content: it was left deleting
+			// while the sidecar retried, and nothing retries it once the entry
+			// has moved to the orphan ConfigMap, so without this step it would
+			// sit with a deletionTimestamp forever (design section 4). The
+			// orphan record is already durable, so a failure here is reported
+			// and does not fail the deletion.
+			if err := csi.ReleaseTempVSC(ctx, r.Client, r.apiReader, entry.Record(), log); err != nil {
+				log.WithError(err).Warnf("Error releasing the temp VolumeSnapshotContent of the escalated snapshot of DataUpload %s; remove its bound-protection finalizer by hand", name)
+			}
+			return entryOrphaned, nil
 		}
 		// The counter is persisted, so a retry of `velero backup delete`,
 		// which is a new DeleteBackupRequest, still reaches the bound across

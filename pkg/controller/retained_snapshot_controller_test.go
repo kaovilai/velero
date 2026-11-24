@@ -320,6 +320,11 @@ func TestRetainedSnapshotControllerEscalatesAfterBoundedAttempts(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, retainedsnapshot.MaxAttempts, entry.Attempts)
 
+	// ... the temp content the sidecar left deleting is released: without
+	// that it would sit with a deletionTimestamp forever (design section 4)...
+	err = c.Get(t.Context(), client.ObjectKey{Name: csi.TempVSCName(retainedTestDriver, retainedTestHandle)}, &snapshotv1api.VolumeSnapshotContent{})
+	assert.True(t, apierrors.IsNotFound(err), "the escalation releases the temp VolumeSnapshotContent")
+
 	// ... and the backup deletion proceeds: the request is woken, not failed.
 	req := getRequest(t, c, dbr)
 	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseInProgress, req.Status.Phase)

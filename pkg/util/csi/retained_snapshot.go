@@ -320,6 +320,58 @@ func DeleteRetainedSnapshot(
 		record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, tempVSC.Name)
 }
 
+// ReleaseTempVSC removes the bound-protection finalizer from the temp
+// VolumeSnapshotContent of a record whose deletion escalated, and deletes the
+// content if nothing deleted it yet. The content was left deleting while the
+// sidecar retried the failing DeleteSnapshot call; once the entry has moved to
+// the orphan-snapshot ConfigMap nothing retries it, and without this step the
+// content would sit with a deletionTimestamp forever (design section 4).
+// Releasing the finalizer lets the content disappear with no further CSI call:
+// the storage snapshot it names is the orphan record's business from here on.
+// A content that is already gone is not an error.
+func ReleaseTempVSC(
+	ctx context.Context,
+	crClient crclient.Client,
+	reader crclient.Reader,
+	record *velerov2alpha1api.RetainedCSIStorageSnapshot,
+	log logrus.FieldLogger,
+) error {
+	if reader == nil {
+		reader = crClient
+	}
+	if record == nil || record.CSISnapshotHandle == "" || record.Driver == "" {
+		return errors.New("invalid retained snapshot record, handle and driver are required")
+	}
+	name := TempVSCName(record.Driver, record.CSISnapshotHandle)
+	vsc := &snapshotv1api.VolumeSnapshotContent{}
+	if err := reader.Get(ctx, crclient.ObjectKey{Name: name}, vsc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return errors.Wrapf(err, "error getting temp VolumeSnapshotContent %s", name)
+	}
+	original := vsc.DeepCopy()
+	kept := vsc.Finalizers[:0:0]
+	for _, f := range vsc.Finalizers {
+		if f != VSCBoundProtectionFinalizer {
+			kept = append(kept, f)
+		}
+	}
+	if len(kept) != len(vsc.Finalizers) {
+		vsc.Finalizers = kept
+		if err := crClient.Patch(ctx, vsc, crclient.MergeFrom(original)); err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "error removing the finalizer of temp VolumeSnapshotContent %s", name)
+		}
+	}
+	if vsc.DeletionTimestamp == nil {
+		if err := crClient.Delete(ctx, vsc); err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "error deleting temp VolumeSnapshotContent %s", name)
+		}
+	}
+	log.Infof("Released temp VolumeSnapshotContent %s of the escalated snapshot %s", name, record.CSISnapshotHandle)
+	return nil
+}
+
 // latestSnapshotDeleteErrorMessage returns the message of the latest
 // SnapshotDeleteError event recorded for the named VolumeSnapshotContent, and
 // whether the message belongs to the DeleteSnapshot call itself. Events of a

@@ -826,6 +826,48 @@ func TestDeleteRetainedSnapshotSuccess(t *testing.T) {
 	})
 }
 
+// TestReleaseTempVSC proves the escalation's release of the temp content
+// (design section 4): the bound-protection finalizer is removed from a content
+// left deleting by a failing DeleteSnapshot, so it disappears with no further
+// CSI call; a content that was never deleted is deleted too; a gone content is
+// not an error.
+func TestReleaseTempVSC(t *testing.T) {
+	record := retainedTestRecord()
+	name := TempVSCName(record.Driver, record.CSISnapshotHandle)
+
+	t.Run("a deleting content loses its finalizer and disappears", func(t *testing.T) {
+		leftover := BuildTempVSCForRetainedSnapshot(record)
+		now := metav1.Now()
+		leftover.DeletionTimestamp = &now
+		c := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithRuntimeObjects(leftover).Build()
+
+		require.NoError(t, ReleaseTempVSC(t.Context(), c, c, record, velerotest.NewLogger()))
+
+		err := c.Get(t.Context(), crclient.ObjectKey{Name: name}, &snapshotv1api.VolumeSnapshotContent{})
+		assert.True(t, apierrors.IsNotFound(err), "the content disappears once its finalizer is released")
+	})
+
+	t.Run("a content that was never deleted is released and deleted", func(t *testing.T) {
+		leftover := BuildTempVSCForRetainedSnapshot(record)
+		c := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithRuntimeObjects(leftover).Build()
+
+		require.NoError(t, ReleaseTempVSC(t.Context(), c, nil, record, velerotest.NewLogger()))
+
+		err := c.Get(t.Context(), crclient.ObjectKey{Name: name}, &snapshotv1api.VolumeSnapshotContent{})
+		assert.True(t, apierrors.IsNotFound(err))
+	})
+
+	t.Run("a gone content is not an error", func(t *testing.T) {
+		c := velerotest.NewFakeControllerRuntimeClientBuilder(t).Build()
+		require.NoError(t, ReleaseTempVSC(t.Context(), c, c, record, velerotest.NewLogger()))
+	})
+
+	t.Run("an invalid record is rejected", func(t *testing.T) {
+		c := velerotest.NewFakeControllerRuntimeClientBuilder(t).Build()
+		require.Error(t, ReleaseTempVSC(t.Context(), c, c, &velerov2alpha1api.RetainedCSIStorageSnapshot{}, velerotest.NewLogger()))
+	})
+}
+
 func TestDeleteRetainedSnapshotInvalidRecord(t *testing.T) {
 	c := (&fakeSnapshotterBackend{snapshots: map[string]bool{}}).client(t)
 
