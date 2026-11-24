@@ -571,22 +571,29 @@ func (v *volumeHelperImpl) GetRetainSnapshotFromActionParameters(obj runtime.Uns
 
 // getPVAndMatchActionWithIndex is getPVAndMatchAction with the index of the
 // matched policy entry.
+// The index is a diagnostic: when it cannot be resolved the action still
+// stands and the entry is reported as unknown (-1), never as an error.
 func (v *volumeHelperImpl) getPVAndMatchActionWithIndex(obj runtime.Unstructured, groupResource schema.GroupResource) (*resourcepolicies.Action, int, error) {
 	action, pv, err := v.getPVAndMatchAction(obj, groupResource)
 	if err != nil || action == nil || v.volumePolicy == nil {
 		return action, -1, err
 	}
-	pvc := new(corev1api.PersistentVolumeClaim)
+	return action, v.matchedPolicyIndex(obj, groupResource, pv), nil
+}
+
+func (v *volumeHelperImpl) matchedPolicyIndex(obj runtime.Unstructured, groupResource schema.GroupResource, pv *corev1api.PersistentVolume) int {
+	var pvc *corev1api.PersistentVolumeClaim
 	if groupResource == kuberesource.PersistentVolumeClaims {
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), &pvc); err != nil {
-			return action, -1, nil
+		pvc = new(corev1api.PersistentVolumeClaim)
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pvc); err != nil {
+			v.logger.WithError(err).Debug("fail to convert unstructured into PVC for the matched policy index")
+			return -1
 		}
-	} else {
-		pvc = nil
 	}
-	_, index, indexErr := v.volumePolicy.GetMatchActionWithIndex(resourcepolicies.NewVolumeFilterData(pv, nil, pvc))
-	if indexErr != nil {
-		return action, -1, nil
+	_, index, err := v.volumePolicy.GetMatchActionWithIndex(resourcepolicies.NewVolumeFilterData(pv, nil, pvc))
+	if err != nil {
+		v.logger.WithError(err).Debug("fail to resolve the matched policy index")
+		return -1
 	}
-	return action, index, nil
+	return index
 }
