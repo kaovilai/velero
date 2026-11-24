@@ -419,6 +419,63 @@ func TestOrphanEntriesOutliveBackup(t *testing.T) {
 	assert.NotContains(t, family.Shards[0].Data, "backup-uid.du-1")
 }
 
+// TestSplitOrphanKey proves the key split: the first dot separates the UID,
+// which carries none, from a DataUpload name that may carry dots; the shard's
+// bookkeeping keys are not entries.
+func TestSplitOrphanKey(t *testing.T) {
+	uid, du, ok := SplitOrphanKey("backup-uid.my.backup-abcde")
+	assert.True(t, ok)
+	assert.Equal(t, "backup-uid", uid)
+	assert.Equal(t, "my.backup-abcde", du)
+	for _, key := range []string{ActiveKey, CompletedKey, "", ".du", "uid."} {
+		_, _, ok := SplitOrphanKey(key)
+		assert.False(t, ok, key)
+	}
+}
+
+// TestRemoveOrphanEntriesForSnapshot proves the stale-orphan cleanup of design
+// section 4: an orphan entry recorded under an earlier UID of the backup is
+// matched by the snapshot itself, removed once that snapshot is deleted, and
+// returned for the event; entries of other snapshots and other drivers stay.
+func TestRemoveOrphanEntriesForSnapshot(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	earlier := testBackup()
+	earlier.UID = "earlier-uid"
+	require.NoError(t, WriteOrphanEntry(t.Context(), c, earlier, "du-1", testEntry("handle-1")))
+	require.NoError(t, WriteOrphanEntry(t.Context(), c, earlier, "du-2", testEntry("handle-2")))
+	other := testEntry("handle-1")
+	other.Driver = "other.csi.example.com"
+	require.NoError(t, WriteOrphanEntry(t.Context(), c, earlier, "du-3", other))
+
+	entries, err := LoadOrphanEntries(t.Context(), c, earlier.Namespace)
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+	assert.Equal(t, "earlier-uid", entries[0].BackupUID)
+	assert.Equal(t, "du-1", entries[0].DataUpload)
+	assert.Equal(t, "handle-1", entries[0].Entry.CSISnapshotHandle)
+
+	removed, err := RemoveOrphanEntriesForSnapshot(t.Context(), c, earlier.Namespace, "rbd.csi.ceph.com", "handle-1")
+	require.NoError(t, err)
+	require.Len(t, removed, 1)
+	assert.Equal(t, "earlier-uid.du-1", removed[0].Key)
+
+	entries, err = LoadOrphanEntries(t.Context(), c, earlier.Namespace)
+	require.NoError(t, err)
+	keys := []string{}
+	for _, o := range entries {
+		keys = append(keys, o.Key)
+	}
+	assert.ElementsMatch(t, []string{"earlier-uid.du-2", "earlier-uid.du-3"}, keys, "other snapshots and other drivers stay")
+
+	// Nothing to remove is not an error.
+	removed, err = RemoveOrphanEntriesForSnapshot(t.Context(), c, earlier.Namespace, "rbd.csi.ceph.com", "handle-9")
+	require.NoError(t, err)
+	assert.Empty(t, removed)
+	removed, err = RemoveOrphanEntriesForSnapshot(t.Context(), c, earlier.Namespace, "rbd.csi.ceph.com", "")
+	require.NoError(t, err)
+	assert.Empty(t, removed)
+}
+
 // TestDeleteRemovesFamily proves the tail's own Backup deletion is not the GC
 // trigger: the tail removes the family itself.
 func TestDeleteRemovesFamily(t *testing.T) {

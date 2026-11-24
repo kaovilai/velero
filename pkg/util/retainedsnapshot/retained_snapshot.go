@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	corev1api "k8s.io/api/core/v1"
@@ -345,6 +346,108 @@ func WriteEntries(ctx context.Context, c client.Client, backup *velerov1api.Back
 func WriteOrphanEntry(ctx context.Context, c client.Client, backup *velerov1api.Backup, duName string, entry *Entry) error {
 	entries := map[string]*Entry{string(backup.UID) + "." + duName: entry}
 	return writeShardedEntries(ctx, c, backup, map[string]string{OrphanLabel: "true"}, OrphanNamePrefix(), entries)
+}
+
+// OrphanEntry is one entry of the orphan-snapshot ConfigMaps, with the
+// backup UID and DataUpload name its key encodes and the shard that holds it.
+type OrphanEntry struct {
+	Shard      string
+	Key        string
+	BackupUID  string
+	DataUpload string
+	Entry      *Entry
+}
+
+// SplitOrphanKey splits an orphan entry key into its backup UID and DataUpload
+// name. A UID carries no dot, so the first dot is the separator; the shard's
+// bookkeeping keys (active, completed) carry none and are not entries.
+func SplitOrphanKey(key string) (uid, duName string, ok bool) {
+	i := strings.IndexByte(key, '.')
+	if i <= 0 || i == len(key)-1 {
+		return "", "", false
+	}
+	return key[:i], key[i+1:], true
+}
+
+// LoadOrphanEntries lists every entry of the orphan-snapshot ConfigMaps of the
+// namespace, in shard then key order. An undecodable entry is returned with an
+// empty Entry so a caller can still name it.
+func LoadOrphanEntries(ctx context.Context, c client.Reader, namespace string) ([]OrphanEntry, error) {
+	list := &corev1api.ConfigMapList{}
+	if err := c.List(ctx, list, &client.ListOptions{
+		Namespace:     namespace,
+		LabelSelector: labels.SelectorFromSet(map[string]string{OrphanLabel: "true"}),
+	}); err != nil {
+		return nil, errors.Wrap(err, "error listing the orphan-snapshot ConfigMaps")
+	}
+	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].Name < list.Items[j].Name })
+	out := []OrphanEntry{}
+	for i := range list.Items {
+		shard := &list.Items[i]
+		keys := make([]string, 0, len(shard.Data))
+		for key := range shard.Data {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			uid, duName, ok := SplitOrphanKey(key)
+			if !ok {
+				continue
+			}
+			entry, err := UnmarshalEntry(shard.Data[key])
+			if err != nil {
+				entry = &Entry{}
+			}
+			out = append(out, OrphanEntry{Shard: shard.Name, Key: key, BackupUID: uid, DataUpload: duName, Entry: entry})
+		}
+	}
+	return out, nil
+}
+
+// RemoveOrphanEntriesForSnapshot removes the orphan entries that name the
+// given driver and snapshot handle, and returns them. An orphan entry goes
+// stale when its Backup object was gone but the tarball still existed: a BSL
+// resync recreates the Backup under a new UID, and a later backup deletion
+// removes the snapshot through the tarball record. The entry's UID is then not
+// the backup's, so the match is by the snapshot itself (design section 4).
+func RemoveOrphanEntriesForSnapshot(ctx context.Context, c client.Client, namespace, driver, handle string) ([]OrphanEntry, error) {
+	if handle == "" {
+		return nil, nil
+	}
+	entries, err := LoadOrphanEntries(ctx, c, namespace)
+	if err != nil {
+		return nil, err
+	}
+	removed := []OrphanEntry{}
+	byShard := map[string][]OrphanEntry{}
+	for _, o := range entries {
+		if o.Entry.CSISnapshotHandle == handle && (driver == "" || o.Entry.Driver == "" || o.Entry.Driver == driver) {
+			byShard[o.Shard] = append(byShard[o.Shard], o)
+		}
+	}
+	for shardName, matches := range byShard {
+		shard := &corev1api.ConfigMap{}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: shardName}, shard); err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			return removed, errors.Wrapf(err, "error getting the orphan-snapshot ConfigMap %s", shardName)
+		}
+		for _, o := range matches {
+			delete(shard.Data, o.Key)
+		}
+		if err := c.Update(ctx, shard); err != nil {
+			return removed, errors.Wrapf(err, "error updating the orphan-snapshot ConfigMap %s", shardName)
+		}
+		removed = append(removed, matches...)
+	}
+	sort.Slice(removed, func(i, j int) bool {
+		if removed[i].Shard != removed[j].Shard {
+			return removed[i].Shard < removed[j].Shard
+		}
+		return removed[i].Key < removed[j].Key
+	})
+	return removed, nil
 }
 
 func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1api.Backup, shardLabels map[string]string, namePrefix string, entries map[string]*Entry) error {

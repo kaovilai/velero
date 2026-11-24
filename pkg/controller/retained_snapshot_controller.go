@@ -310,6 +310,7 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 			return entryDeleted, errors.Wrapf(err, "error marking the retained snapshot of DataUpload %s as deleted", name)
 		}
 		log.Infof("Deleted the retained snapshot %s of DataUpload %s", entry.CSISnapshotHandle, name)
+		r.resolveStaleOrphans(ctx, backup, shard, name, entry, log)
 		return entryDeleted, nil
 	}
 
@@ -362,6 +363,27 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 	// Any other failure -- a timeout, a credential failure, an API error --
 	// fails the backup deletion so it can be retried.
 	return entryDeleted, err
+}
+
+// resolveStaleOrphans removes the orphan entries that name the snapshot just
+// deleted. An orphan entry goes stale when its Backup object was gone but the
+// tarball still existed: a BSL resync recreates the Backup under a new UID,
+// and this deletion then removes the snapshot through the tarball record. The
+// entry would otherwise outlive the snapshot and send the operator to clean up
+// a snapshot that no longer exists (design section 4). Only the snapshot
+// identity can match the entry, because its UID is the earlier Backup's. The
+// snapshot is gone either way, so a failure here is reported, not fatal.
+func (r *retainedSnapshotReconciler) resolveStaleOrphans(ctx context.Context, backup *velerov1api.Backup, shard *corev1api.ConfigMap, name string, entry *retainedsnapshot.Entry, log logrus.FieldLogger) {
+	removed, err := retainedsnapshot.RemoveOrphanEntriesForSnapshot(ctx, r.Client, backup.Namespace, entry.Driver, entry.CSISnapshotHandle)
+	if err != nil {
+		log.WithError(err).Warnf("Error removing the stale orphan entries of the deleted snapshot %s", entry.CSISnapshotHandle)
+	}
+	for _, o := range removed {
+		r.eventf(shard, backup, "RetainedSnapshotOrphanResolved",
+			"the snapshot %s was deleted through the record of DataUpload %s; the stale orphan entry %s (backup UID %s) was removed from ConfigMap %s",
+			entry.CSISnapshotHandle, name, o.Key, o.BackupUID, o.Shard)
+		log.Infof("Removed the stale orphan entry %s of the deleted snapshot %s from ConfigMap %s", o.Key, entry.CSISnapshotHandle, o.Shard)
+	}
 }
 
 // moveToOrphan moves an escalated or skipped record to the orphan-snapshot

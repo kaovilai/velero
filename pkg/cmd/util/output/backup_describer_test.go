@@ -1039,15 +1039,20 @@ func TestDescribeOrphanSnapshotRecords(t *testing.T) {
 	require.NoError(t, err)
 	theirs, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-2", Driver: "rbd.csi.ceph.com"})
 	require.NoError(t, err)
+	// The entry of an earlier instance of the backup -- its Backup object was
+	// gone, a BSL resync recreated it under bak-uid -- naming a snapshot the
+	// backup still retains.
+	stale, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-3", Driver: "rbd.csi.ceph.com", Attempts: 5})
+	require.NoError(t, err)
 	orphans := &corev1api.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "orphan-snapshots-0", Labels: map[string]string{retainedsnapshot.OrphanLabel: "true"}},
-		Data:       map[string]string{"bak-uid.du-a": string(mine), "other-uid.du-b": string(theirs), retainedsnapshot.ActiveKey: "false"},
+		Data:       map[string]string{"bak-uid.du-a": string(mine), "other-uid.du-b": string(theirs), "earlier-uid.du-c": string(stale), retainedsnapshot.ActiveKey: "false"},
 	}
 	kbClient := velerotest.NewFakeControllerRuntimeClient(t, orphans)
 
 	d := &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
 	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
-	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, backup)
+	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, backup, nil)
 	d.out.Flush()
 	assert.Equal(t, `
 Orphan Snapshot Records: 1 retained snapshot(s) were skipped or escalated and need manual cleanup
@@ -1055,12 +1060,28 @@ Orphan Snapshot Records: 1 retained snapshot(s) were skipped or escalated and ne
     DataUpload du-a: driver rbd.csi.ceph.com, snapshot handle h-1, attempts 5
 `, d.buf.String())
 
+	// With the backup's retained handles known, the stale entry of the earlier
+	// instance is reported as such; h-2 belongs to another backup and stays out.
+	d = &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
+	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
+	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, backup, []string{"h-3", "h-9"})
+	d.out.Flush()
+	assert.Equal(t, `
+Orphan Snapshot Records: 1 retained snapshot(s) were skipped or escalated and need manual cleanup
+  ConfigMap velero/orphan-snapshots-0:
+    DataUpload du-a: driver rbd.csi.ceph.com, snapshot handle h-1, attempts 5
+
+Stale Orphan Snapshot Records: 1 entry(ies) of an earlier instance of this backup name snapshots this backup still retains; deleting this backup deletes the snapshots and removes the entries
+  ConfigMap velero/orphan-snapshots-0:
+    DataUpload du-c (backup UID earlier-uid): driver rbd.csi.ceph.com, snapshot handle h-3, attempts 5
+`, d.buf.String())
+
 	// A backup with no orphan records prints nothing.
 	none := builder.ForBackup("velero", "clean").Result()
 	none.UID = "clean-uid"
 	d = &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
 	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
-	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, none)
+	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, none, nil)
 	d.out.Flush()
 	assert.Empty(t, d.buf.String())
 }

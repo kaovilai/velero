@@ -431,6 +431,41 @@ func TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive(t *testing.T) {
 	assert.NotEmpty(t, req.Annotations[velerov1api.RetainedSnapshotsWakeAnnotation], "the escalation wakes the request")
 }
 
+// TestRetainedSnapshotControllerResolvesStaleOrphan proves the stale-orphan
+// cleanup of design section 4: an orphan entry written when the Backup object
+// was gone goes stale once a BSL resync recreates the Backup under a new UID
+// and its deletion removes the snapshot through the tarball record; the
+// deletion then removes the entry, matched by the snapshot, with an event, and
+// leaves unrelated orphan entries alone.
+func TestRetainedSnapshotControllerResolvesStaleOrphan(t *testing.T) {
+	backend := &fakeSnapshotBackend{snapshots: map[string]bool{retainedTestHandle: true}}
+	backup := retainedTestBackup()
+	backup.UID = "resynced-uid"
+	c := backend.client(t, backup)
+
+	// The orphan entries of the earlier instance of the backup, keyed by its
+	// UID: one names the snapshot this deletion removes, one another snapshot.
+	earlier := retainedTestBackup()
+	earlier.UID = "earlier-uid"
+	require.NoError(t, retainedsnapshot.WriteOrphanEntry(t.Context(), c, earlier, "foo-du", &retainedsnapshot.Entry{CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Attempts: retainedsnapshot.MaxAttempts}))
+	require.NoError(t, retainedsnapshot.WriteOrphanEntry(t.Context(), c, earlier, "bar-du", &retainedsnapshot.Entry{CSISnapshotHandle: "another-snapshot", Driver: retainedTestDriver, Attempts: retainedsnapshot.MaxAttempts}))
+
+	shard := retainedTestFamily(t, c, backup, map[string]*retainedsnapshot.Entry{
+		"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
+	})
+	retainedTestRequest(t, c, backup)
+	recorder := &fakeEventRecorder{}
+	r := NewRetainedSnapshotReconcilerWithRecorder(velerotest.NewLogger(), c, c, clock.RealClock{}, recorder)
+	reconcileShard(t, r, shard)
+
+	assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
+	orphans, err := retainedsnapshot.LoadOrphanEntries(t.Context(), c, backup.Namespace)
+	require.NoError(t, err)
+	require.Len(t, orphans, 1, "only the entry naming the deleted snapshot is removed")
+	assert.Equal(t, "earlier-uid.bar-du", orphans[0].Key)
+	assert.Contains(t, recorder.reasons, "RetainedSnapshotOrphanResolved")
+}
+
 type fakeEventRecorder struct {
 	reasons []string
 }
