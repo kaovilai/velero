@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	veleroshared "github.com/velero-io/velero/pkg/apis/velero/shared"
@@ -420,6 +421,21 @@ func (p *pvcBackupItemAction) Execute(
 				"retainSnapshot", datamover.DataMoverTypeVeleroBlock, effectiveDataMover)
 			retainSnapshot = false
 		}
+		// A VolumeGroupSnapshot member's backend snapshot belongs to the group
+		// and is released only with the VolumeGroupSnapshotContent: the
+		// sidecar never issues DeleteSnapshot for a member content, so the
+		// retained-snapshot deletion could not delete it on its own. The
+		// policy is ignored, with a warning, and the member keeps the
+		// VolumeGroupSnapshot lifecycle it has today (design, Non Goals).
+		if retainSnapshot && isVolumeGroupSnapshotMember(vs, vsc) {
+			dataUploadLog.Warnf(
+				"The %q parameter of the volume policy is ignored for VolumeSnapshot %s/%s, which is a member of VolumeGroupSnapshot %s; a group member's snapshot is released with the group and cannot be retained on its own",
+				"retainSnapshot", vs.Namespace, vs.Name, ptr.Deref(vs.Status.VolumeGroupSnapshotName, ""))
+			retainSnapshot = false
+		}
+		if !retainSnapshot && effectiveDataMover == datamover.DataMoverTypeVeleroBlock {
+			dataUploadLog.Info("Base snapshot retention is off for this volume: no volume policy matched with retainSnapshot: true")
+		}
 
 		dataUploadLog.Info("Starting data upload of backup")
 
@@ -648,14 +664,33 @@ func newDataUpload(
 
 	// The retention decision travels on the DataUpload, so this must not depend
 	// on the uploader-config branch above that initializes the map today.
-	if retainSnapshot {
+	// Every velero-block DataUpload carries the key with its explicit value,
+	// "true" or "false", whether or not a policy matched: the key doubles as
+	// the retention-evaluated marker the legacy recovery of backups created
+	// before the rollback relies on (design sections 1 and 7). A DataUpload
+	// without the marker is from a pre-rollback build; one with the marker and
+	// no record was evaluated and not retained, whatever its class says.
+	if datamover.IsVeleroBlockDataMover(dataMover) {
 		if dataUpload.Spec.DataMoverConfig == nil {
 			dataUpload.Spec.DataMoverConfig = make(map[string]string)
 		}
-		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] = "true"
+		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] = strconv.FormatBool(retainSnapshot)
 	}
 
 	return dataUpload
+}
+
+// isVolumeGroupSnapshotMember reports whether the backup VolumeSnapshot was
+// taken as a member of a VolumeGroupSnapshot: the VolumeSnapshot names its
+// group, or its content carries the group handle.
+func isVolumeGroupSnapshotMember(vs *snapshotv1api.VolumeSnapshot, vsc *snapshotv1api.VolumeSnapshotContent) bool {
+	if vs != nil && vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil && *vs.Status.VolumeGroupSnapshotName != "" {
+		return true
+	}
+	if vsc != nil && vsc.Status != nil && vsc.Status.VolumeGroupSnapshotHandle != nil && *vsc.Status.VolumeGroupSnapshotHandle != "" {
+		return true
+	}
+	return false
 }
 
 func createDataUpload(

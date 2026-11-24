@@ -288,6 +288,7 @@ func TestExecute(t *testing.T) {
 					SourcePVC:        "testPVC",
 					SourceNamespace:  "velero",
 					DataMover:        "velero-block",
+					DataMoverConfig:  map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
 					OperationTimeout: metav1.Duration{Duration: 1 * time.Minute},
 					ParentSnapshot:   "",
 				},
@@ -2395,20 +2396,40 @@ func TestNewDataUpload(t *testing.T) {
 			expectedDataMoverCfg: map[string]string{},
 		},
 		{
-			name:                      "Default backup type, uploader config with 0 parallel files",
+			// Every velero-block DataUpload carries the retention-evaluated
+			// marker with its explicit value, whether or not a policy matched
+			// (design sections 1 and 7).
+			name:                      "velero-block without retention carries the false marker",
 			backupType:                "",
 			vsClassName:               ptr.To("test-vs-class"),
 			uploaderConfig:            &velerov1api.UploaderConfigForBackup{ParallelFilesUpload: 0},
 			dataMoverFromVolumePolicy: "velero-block",
 			expectedParentSnap:        "",
-			expectedDataMoverCfg:      map[string]string{},
+			expectedDataMoverCfg:      map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
+		},
+		{
+			// The marker must not depend on the uploader-config branch that
+			// initializes the map today.
+			name:                      "velero-block without uploader config still carries the false marker",
+			vsClassName:               ptr.To("test-vs-class"),
+			uploaderConfig:            nil,
+			dataMoverFromVolumePolicy: "velero-block",
+			expectedDataMoverCfg:      map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
+		},
+		{
+			// The marker is a velero-block contract; the file system data
+			// mover's DataUploads are unchanged.
+			name:                 "file system data mover carries no marker",
+			vsClassName:          ptr.To("test-vs-class"),
+			uploaderConfig:       nil,
+			expectedDataMoverCfg: nil,
 		},
 		{
 			name:                      "block concurrency",
 			vsClassName:               ptr.To("test-vs-class"),
 			uploaderConfig:            &velerov1api.UploaderConfigForBackup{ParallelBlocksUpload: 7},
 			dataMoverFromVolumePolicy: "velero-block",
-			expectedDataMoverCfg:      map[string]string{uploaderUtil.ParallelBlocksUpload: "7"},
+			expectedDataMoverCfg:      map[string]string{uploaderUtil.ParallelBlocksUpload: "7", velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
 		},
 		{
 			// The retention decision must not depend on the uploader-config
@@ -2533,6 +2554,29 @@ func TestNewDataUpload(t *testing.T) {
 			assert.Equal(t, fsType, du.Spec.SourceFSType)
 			assert.Equal(t, tc.expectedParentSnap, du.Spec.ParentSnapshot)
 			assert.Equal(t, tc.expectedDataMoverCfg, du.Spec.DataMoverConfig)
+		})
+	}
+}
+
+// TestIsVolumeGroupSnapshotMember covers the member detection the retention
+// decision uses: a retainSnapshot policy is ignored for a DataUpload whose
+// backup snapshot is a VolumeGroupSnapshot member (design, Non Goals).
+func TestIsVolumeGroupSnapshotMember(t *testing.T) {
+	tests := []struct {
+		name string
+		vs   *snapshotv1api.VolumeSnapshot
+		vsc  *snapshotv1api.VolumeSnapshotContent
+		want bool
+	}{
+		{name: "no status", vs: &snapshotv1api.VolumeSnapshot{}, vsc: &snapshotv1api.VolumeSnapshotContent{}},
+		{name: "empty group name", vs: &snapshotv1api.VolumeSnapshot{Status: &snapshotv1api.VolumeSnapshotStatus{VolumeGroupSnapshotName: ptr.To("")}}, vsc: &snapshotv1api.VolumeSnapshotContent{}},
+		{name: "snapshot names its group", vs: &snapshotv1api.VolumeSnapshot{Status: &snapshotv1api.VolumeSnapshotStatus{VolumeGroupSnapshotName: ptr.To("vgs-1")}}, vsc: &snapshotv1api.VolumeSnapshotContent{}, want: true},
+		{name: "content carries the group handle", vs: &snapshotv1api.VolumeSnapshot{}, vsc: &snapshotv1api.VolumeSnapshotContent{Status: &snapshotv1api.VolumeSnapshotContentStatus{VolumeGroupSnapshotHandle: ptr.To("group-handle")}}, want: true},
+		{name: "nil objects", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isVolumeGroupSnapshotMember(tc.vs, tc.vsc))
 		})
 	}
 }
