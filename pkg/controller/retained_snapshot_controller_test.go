@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -48,13 +47,7 @@ import (
 	"github.com/velero-io/velero/pkg/plugin/clientmgmt"
 	pluginmocks "github.com/velero-io/velero/pkg/plugin/mocks"
 	"github.com/velero-io/velero/pkg/plugin/velero"
-	"github.com/velero-io/velero/pkg/repository"
-	repomanager "github.com/velero-io/velero/pkg/repository/manager"
-	repomocks "github.com/velero-io/velero/pkg/repository/mocks"
-	repotypes "github.com/velero-io/velero/pkg/repository/types"
-	"github.com/velero-io/velero/pkg/repository/udmrepo"
 	velerotest "github.com/velero-io/velero/pkg/test"
-	"github.com/velero-io/velero/pkg/uploader"
 	"github.com/velero-io/velero/pkg/util/csi"
 	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
@@ -744,135 +737,6 @@ func TestBackupDeletionHandsOffToRetainedSnapshotController(t *testing.T) {
 	assert.Empty(t, family.Shards)
 }
 
-// TestBackupDeletionKeepsSnapshotWhenUnrecordedHandleCantBeRead proves the
-// pre-rollback recovery rule: if the tag cannot be read, the repository data
-// is kept and the backup deletion fails, so a retry can read it.
-func TestBackupDeletionKeepsSnapshotWhenUnrecordedHandleCantBeRead(t *testing.T) {
-	backup := retainedTestBackup()
-	location := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "default").Provider("objStoreProvider").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
-
-	// The delete action gathered an unrecorded entry from the tarball.
-	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), velerotest.NewFakeControllerRuntimeClient(t), backup, nil))
-
-	dbr := defaultTestDbr()
-	td := setupBackupDeletionControllerTest(t, dbr, backup, location)
-	td.controller.repoMgr = repomocks.NewManager(t)
-
-	// The repository read fails.
-	originalTags := getRepoSnapshotTagsFunc
-	t.Cleanup(func() { getRepoSnapshotTagsFunc = originalTags })
-	getRepoSnapshotTagsFunc = func(context.Context, *repository.Ensurer, repomanager.Manager, *velerov1api.Backup, repotypes.SnapshotIdentifier) (map[string]string, error) {
-		return nil, errors.New("fake-repo-error")
-	}
-
-	// Write the family with an unrecorded entry on the test client.
-	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), td.fakeClient, backup, map[string]*retainedsnapshot.Entry{
-		"foo-du": {
-			Driver:  retainedTestDriver,
-			Trusted: false,
-			Snapshot: &repotypes.SnapshotIdentifier{
-				SnapshotID:      "kopia-1",
-				VolumeNamespace: "app",
-				RepositoryType:  "kopia",
-			},
-		},
-	}))
-
-	pluginManager := &pluginmocks.Manager{}
-	pluginManager.On("GetDeleteItemActions").Return([]velero.DeleteItemAction{}, nil)
-	pluginManager.On("CleanupClients")
-	td.controller.newPluginManager = func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager }
-	td.backupStore.On("GetBackupVolumeSnapshots", dbr.Spec.BackupName).Return(nil, nil)
-
-	_, err := td.controller.Reconcile(t.Context(), td.req)
-	require.NoError(t, err)
-
-	res := getRequest(t, td.fakeClient, dbr)
-	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseProcessed, res.Status.Phase)
-	assert.Contains(t, strings.Join(res.Status.Errors, "\n"), "error reading the retained snapshot handle from the snapshot data")
-	td.backupStore.AssertNotCalled(t, "DeleteBackup", mock.Anything)
-}
-
-// TestResolveRetainedSnapshotHandles proves the tag resolution: the handle is
-// read from the cbt-change-id tag of the repository snapshot into the entry,
-// and a repository snapshot that is gone or has no tag drops the record.
-func TestResolveRetainedSnapshotHandles(t *testing.T) {
-	tests := []struct {
-		name        string
-		tags        map[string]string
-		tagsErr     error
-		wantHandle  string
-		wantDropped bool
-		wantErr     bool
-	}{
-		{
-			name:       "the handle is read from the cbt-change-id tag",
-			tags:       map[string]string{uploader.CBTChangeIDTag: "snap-handle"},
-			wantHandle: "snap-handle",
-		},
-		{
-			name:        "a repository snapshot that is gone drops the record",
-			tagsErr:     udmrepo.SnapshotNotFound(errors.New("snapshot not found")),
-			wantDropped: true,
-		},
-		{
-			name:        "a repository snapshot without the tag drops the record",
-			tags:        map[string]string{},
-			wantDropped: true,
-		},
-		{
-			name:    "an unreadable repository fails the deletion so a retry can read it",
-			tagsErr: errors.New("fake-repo-error"),
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			backup := retainedTestBackup()
-			c := velerotest.NewFakeControllerRuntimeClient(t)
-			require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), c, backup, map[string]*retainedsnapshot.Entry{
-				"foo-du": {
-					Driver:  retainedTestDriver,
-					Trusted: false,
-					Snapshot: &repotypes.SnapshotIdentifier{
-						SnapshotID:      "kopia-1",
-						VolumeNamespace: "app",
-						RepositoryType:  "kopia",
-					},
-				},
-			}))
-
-			looked := ""
-			originalTags := getRepoSnapshotTagsFunc
-			t.Cleanup(func() { getRepoSnapshotTagsFunc = originalTags })
-			getRepoSnapshotTagsFunc = func(_ context.Context, _ *repository.Ensurer, _ repomanager.Manager, _ *velerov1api.Backup, snapshot repotypes.SnapshotIdentifier) (map[string]string, error) {
-				looked = snapshot.SnapshotID
-				return tc.tags, tc.tagsErr
-			}
-
-			r := &backupDeletionReconciler{Client: c, logger: velerotest.NewLogger(), repoMgr: repomocks.NewManager(t), repoEnsurer: repository.NewEnsurer(c, velerotest.NewLogger(), time.Hour)}
-			errs := r.resolveRetainedSnapshotHandles(t.Context(), backup, velerotest.NewLogger())
-
-			assert.Equal(t, "kopia-1", looked)
-			if tc.wantErr {
-				require.Len(t, errs, 1)
-				return
-			}
-			assert.Empty(t, errs)
-			family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
-			require.NoError(t, err)
-			if tc.wantDropped {
-				assert.Zero(t, family.PendingEntries())
-				return
-			}
-			entry, ok := family.Entry("foo-du")
-			require.True(t, ok)
-			assert.Equal(t, tc.wantHandle, entry.CSISnapshotHandle)
-		})
-	}
-}
-
 // TestRetainedSnapshotControllerResolvesLongBackupName proves a shard of a
 // backup whose name exceeds the 63-character label value limit resolves the
 // live Backup: the full name is preserved in the shard's annotation, while
@@ -1058,73 +922,4 @@ func TestBackupDeletionWaitsOnFamilyMissedByCache(t *testing.T) {
 	assert.NotEmpty(t, res.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation])
 	td.backupStore.AssertNotCalled(t, "DeleteBackup", mock.Anything,
 		"the tail must not remove the tarball while a pending family is visible to the API reader")
-}
-
-// TestGatherKeepsLegacyEntryForPreRollbackDataUpload proves the pre-rollback
-// recovery rule: a completed local DataUpload without a record is a backup
-// taken before the record existed, so its legacy entry -- the repository
-// snapshot the handle is resolved from before the repository data is deleted
-// -- survives the gather. A DataUpload that did not complete had its record
-// cleared by the patch-back after the snapshot was released, so the
-// tarball's entry for it is dropped.
-func TestGatherKeepsLegacyEntryForPreRollbackDataUpload(t *testing.T) {
-	backup := retainedTestBackup()
-	c := velerotest.NewFakeControllerRuntimeClient(t, backup)
-
-	legacyEntry := func() *retainedsnapshot.Entry {
-		return &retainedsnapshot.Entry{
-			Driver:  retainedTestDriver,
-			Trusted: false,
-			Snapshot: &repotypes.SnapshotIdentifier{
-				SnapshotID:      "kopia-1",
-				VolumeNamespace: "app",
-				RepositoryType:  "kopia",
-			},
-		}
-	}
-	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), c, backup, map[string]*retainedsnapshot.Entry{
-		"foo-du": legacyEntry(),
-		"bar-du": legacyEntry(),
-		"baz-du": legacyEntry(),
-	}))
-
-	// A completed DataUpload with the retention-evaluated marker and no
-	// record was evaluated and not retained: it is not a legacy candidate,
-	// and a tarball entry for it is dropped (design section 7).
-	marked := builder.ForDataUpload(velerov1api.DefaultNamespace, "baz-du").
-		Labels(map[string]string{velerov1api.BackupNameLabel: "foo"}).
-		Phase(velerov2alpha1api.DataUploadPhaseCompleted).
-		DataMoverConfig(map[string]string{velerov2alpha1api.RetainSnapshotDataMoverConfigKey: "false"}).
-		Result()
-	marked.Status.SnapshotID = "kopia-3"
-	require.NoError(t, c.Create(t.Context(), marked))
-
-	// The local DataUpload of the pre-rollback backup: completed, no record.
-	preRollback := builder.ForDataUpload(velerov1api.DefaultNamespace, "foo-du").
-		Labels(map[string]string{velerov1api.BackupNameLabel: "foo"}).
-		Phase(velerov2alpha1api.DataUploadPhaseCompleted).
-		Result()
-	preRollback.Status.SnapshotID = "kopia-1"
-	require.NoError(t, c.Create(t.Context(), preRollback))
-
-	// A DataUpload that did not complete: the patch-back cleared its record
-	// after the snapshot was released.
-	released := builder.ForDataUpload(velerov1api.DefaultNamespace, "bar-du").
-		Labels(map[string]string{velerov1api.BackupNameLabel: "foo"}).
-		Phase(velerov2alpha1api.DataUploadPhaseFailed).
-		Result()
-	require.NoError(t, c.Create(t.Context(), released))
-
-	r := &backupDeletionReconciler{Client: c, logger: velerotest.NewLogger()}
-	assert.Empty(t, r.gatherRetainedSnapshotRecords(t.Context(), backup))
-
-	family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
-	require.NoError(t, err)
-	_, ok := family.Entry("foo-du")
-	assert.True(t, ok, "the legacy entry of a pre-rollback backup survives the gather")
-	_, ok = family.Entry("bar-du")
-	assert.False(t, ok, "the tarball entry of a released DataUpload is dropped")
-	_, ok = family.Entry("baz-du")
-	assert.False(t, ok, "a marked DataUpload without a record is not a legacy candidate")
-	assert.Equal(t, 1, family.PendingEntries())
 }

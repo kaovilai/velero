@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/errors"
-	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,7 +18,6 @@ import (
 	"github.com/velero-io/velero/pkg/label"
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	repotypes "github.com/velero-io/velero/pkg/repository/types"
-	"github.com/velero-io/velero/pkg/util"
 	"github.com/velero-io/velero/pkg/util/datamover"
 	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
@@ -98,14 +95,6 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 		// against a temp content the driver will never delete.
 		entry.Trusted = false
 		entries[du.Name] = entry
-	} else if entry := d.unrecordedRetainedSnapshotEntry(input.Backup, *du); entry != nil {
-		// A backup taken before Velero recorded retained snapshots kept its
-		// snapshot through a Retain VolumeSnapshotClass; its DataUpload
-		// carries no record, but the block uploader saved the handle as the
-		// cbt-change-id tag of the repository snapshot, and the
-		// backup-deletion controller resolves it from there before the
-		// repository data is deleted.
-		entries[du.Name] = entry
 	}
 	if err := retainedsnapshot.WriteEntries(context.Background(), d.client, input.Backup, entries); err != nil {
 		return errors.WithStack(errors.Wrapf(err, "failed to gather the retained snapshot record of DataUpload %s/%s", du.Namespace, du.Name))
@@ -126,96 +115,6 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 		}
 	}
 	return nil
-}
-
-// unrecordedRetainedSnapshotEntry builds the pending entry of a DataUpload of
-// a backup taken before Velero recorded retained snapshots. The handle is not
-// known yet: the entry identifies the repository snapshot, and the
-// backup-deletion controller resolves the handle from its cbt-change-id tag
-// before the repository data is deleted. The VolumeSnapshotClass is looked up
-// in the cluster where the deletion runs, and the deletion secret is taken
-// from the class parameters; a backup whose class was never synced to that
-// cluster, or whose class names the deletion secret with a template, is left
-// for manual cleanup. The vSphere CSI driver is excluded because its change
-// ID is not a snapshot handle.
-func (d *DataUploadDeleteAction) unrecordedRetainedSnapshotEntry(bak *velerov1.Backup, du velerov2alpha1.DataUpload) *retainedsnapshot.Entry {
-	if du.Spec.SnapshotType != velerov2alpha1.SnapshotTypeCSI || du.Spec.CSISnapshot == nil ||
-		!datamover.IsVeleroBlockDataMover(du.Spec.DataMover) ||
-		du.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted || du.Status.SnapshotID == "" {
-		return nil
-	}
-
-	log := d.logger.WithField("dataupload", du.Namespace+"/"+du.Name)
-
-	// The legacy trigger applies only to marker-less DataUploads from
-	// pre-rollback builds. Every velero-block DataUpload created by a build
-	// with this design carries the retention-evaluated marker -- the
-	// retainSnapshot key of spec.dataMoverConfig with its explicit value --
-	// so a marked DataUpload without a record was evaluated and not retained,
-	// whatever its VolumeSnapshotClass says (design section 7). Without this
-	// gate every no-retention backup under a Retain class, the common CBT
-	// setup, would fabricate a record for an already-deleted snapshot.
-	if retainedsnapshot.IsRetentionEvaluated(&du) {
-		log.Debug("DataUpload carries the retention-evaluated marker and no record, nothing was retained")
-		return nil
-	}
-	driver := du.Spec.CSISnapshot.Driver
-	if driver == "" || driver == util.VSphereCSIDriverName {
-		// The vSphere change ID is not the snapshot handle.
-		return nil
-	}
-	if du.Spec.CSISnapshot.SnapshotClass == "" {
-		return nil
-	}
-
-	// The backup kept the snapshot if the VolumeSnapshotClass has deletionPolicy Retain.
-	class := &snapshotv1api.VolumeSnapshotClass{}
-	if err := d.client.Get(context.Background(), client.ObjectKey{Name: du.Spec.CSISnapshot.SnapshotClass}, class); err != nil {
-		log.WithError(err).Warnf("Failed to get VolumeSnapshotClass %s, a snapshot it retained needs manual cleanup", du.Spec.CSISnapshot.SnapshotClass)
-		return nil
-	}
-	if class.DeletionPolicy != snapshotv1api.VolumeSnapshotContentRetain {
-		return nil
-	}
-
-	entry := &retainedsnapshot.Entry{
-		Driver: driver,
-		Snapshot: &repotypes.SnapshotIdentifier{
-			VolumeNamespace:       du.Spec.SourceNamespace,
-			BackupStorageLocation: bak.Spec.StorageLocation,
-			SnapshotID:            du.Status.SnapshotID,
-			RepositoryType:        velerov1.BackupRepositoryTypeKopia,
-			UploaderType:          GetUploaderType(du.Spec.DataMover),
-			Source:                GetRealSource(du.Spec.SourceNamespace, du.Spec.SourcePVC),
-		},
-	}
-	if name := class.Parameters[velerov1.PrefixedSecretNameAnnotation]; name != "" {
-		// A templated secret name or namespace cannot be resolved to the
-		// secret the driver needs: the temp VolumeSnapshotContent would be
-		// built without credentials, and the driver's credential failures
-		// never qualify for escalation, so the backup would be undeletable.
-		// The entry is left out and the snapshot is flagged for manual
-		// cleanup, the same as a class that no longer exists.
-		if isTemplateSecret(name) {
-			log.Warnf("VolumeSnapshotClass %s names the deletion secret with a template, a snapshot it retained needs manual cleanup", class.Name)
-			return nil
-		}
-		entry.DeletionSecretRef = &corev1api.SecretReference{
-			Name:      name,
-			Namespace: class.Parameters[velerov1.PrefixedSecretNamespaceAnnotation],
-		}
-		if isTemplateSecret(entry.DeletionSecretRef.Namespace) {
-			log.Warnf("VolumeSnapshotClass %s names the deletion secret with a template, a snapshot it retained needs manual cleanup", class.Name)
-			return nil
-		}
-	}
-
-	log.Infof("DataUpload has no retained snapshot record, the handle is read from repository snapshot %s", du.Status.SnapshotID)
-	return entry
-}
-
-func isTemplateSecret(value string) bool {
-	return strings.Contains(value, "${")
 }
 
 // generate the configmap which is to be created and used as a way to communicate the snapshot info to the backup deletion controller

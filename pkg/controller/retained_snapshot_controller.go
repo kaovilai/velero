@@ -304,10 +304,6 @@ func (r *retainedSnapshotReconciler) deleteEntry(ctx context.Context, backup *ve
 		r.eventf(shard, backup, "RetainedSnapshotRecordInvalid", "the retained snapshot record of DataUpload %s cannot be decoded and was moved to the orphan-snapshot ConfigMap: %v", name, err)
 		return entryOrphaned, r.moveToOrphan(ctx, backup, name, &retainedsnapshot.Entry{Attempts: retainedsnapshot.MaxAttempts})
 	}
-	if entry.CSISnapshotHandle == "" {
-		return entryDeleted, errors.Errorf("the retained snapshot record of DataUpload %s carries no handle", name)
-	}
-
 	// Records sourced from DataUpload.status are trusted -- they entered
 	// through the API -- and are preferred over tarball- or tag-derived values
 	// wherever both exist. For an untrusted record naming a driver the cluster

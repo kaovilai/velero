@@ -33,7 +33,6 @@ import (
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/builder"
-	repotypes "github.com/velero-io/velero/pkg/repository/types"
 	velerotest "github.com/velero-io/velero/pkg/test"
 )
 
@@ -198,42 +197,6 @@ func TestWriteEntriesMergesAttemptCount(t *testing.T) {
 	entry, ok := family.Entry("du-1")
 	require.True(t, ok)
 	assert.Equal(t, 3, entry.Attempts)
-}
-
-// TestWriteEntriesPreservesResolvedHandle proves that a regather of a
-// pre-rollback entry, whose tarball copy still carries an empty handle, does
-// not overwrite a handle a previous attempt resolved from the repository
-// snapshot's tag: after the repository data is deleted, the resolved handle
-// is the only copy left, and losing it turns a resolvable record into a
-// dropped one that leaks the snapshot.
-func TestWriteEntriesPreservesResolvedHandle(t *testing.T) {
-	c := velerotest.NewFakeControllerRuntimeClient(t)
-	backup := testBackup()
-
-	// The pre-rollback gather: no handle, the repository snapshot identifies it.
-	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{
-		"du-1": {Driver: "d", Snapshot: &repotypes.SnapshotIdentifier{SnapshotID: "kopia-1"}},
-	}))
-	// The handle was resolved from the tag and persisted.
-	family, err := LoadFamily(t.Context(), c, backup)
-	require.NoError(t, err)
-	entry, ok := family.Entry("du-1")
-	require.True(t, ok)
-	entry.CSISnapshotHandle = "resolved-handle"
-	require.NoError(t, UpdateEntry(t.Context(), c, backup, "du-1", entry))
-
-	// A retry regathers from the unchanged tarball: the incoming entry still
-	// carries no handle.
-	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{
-		"du-1": {Driver: "d", Snapshot: &repotypes.SnapshotIdentifier{SnapshotID: "kopia-1"}},
-	}))
-
-	family, err = LoadFamily(t.Context(), c, backup)
-	require.NoError(t, err)
-	entry, ok = family.Entry("du-1")
-	require.True(t, ok)
-	assert.Equal(t, "resolved-handle", entry.CSISnapshotHandle,
-		"the resolved handle must survive a regather whose incoming entry carries none")
 }
 
 // TestWriteEntriesKeepsTrustedEntryOnRegather proves the trusted-entry rule

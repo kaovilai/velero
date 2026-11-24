@@ -669,19 +669,15 @@ func newDataUpload(
 	}
 
 	// The retention decision travels on the DataUpload, so this must not depend
-	// on the uploader-config branch above that initializes the map today.
-	// Every velero-block DataUpload carries the key with its explicit value,
-	// "true" or "false", whether or not a policy matched: the key doubles as
-	// the retention-evaluated marker the legacy recovery of backups created
-	// before the rollback relies on (design sections 1 and 7). A DataUpload
-	// without the marker is from a pre-rollback build; one with the marker and
-	// no record was evaluated and not retained, whatever its class says.
-	if datamover.IsVeleroBlockDataMover(dataMover) {
+	// on the uploader-config branch above that initializes the map today. The
+	// key is written only when a policy opted the volume in; a DataUpload
+	// without it is not retained, whatever its class says.
+	if retainSnapshot && datamover.IsVeleroBlockDataMover(dataMover) {
 		if dataUpload.Spec.DataMoverConfig == nil {
 			dataUpload.Spec.DataMoverConfig = make(map[string]string)
 		}
-		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] = strconv.FormatBool(retainSnapshot)
-		if retainSnapshot && retainSnapshotPolicy != "" {
+		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] = "true"
+		if retainSnapshotPolicy != "" {
 			// The matched entry travels with the decision so that
 			// `velero backup describe` can report which policy applied.
 			dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey] = retainSnapshotPolicy

@@ -52,7 +52,6 @@ import (
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/label"
-	repotypes "github.com/velero-io/velero/pkg/repository/types"
 )
 
 const (
@@ -180,10 +179,7 @@ func EntryShardLabels(backup *velerov1api.Backup) map[string]string {
 
 // Entry is one retained snapshot record in a shard, keyed by the DataUpload
 // name. The snapshot fields carry the record gathered from the DataUpload
-// status, the backup tarball or the repository tag; a record whose
-// CSISnapshotHandle is empty is a pre-rollback backup whose handle still has
-// to be resolved from the repository snapshot's cbt-change-id tag before the
-// repository data is deleted.
+// status or the backup tarball.
 type Entry struct {
 	// CSISnapshotHandle is the CSI snapshot handle of the retained snapshot.
 	CSISnapshotHandle string `json:"csiSnapshotHandle,omitempty"`
@@ -193,32 +189,16 @@ type Entry struct {
 	DeletionSecretRef *corev1api.SecretReference `json:"deletionSecretRef,omitempty"`
 	// ManagedByLabelValue is the managed-by label value of the backup content.
 	ManagedByLabelValue string `json:"managedByLabelValue,omitempty"`
-	// Snapshot identifies the repository snapshot that holds the handle as its
-	// cbt-change-id tag, for a backup taken before Velero recorded retained
-	// snapshots. The handle must be resolved from it before the repository
-	// data is deleted, because deleting that data destroys the tag.
-	Snapshot *repotypes.SnapshotIdentifier `json:"snapshot,omitempty"`
 	// Attempts is the persisted number of DeleteSnapshot failures that came
 	// from the call itself. A retry of `velero backup delete` is a new
 	// DeleteBackupRequest and any in-memory count would reset on it, so the
 	// counter lives here.
 	Attempts int `json:"attempts,omitempty"`
 	// Trusted is true when the record was sourced from DataUpload.status, which
-	// entered through the API; tarball- and tag-sourced values are written by
-	// anyone who can write the backup storage, so they are preferred only
-	// where no trusted value exists.
+	// entered through the API; tarball-sourced values are written by anyone
+	// who can write the backup storage, so they are preferred only where no
+	// trusted value exists.
 	Trusted bool `json:"trusted,omitempty"`
-}
-
-// IsRetentionEvaluated reports whether the DataUpload carries the
-// retention-evaluated marker: the retainSnapshot key of spec.dataMoverConfig,
-// written with its explicit value for every velero-block DataUpload created
-// by a build with this design, whether or not a policy matched. A DataUpload
-// without the marker is from a pre-rollback build and is the only kind the
-// legacy tag recovery of design section 7 applies to.
-func IsRetentionEvaluated(du *velerov2alpha1api.DataUpload) bool {
-	_, marked := du.Spec.DataMoverConfig[velerov2alpha1api.RetainSnapshotDataMoverConfigKey]
-	return marked
 }
 
 // FromDataUploadStatus builds the entry of a DataUpload's persisted record.
@@ -632,11 +612,8 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 		}
 		entry := entries[name]
 		// Merge the persisted state instead of resetting it: the attempt
-		// count, and a handle a previous attempt resolved from the repository
-		// snapshot's tag. The regather's entry still carries an empty handle
-		// -- the tarball never changes -- while the resolved handle is the
-		// only copy left once the repository data is deleted; losing it turns
-		// a resolvable record into a dropped one and leaks the snapshot.
+		// count, and the trusted provenance of an entry gathered from a live
+		// DataUpload.
 		for _, shard := range shards {
 			if value, ok := shard.Data[name]; ok {
 				if existing, err := UnmarshalEntry(value); err == nil {
@@ -697,14 +674,13 @@ func writeShardedEntries(ctx context.Context, c client.Client, backup *velerov1a
 }
 
 // mergeEntry merges an incoming entry into the one the family already holds
-// for the same DataUpload. The persisted attempt count is never reset, and a
-// handle a previous attempt resolved from the repository snapshot's tag is
-// kept when the incoming entry carries none. A family entry gathered from a
-// live DataUpload keeps its trusted provenance and its handle: a tarball
-// record never overwrites it, only its attempt count merges (design section
-// 5). Without that rule a regather after a failed attempt -- the live
-// DataUploads are gone by then -- would downgrade every record to untrusted,
-// and a rewritten tarball could swap the handle a trusted record selected.
+// for the same DataUpload. The persisted attempt count is never reset. A
+// family entry gathered from a live DataUpload keeps its trusted provenance
+// and its handle: a tarball record never overwrites it, only its attempt
+// count merges (design section 5). Without that rule a regather after a
+// failed attempt -- the live DataUploads are gone by then -- would downgrade
+// every record to untrusted, and a rewritten tarball could swap the handle a
+// trusted record selected.
 func mergeEntry(existing, incoming *Entry) *Entry {
 	if existing.Trusted && !incoming.Trusted {
 		merged := *existing
@@ -715,9 +691,6 @@ func mergeEntry(existing, incoming *Entry) *Entry {
 	}
 	if existing.Attempts > incoming.Attempts {
 		incoming.Attempts = existing.Attempts
-	}
-	if incoming.CSISnapshotHandle == "" && existing.CSISnapshotHandle != "" {
-		incoming.CSISnapshotHandle = existing.CSISnapshotHandle
 	}
 	return incoming
 }
@@ -797,8 +770,8 @@ func TombstoneEntry(ctx context.Context, c client.Client, backup *velerov1api.Ba
 	return nil
 }
 
-// UpdateEntry persists a mutation of one pending entry, e.g. the resolved
-// handle of a pre-rollback record or the incremented attempt count.
+// UpdateEntry persists a mutation of one pending entry, e.g. the incremented
+// attempt count.
 func UpdateEntry(ctx context.Context, c client.Client, backup *velerov1api.Backup, duName string, entry *Entry) error {
 	family, err := LoadFamily(ctx, c, backup)
 	if err != nil {

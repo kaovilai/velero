@@ -288,7 +288,6 @@ func TestExecute(t *testing.T) {
 					SourcePVC:        "testPVC",
 					SourceNamespace:  "velero",
 					DataMover:        "velero-block",
-					DataMoverConfig:  map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
 					OperationTimeout: metav1.Duration{Duration: 1 * time.Minute},
 					ParentSnapshot:   "",
 				},
@@ -2397,30 +2396,28 @@ func TestNewDataUpload(t *testing.T) {
 			expectedDataMoverCfg: map[string]string{},
 		},
 		{
-			// Every velero-block DataUpload carries the retention-evaluated
-			// marker with its explicit value, whether or not a policy matched
-			// (design sections 1 and 7).
-			name:                      "velero-block without retention carries the false marker",
+			// The retainSnapshot key is written only when a policy opted the
+			// volume in; a velero-block DataUpload without retention carries
+			// no key.
+			name:                      "velero-block without retention carries no retainSnapshot key",
 			backupType:                "",
 			vsClassName:               ptr.To("test-vs-class"),
 			uploaderConfig:            &velerov1api.UploaderConfigForBackup{ParallelFilesUpload: 0},
 			dataMoverFromVolumePolicy: "velero-block",
 			expectedParentSnap:        "",
-			expectedDataMoverCfg:      map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
+			expectedDataMoverCfg:      map[string]string{},
 		},
 		{
-			// The marker must not depend on the uploader-config branch that
-			// initializes the map today.
-			name:                      "velero-block without uploader config still carries the false marker",
+			name:                      "velero-block without uploader config and without retention has no config",
 			vsClassName:               ptr.To("test-vs-class"),
 			uploaderConfig:            nil,
 			dataMoverFromVolumePolicy: "velero-block",
-			expectedDataMoverCfg:      map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
+			expectedDataMoverCfg:      nil,
 		},
 		{
-			// The marker is a velero-block contract; the file system data
+			// Retention is a velero-block contract; the file system data
 			// mover's DataUploads are unchanged.
-			name:                 "file system data mover carries no marker",
+			name:                 "file system data mover carries no retainSnapshot key",
 			vsClassName:          ptr.To("test-vs-class"),
 			uploaderConfig:       nil,
 			expectedDataMoverCfg: nil,
@@ -2430,7 +2427,7 @@ func TestNewDataUpload(t *testing.T) {
 			vsClassName:               ptr.To("test-vs-class"),
 			uploaderConfig:            &velerov1api.UploaderConfigForBackup{ParallelBlocksUpload: 7},
 			dataMoverFromVolumePolicy: "velero-block",
-			expectedDataMoverCfg:      map[string]string{uploaderUtil.ParallelBlocksUpload: "7", velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
+			expectedDataMoverCfg:      map[string]string{uploaderUtil.ParallelBlocksUpload: "7"},
 		},
 		{
 			// The retention decision must not depend on the uploader-config
@@ -2456,11 +2453,11 @@ func TestNewDataUpload(t *testing.T) {
 			},
 		},
 		{
-			name:                      "a matched policy without retention leaves no policy key",
+			name:                      "a matched policy without retention leaves no retention keys",
 			vsClassName:               ptr.To("test-vs-class"),
 			dataMoverFromVolumePolicy: "velero-block",
 			retainSnapshotPolicy:      "volumePolicies[0]",
-			expectedDataMoverCfg:      map[string]string{velerov2alpha1.RetainSnapshotDataMoverConfigKey: "false"},
+			expectedDataMoverCfg:      nil,
 		},
 		{
 			name:                      "retention with uploader config keeps the concurrency settings",

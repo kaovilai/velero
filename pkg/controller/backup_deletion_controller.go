@@ -58,8 +58,6 @@ import (
 	"github.com/velero-io/velero/pkg/repository"
 	repomanager "github.com/velero-io/velero/pkg/repository/manager"
 	repotypes "github.com/velero-io/velero/pkg/repository/types"
-	"github.com/velero-io/velero/pkg/repository/udmrepo"
-	"github.com/velero-io/velero/pkg/uploader"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/filesystem"
@@ -501,18 +499,6 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			}
 		}
 
-		// The snapshot handle of a retained snapshot that a backup taken
-		// before Velero recorded them kept is only in the repository snapshot,
-		// saved as the cbt-change-id tag, so it is resolved before the
-		// repository data is deleted, which destroys the tag.
-		if len(errs) == 0 {
-			if resolveErrs := r.resolveRetainedSnapshotHandles(ctx, backup, log); len(resolveErrs) > 0 {
-				for _, err := range resolveErrs {
-					errs = append(errs, errors.Wrap(err, "error reading the retained snapshot handle from the snapshot data").Error())
-				}
-			}
-		}
-
 		log.Info("Removing snapshot data by data mover")
 		if len(errs) == 0 {
 			if deleteErrs := r.deleteMovedSnapshots(ctx, backup); len(deleteErrs) > 0 {
@@ -800,14 +786,6 @@ func (r *backupDeletionReconciler) gatherRetainedSnapshotRecords(ctx context.Con
 		du := &duList.Items[i]
 		if entry := retainedsnapshot.FromDataUploadStatus(du); entry != nil {
 			local[du.Name] = entry
-		} else if du.Status.Phase == velerov2alpha1.DataUploadPhaseCompleted && du.Status.SnapshotID != "" &&
-			!retainedsnapshot.IsRetentionEvaluated(du) {
-			// A completed, marker-less DataUpload without a record is a
-			// pre-rollback backup, whose record field never existed: its
-			// legacy entry -- the repository snapshot the handle is resolved
-			// from -- is the recovery path and must survive this gather. A
-			// marked DataUpload without a record was evaluated and not
-			// retained, so any tarball entry for it is dropped below.
 		} else {
 			dropped[du.Name] = struct{}{}
 		}
@@ -815,10 +793,10 @@ func (r *backupDeletionReconciler) gatherRetainedSnapshotRecords(ctx context.Con
 
 	var errs []error
 	for name := range dropped {
-		// Local presence is authoritative for a DataUpload that did not
-		// complete: the patch-back cleared the record after the snapshot was
-		// released, so the tarball's record for this DataUpload is dropped,
-		// not resurrected.
+		// Local presence is authoritative: a local DataUpload with no record
+		// -- the patch-back cleared it after the snapshot was released, or the
+		// volume was never opted in -- drops the tarball's record for this
+		// DataUpload rather than resurrecting it.
 		if _, ok := family.Entry(name); ok {
 			if err := retainedsnapshot.RemoveEntry(ctx, r.Client, backup, name); err != nil {
 				errs = append(errs, errors.Wrapf(err, "error dropping the tarball record of DataUpload %s", name))
@@ -831,82 +809,6 @@ func (r *backupDeletionReconciler) gatherRetainedSnapshotRecords(ctx context.Con
 	}
 	if err := retainedsnapshot.WriteEntries(ctx, r.Client, backup, local); err != nil {
 		errs = append(errs, errors.Wrap(err, "error writing the retained snapshot records"))
-	}
-	return errs
-}
-
-// getRepoSnapshotTagsFunc reads the tags of a repository snapshot. It is a
-// variable so that tests can replace it.
-var getRepoSnapshotTagsFunc = getRepoSnapshotTags
-
-func getRepoSnapshotTags(ctx context.Context, repoEnsurer *repository.Ensurer, repoMgr repomanager.Manager, backup *velerov1api.Backup, snapshot repotypes.SnapshotIdentifier) (map[string]string, error) {
-	repo, err := repoEnsurer.EnsureRepo(ctx, backup.Namespace, snapshot.VolumeNamespace, snapshot.BackupStorageLocation, snapshot.RepositoryType)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error to ensure repo %s-%s-%s", snapshot.BackupStorageLocation, snapshot.VolumeNamespace, snapshot.RepositoryType)
-	}
-	return repoMgr.GetSnapshotTags(ctx, repo, snapshot.SnapshotID)
-}
-
-// resolveRetainedSnapshotHandles fills in the snapshot handle of the gathered
-// records of backups taken before Velero recorded retained snapshots. The
-// block data mover saved the CSI snapshot handle as the cbt-change-id tag of
-// the repository snapshot, so it is resolved before the repository data is
-// deleted, because deleting that data destroys the tag. If the tag cannot be
-// read, the repository data is kept and the backup deletion fails, so a retry
-// can read it; if the repository snapshot is already gone or has no tag, the
-// record is dropped.
-func (r *backupDeletionReconciler) resolveRetainedSnapshotHandles(ctx context.Context, backup *velerov1api.Backup, log logrus.FieldLogger) []error {
-	if r.repoMgr == nil {
-		return nil
-	}
-	family, err := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup)
-	if err != nil {
-		return []error{errors.Wrap(err, "error reading the retained snapshot records")}
-	}
-
-	var errs []error
-	for _, shard := range family.Shards {
-		for _, name := range pendingShardKeys(shard) {
-			entry, ok := family.Entry(name)
-			if !ok || entry == nil {
-				continue
-			}
-			if entry.CSISnapshotHandle != "" || entry.Snapshot == nil || entry.Snapshot.SnapshotID == "" {
-				continue
-			}
-
-			tags, tagsErr := getRepoSnapshotTagsFunc(ctx, r.repoEnsurer, r.repoMgr, backup, *entry.Snapshot)
-			if tagsErr != nil {
-				if errors.Is(tagsErr, udmrepo.ErrSnapshotNotFound) {
-					// The repository snapshot is gone, e.g. deleted by an
-					// earlier attempt, so there is nothing to delete.
-					log.Warnf("The repository snapshot of DataUpload %s is gone, dropping its retained snapshot record", name)
-					if err := retainedsnapshot.RemoveEntry(ctx, r.Client, backup, name); err != nil {
-						errs = append(errs, errors.Wrapf(err, "error dropping the record of DataUpload %s", name))
-					}
-					continue
-				}
-				errs = append(errs, errors.Wrapf(tagsErr, "error reading the snapshot handle of DataUpload %s from the repository snapshot %s", name, entry.Snapshot.SnapshotID))
-				continue
-			}
-
-			handle := tags[uploader.CBTChangeIDTag]
-			if handle == "" {
-				// The repository snapshot has no tag, so there is nothing to
-				// delete.
-				log.Warnf("The repository snapshot %s of DataUpload %s carries no snapshot handle, dropping its retained snapshot record", entry.Snapshot.SnapshotID, name)
-				if err := retainedsnapshot.RemoveEntry(ctx, r.Client, backup, name); err != nil {
-					errs = append(errs, errors.Wrapf(err, "error dropping the record of DataUpload %s", name))
-				}
-				continue
-			}
-
-			log.Infof("Read the retained snapshot handle %s of DataUpload %s from the repository snapshot %s", handle, name, entry.Snapshot.SnapshotID)
-			entry.CSISnapshotHandle = handle
-			if err := retainedsnapshot.UpdateEntry(ctx, r.Client, backup, name, entry); err != nil {
-				errs = append(errs, errors.Wrapf(err, "error recording the resolved handle of DataUpload %s", name))
-			}
-		}
 	}
 	return errs
 }
