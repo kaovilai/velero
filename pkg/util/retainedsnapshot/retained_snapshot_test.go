@@ -581,6 +581,13 @@ func TestFromDataUploadStatus(t *testing.T) {
 	du := dataUploadWithRecord("du-1", "handle-1")
 	du.Status.RetainedCSIStorageSnapshot = nil
 	assert.Nil(t, FromDataUploadStatus(du))
+
+	// A released record no longer owns a snapshot: no entry, so the backup
+	// deletion skips it and the local-wins merge drops the tarball's copy.
+	released := dataUploadWithRecord("du-1", "handle-1")
+	released.Status.RetainedCSIStorageSnapshot.Released = true
+	released.Status.RetainedCSIStorageSnapshot.ReleasedBy = "later-uid"
+	assert.Nil(t, FromDataUploadStatus(released))
 }
 
 // TestEntryRecord proves the entry's record carries the deletion fields the

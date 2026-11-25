@@ -1504,6 +1504,14 @@ func TestFallbackReasonOf(t *testing.T) {
 			want:     "base snapshot h-1 of the previous backup (DataUpload prev) was retained but could not be used; " + block.FallbackReasonBaseGone + ": not found",
 		},
 		{
+			// The backup holding the rolling base was deleted: the parent is
+			// an older backup whose snapshot the base move released.
+			name:     "previous backup's snapshot was released by the rolling base",
+			result:   datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
+			previous: []*velerov2alpha1api.DataUpload{newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h-1", Driver: retentionDriver, Released: true, ReleasedBy: "holder-uid"})},
+			want:     "base snapshot h-1 of the previous backup (DataUpload prev) was released as the rolling base moved on (released by backup holder-uid), and the backup holding the newer base is gone; " + block.FallbackReasonBaseGone + ": not found",
+		},
+		{
 			name:   "the latest completed previous DataUpload wins, later and unfinished ones are ignored",
 			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
 			previous: []*velerov2alpha1api.DataUpload{

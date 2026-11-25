@@ -103,6 +103,11 @@ func NewRetainedSnapshotReconcilerWithRecorder(logger logrus.FieldLogger, client
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents/status,verbs=get;update;patch
 
 func (r *retainedSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// The rolling-base release is the controller's second worker, keyed by
+	// the DataUploads that complete with a chained record.
+	if err := (&retainedSnapshotReleaser{retainedSnapshotReconciler: r}).setupWithManager(mgr); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1api.ConfigMap{}).
 		WithEventFilter(predicate.NewPredicateFuncs(func(object client.Object) bool {

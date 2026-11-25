@@ -208,10 +208,14 @@ type Entry struct {
 	Trusted bool `json:"trusted,omitempty"`
 }
 
-// FromDataUploadStatus builds the entry of a DataUpload's persisted record.
+// FromDataUploadStatus builds the entry of a DataUpload's persisted record. A
+// released record no longer owns a snapshot -- a newer backup of the chain
+// deleted it as the rolling base moved on -- so it contributes no entry: the
+// backup deletion skips it, and a local released record drops the tarball's
+// stale unreleased copy through the local-wins merge.
 func FromDataUploadStatus(du *velerov2alpha1api.DataUpload) *Entry {
 	record := du.Status.RetainedCSIStorageSnapshot
-	if record == nil {
+	if record == nil || record.Released {
 		return nil
 	}
 	return &Entry{

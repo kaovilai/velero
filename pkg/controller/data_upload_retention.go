@@ -744,6 +744,12 @@ func (r *DataUploadReconciler) fallbackReasonOf(ctx context.Context, du *velerov
 	if previous.Status.RetainedCSIStorageSnapshot == nil {
 		return fmt.Sprintf("base snapshot not retained by the previous backup (DataUpload %s); %s", previous.Name, reason)
 	}
+	if record := previous.Status.RetainedCSIStorageSnapshot; record.Released {
+		// The backup that held the rolling base was deleted, so the parent is
+		// an older backup whose snapshot was released when the base moved on.
+		return fmt.Sprintf("base snapshot %s of the previous backup (DataUpload %s) was released as the rolling base moved on (released by backup %s), and the backup holding the newer base is gone; %s",
+			record.CSISnapshotHandle, previous.Name, record.ReleasedBy, reason)
+	}
 	return fmt.Sprintf("base snapshot %s of the previous backup (DataUpload %s) was retained but could not be used; %s",
 		previous.Status.RetainedCSIStorageSnapshot.CSISnapshotHandle, previous.Name, reason)
 }

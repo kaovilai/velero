@@ -231,7 +231,7 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// durable home -- the backup-UID family, inactive, when the
 			// Backup still exists, or the orphan-snapshot ConfigMap when it is
 			// gone -- and only then is the finalizer removed (design section 3).
-			if du.Status.RetainedCSIStorageSnapshot != nil {
+			if record := du.Status.RetainedCSIStorageSnapshot; record != nil && !record.Released {
 				if du.DeletionTimestamp.IsZero() {
 					log.Debug("DataUpload carries a retained snapshot record, keeping its finalizer until deletion delivers the record")
 					return ctrl.Result{}, nil
