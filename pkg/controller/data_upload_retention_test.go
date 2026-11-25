@@ -1603,3 +1603,70 @@ func TestRetainSnapshotOnCompletionRecordsChain(t *testing.T) {
 		})
 	}
 }
+
+// TestRetainSnapshotOnCompletionLeaseWindow proves the lease window: the
+// callback takes the Retain patch's resourceVersion from a read that shows the
+// content live and re-checks its lease after that read, so a patch-back that
+// took over after the callback's earlier lease check is caught. The callback
+// passes its lease check and persists the record, then the patch-back acts
+// before the callback's read: the callback must abort without patching Retain.
+func TestRetainSnapshotOnCompletionLeaseWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// interleave runs when the callback reads the content for the patch,
+		// after its earlier lease check passed.
+		interleave func(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) *snapshotv1api.VolumeSnapshotContent
+		wantErr    string
+	}{
+		{
+			name: "the patch-back deleted the content",
+			interleave: func(_ *testing.T, _ *DataUploadReconciler, _ *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) *snapshotv1api.VolumeSnapshotContent {
+				deleting := vsc.DeepCopy()
+				now := metav1.Now()
+				deleting.DeletionTimestamp = &now
+				deleting.Finalizers = []string{csi.VSCBoundProtectionFinalizer}
+				return deleting
+			},
+			wantErr: "is being deleted",
+		},
+		{
+			name: "the patch-back took the rollback mark after the callback's lease expired",
+			interleave: func(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) *snapshotv1api.VolumeSnapshotContent {
+				t.Helper()
+				current := getDataUpload(t, r, du)
+				current.Annotations[dataUploadRollbackLeaseAnnotation] = (&dataUploadLease{Holder: "other-node-1", ExpiresAt: r.Clock.Now().Add(time.Minute)}).String()
+				require.NoError(t, r.client.Update(t.Context(), current))
+				return vsc
+			},
+			wantErr: "a rollback of DataUpload",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := initDataUploaderReconciler()
+			require.NoError(t, err)
+			du := retentionDataUploadBuilder().Result()
+			createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
+
+			fake := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
+			gets := 0
+			fake.PrependReactor("get", "volumesnapshotcontents", func(clientTesting.Action) (bool, runtime.Object, error) {
+				gets++
+				if gets < 2 {
+					return false, nil, nil
+				}
+				return true, tc.interleave(t, r, du, retentionBackupVSC()), nil
+			})
+			patches := &vscPatchRecorder{}
+			fake.PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+				patches.patches = append(patches.patches, string(action.(clientTesting.PatchAction).GetPatch()))
+				return false, nil, nil
+			})
+
+			err = r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger())
+			require.ErrorContains(t, err, tc.wantErr)
+			assert.GreaterOrEqual(t, gets, 2, "the callback re-read the content after its lease check")
+			assert.False(t, patches.hasDeletionPolicy("Retain"), "the callback must abort without patching Retain")
+			assert.NotNil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot, "the record stays, the patch-back and the backup deletion own the snapshot")
+		})
+	}
+}

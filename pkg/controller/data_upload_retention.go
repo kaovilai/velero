@@ -201,6 +201,17 @@ func (r *DataUploadReconciler) dataUploadLeaseHeld(ctx context.Context, du *vele
 	return ok && lease.Holder == holder && r.Clock.Now().Before(lease.ExpiresAt), nil
 }
 
+// dataUploadLeaseLive reports whether the annotation carries an unexpired lease
+// of any holder, read uncached.
+func (r *DataUploadReconciler) dataUploadLeaseLive(ctx context.Context, du *velerov2alpha1api.DataUpload, annotation string) (bool, error) {
+	current := &velerov2alpha1api.DataUpload{}
+	if err := r.uncachedReader().Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, current); err != nil {
+		return false, errors.Wrap(err, "error reading the DataUpload lease")
+	}
+	lease, ok := parseDataUploadLease(current.Annotations[annotation])
+	return ok && r.Clock.Now().Before(lease.ExpiresAt), nil
+}
+
 // uncachedReader reads DataUploads from the API server. The node-agent's cached
 // client can return the pre-write object for a plain status update, and both
 // the persisted-record verification and the lease re-check need what the API
@@ -304,27 +315,21 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	}
 	log.Infof("Recorded retained snapshot %s of driver %s on DataUpload %s", record.CSISnapshotHandle, record.Driver, du.Name)
 
-	// Re-check the lease immediately before patching the content: for expiry or
-	// for client throttling, the callback does not patch Retain, fails the
-	// DataUpload and keeps the record, leaving the content Delete.
-	held, err := r.dataUploadLeaseHeld(ctx, du, dataUploadRetainLeaseAnnotation, holder)
-	if err != nil {
-		return err
-	}
-	if !held {
-		return errors.Errorf("the retention lease of DataUpload %s was lost before its snapshot was retained", du.Name)
-	}
-
-	// The Retain patch is preconditioned on a resourceVersion captured
-	// immediately after the mark re-check and used without a further re-read,
-	// per the design: a rollback that has patched or deleted the content in
-	// between makes the delayed write fail instead of landing after it. The
-	// Get at the top of this function predates the lease acquisition, the
-	// record persist and the read-back, a window in which the snapshot
-	// controllers update the content routinely (finalizers, the being-deleted
-	// annotation, status); a resourceVersion captured there fails the patch
-	// spuriously with a conflict, which fails the DataUpload and degrades the
-	// next incremental to a full backup, so the capture is repeated here.
+	// The Retain patch is preconditioned on the resourceVersion of a read that
+	// shows the content still live, and the lease is re-checked after that
+	// read, not before it: a patch-back that took over between a lease check
+	// and the read -- the lease expired, or the content was deleted under it
+	// -- is then caught either way. The read aborts on a content that is gone
+	// or being deleted; the re-check aborts when the callback's mark is no
+	// longer its own or the rollback mark is live. Only then is the content
+	// patched, with that read's resourceVersion and no further re-read, so a
+	// rollback write that lands after the re-check makes the patch fail with a
+	// conflict instead of landing after it. The read is taken here and not at
+	// the top of this function: the snapshot controllers update the content
+	// routinely (finalizers, the being-deleted annotation, status) during the
+	// lease acquisition, the record persist and the read-back, and a
+	// resourceVersion captured there fails the patch spuriously, which fails
+	// the DataUpload and degrades the next incremental to a full backup.
 	fresh, err := r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -333,6 +338,23 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 			return errors.Wrapf(err, "the backup VolumeSnapshotContent %s vanished before its snapshot was retained", du.Name)
 		}
 		return errors.Wrapf(err, "error re-reading the backup VolumeSnapshotContent %s before retaining its snapshot", du.Name)
+	}
+	if fresh.DeletionTimestamp != nil {
+		return errors.Errorf("the backup VolumeSnapshotContent %s is being deleted, not retaining its snapshot", du.Name)
+	}
+	held, err := r.dataUploadLeaseHeld(ctx, du, dataUploadRetainLeaseAnnotation, holder)
+	if err != nil {
+		return err
+	}
+	if !held {
+		return errors.Errorf("the retention lease of DataUpload %s was lost before its snapshot was retained", du.Name)
+	}
+	rollingBack, err := r.dataUploadLeaseLive(ctx, du, dataUploadRollbackLeaseAnnotation)
+	if err != nil {
+		return err
+	}
+	if rollingBack {
+		return errors.Errorf("a rollback of DataUpload %s is in progress, not retaining its snapshot", du.Name)
 	}
 	if _, err := csi.PatchVSCDeletionPolicy(ctx, r.csiSnapshotClient, fresh.Name, snapshotv1api.VolumeSnapshotContentRetain, fresh.ResourceVersion); err != nil {
 		if apierrors.IsNotFound(err) {
