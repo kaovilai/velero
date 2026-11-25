@@ -299,8 +299,8 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// to release -- its content was never switched to Retain -- so it skips
 	// the release and its uncached reads entirely, progress-update-driven
 	// reconciles and file system data mover DataUploads included.
-	if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI && !isDataUploadInFinalState(du) &&
-		du.Status.RetainedCSIStorageSnapshot != nil {
+	if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI && du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted &&
+		du.Status.RetainedCSIStorageSnapshot != nil && !du.Status.RetainedCSIStorageSnapshot.Released {
 		if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
 			var refused *leaseRefusedError
 			if errors.As(releaseErr, &refused) {
@@ -1054,6 +1054,13 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 	if !succeeded {
 		log.Warn("Dataupload has been updated by others")
 		return
+	}
+
+	// A DataUpload that timed out preparing never retains: the patch-back
+	// reclaims its snapshot before the exposer cleanup, as on the other
+	// unfinished paths.
+	if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
+		log.WithError(releaseErr).Error("Failed to release the volume snapshot of the timed-out DataUpload, its record is kept and the backup deletion owns it")
 	}
 
 	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]

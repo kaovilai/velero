@@ -1106,47 +1106,58 @@ func TestReleaseRetainedSnapshotSeedsStatus(t *testing.T) {
 	}
 }
 
-// TestReleaseRetainedSnapshotNoopsOnFinalStateDataUpload proves the cancel-path
-// guard: a DataUpload that already reached a terminal phase, e.g. because the
-// cancel path overwrote a completed one, must not have its base snapshot
-// deleted by the patch-back; a surviving record is owned by the backup
-// deletion instead.
-func TestReleaseRetainedSnapshotNoopsOnFinalStateDataUpload(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
+// TestReleaseRetainedSnapshotFinalStateGuard proves the patch-back guard
+// no-ops on a Completed DataUpload only: a completed backup's base snapshot is
+// never deleted by it, while a Canceled or Failed DataUpload with a record --
+// the cancel path and the prepare timeout mark the object before they clean up
+// -- has its snapshot released like any other unfinished data movement's.
+func TestReleaseRetainedSnapshotFinalStateGuard(t *testing.T) {
+	for _, tc := range []struct {
+		phase       velerov2alpha1api.DataUploadPhase
+		wantRelease bool
+	}{
+		{phase: velerov2alpha1api.DataUploadPhaseCompleted, wantRelease: false},
+		{phase: velerov2alpha1api.DataUploadPhaseCanceled, wantRelease: true},
+		{phase: velerov2alpha1api.DataUploadPhaseFailed, wantRelease: true},
+	} {
+		t.Run(string(tc.phase), func(t *testing.T) {
+			r, err := initDataUploaderReconciler()
+			require.NoError(t, err)
 
-	// The in-memory DataUpload looks unfinished, but the API object has
-	// already reached a terminal phase.
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	vsc := func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		return vsc
-	}()
-	createRetainedSnapshotObjects(t, r, du, vsc)
+			// The in-memory DataUpload looks unfinished, but the API object has
+			// already reached a terminal phase.
+			du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
+			du.Status.RetainedCSIStorageSnapshot = retentionRecord()
+			vsc := retentionBackupVSC()
+			vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
+			createRetainedSnapshotObjects(t, r, du, vsc)
+			final := getDataUpload(t, r, du)
+			final.Status.Phase = tc.phase
+			require.NoError(t, r.client.Update(t.Context(), final))
 
-	// Move the API object to a final phase, as the cancel path would when it
-	// overwrites a terminal DataUpload.
-	completed := getDataUpload(t, r, du)
-	completed.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
-	require.NoError(t, r.client.Update(t.Context(), completed))
+			var writes int
+			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("*", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+				if _, ok := action.(clientTesting.GetAction); !ok {
+					writes++
+				}
+				return false, nil, nil
+			})
 
-	var actions int
-	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("*", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		if _, ok := action.(clientTesting.GetAction); !ok {
-			actions++
-		}
-		return false, nil, nil
-	})
+			require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
 
-	require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-	assert.Zero(t, actions, "the patch-back must not touch the content of a final-state DataUpload")
-
-	current, getErr := getBackupVSC(t, r, du)
-	require.NoError(t, getErr)
-	assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, current.Spec.DeletionPolicy,
-		"the base snapshot of the completed backup must stay retained")
+			current, getErr := getBackupVSC(t, r, du)
+			if !tc.wantRelease {
+				assert.Zero(t, writes, "the patch-back must not touch the content of a Completed DataUpload")
+				require.NoError(t, getErr)
+				assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, current.Spec.DeletionPolicy, "the base snapshot of the completed backup must stay retained")
+				assert.NotNil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot)
+				return
+			}
+			assert.NotZero(t, writes, "the patch-back runs on a %s DataUpload", tc.phase)
+			assert.True(t, apierrors.IsNotFound(getErr), "the backup content is deleted, so the driver deletes the snapshot")
+			assert.Nil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot, "the record is cleared after the release")
+		})
+	}
 }
 
 // conflictOnceDataUploadClient fails the first DataUpload update with a
@@ -1669,4 +1680,30 @@ func TestRetainSnapshotOnCompletionLeaseWindow(t *testing.T) {
 			assert.NotNil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot, "the record stays, the patch-back and the backup deletion own the snapshot")
 		})
 	}
+}
+
+// TestOnPrepareTimeoutReleasesRetainedSnapshot proves the prepare timeout runs
+// the patch-back: it marks the DataUpload Failed before its cleanup, and the
+// snapshot a record names is released instead of being left to the backup
+// deletion.
+func TestOnPrepareTimeoutReleasesRetainedSnapshot(t *testing.T) {
+	r, err := initDataUploaderReconciler()
+	require.NoError(t, err)
+	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
+		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
+	}
+
+	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhasePrepared).Result()
+	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
+	vsc := retentionBackupVSC()
+	vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
+	createRetainedSnapshotObjects(t, r, du, vsc)
+
+	r.onPrepareTimeout(t.Context(), getDataUpload(t, r, du))
+
+	updated := getDataUpload(t, r, du)
+	assert.Equal(t, velerov2alpha1api.DataUploadPhaseFailed, updated.Status.Phase)
+	assert.Nil(t, updated.Status.RetainedCSIStorageSnapshot, "the record is cleared after the release")
+	_, getErr := getBackupVSC(t, r, du)
+	assert.True(t, apierrors.IsNotFound(getErr), "the backup content is deleted, so the driver deletes the snapshot")
 }

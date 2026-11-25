@@ -160,7 +160,12 @@ func (r *DataUploadReconciler) tryAcquireDataUploadLease(ctx context.Context, du
 		// owning the lease.
 		acquired = false
 		blockedFor = time.Duration(0)
-		if isDataUploadInFinalState(current) {
+		// The completion callback never retains for a DataUpload in any final
+		// phase. The patch-back is refused only on a Completed one: a
+		// Canceled or Failed DataUpload with a record must still be able to
+		// release its snapshot.
+		if current.Status.Phase == velerov2alpha1api.DataUploadPhaseCompleted ||
+			(annotation == dataUploadRetainLeaseAnnotation && isDataUploadInFinalState(current)) {
 			return false
 		}
 		for _, leaseAnnotation := range []string{dataUploadRetainLeaseAnnotation, dataUploadRollbackLeaseAnnotation} {
@@ -504,18 +509,20 @@ func (r *DataUploadReconciler) releaseRetainedSnapshot(ctx context.Context, du *
 		return nil
 	}
 
-	// The patch-back no-ops on a DataUpload in a final state: the cancel path
-	// can reach a DataUpload that already reached a terminal phase, and a
-	// patch-back that ran there would delete the base snapshot of a completed
-	// backup. The in-memory DataUpload can be stale, e.g. the cancel path marks
-	// the object Canceled before it cleans up, so the guard reads the object
-	// the API server holds.
+	// The patch-back no-ops on a Completed DataUpload only: a patch-back that
+	// ran there would delete the base snapshot of a completed backup. A
+	// Canceled or Failed DataUpload with a record did not complete -- the
+	// cancel path marks the object Canceled before it cleans up, the prepare
+	// timeout marks it Failed -- and its snapshot is released like any other
+	// unfinished data movement's, instead of being left to the backup
+	// deletion. The in-memory DataUpload can be stale, so the guard reads the
+	// object the API server holds.
 	current := &velerov2alpha1api.DataUpload{}
 	if err := r.uncachedReader().Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, current); err != nil {
 		return errors.Wrap(err, "error reading the DataUpload before releasing its snapshot")
 	}
-	if isDataUploadInFinalState(current) {
-		log.Infof("DataUpload %s is in the final phase %s, not releasing its snapshot; a surviving record is owned by the backup deletion", du.Name, current.Status.Phase)
+	if current.Status.Phase == velerov2alpha1api.DataUploadPhaseCompleted {
+		log.Infof("DataUpload %s is Completed, not releasing its snapshot; its record is owned by the rolling base and the backup deletion", du.Name)
 		return nil
 	}
 
