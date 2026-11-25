@@ -379,21 +379,66 @@ func TestRetainedSnapshotControllerFailsRequestOnRetryableError(t *testing.T) {
 
 	reconcileShard(t, newRetainedTestReconciler(c), shard)
 
-	// The request is failed with the error, so the deletion can be retried.
+	// The controller never writes the request: the failure goes into shard 0.
 	req := getRequest(t, c, dbr)
-	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseProcessed, req.Status.Phase)
-	assert.NotEmpty(t, req.Status.Errors)
+	assert.Equal(t, dbr.ResourceVersion, req.ResourceVersion, "the retained-snapshot controller never writes the request")
+	family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Contains(t, family.FailedReason(), "Failed to get snapshot credentials")
+	assert.False(t, family.HasPendingWork(), "a failed family has no work until a retry writes a fresh shard 0")
 
 	// The entry stays pending; a credential failure is not a DeleteSnapshot
 	// call failure, so it does not count toward the escalation bound.
-	family, err := retainedsnapshot.LoadFamily(t.Context(), c, backup)
-	require.NoError(t, err)
 	entry, ok := family.Entry("foo-du")
 	require.True(t, ok, "the entry stays pending")
 	assert.Zero(t, entry.Attempts, "a credential failure does not count toward the escalation bound")
-	// The family is set inactive so no unowned work continues; the retry is a
-	// new request that re-activates it (design section 4).
-	assert.False(t, family.IsActivated(), "an uncounted failure deactivates the family")
+
+	// The shard-0 marker re-enters the request through the family watch.
+	manifest := family.Manifest.DeepCopy()
+	delete(manifest.Data, retainedsnapshot.FailedKey)
+	assert.True(t, familyEntriesSettledPredicate().Update(event.UpdateEvent{ObjectOld: manifest, ObjectNew: family.Manifest}),
+		"marking shard 0 failed is admitted by the family watch")
+
+	// A further reconcile of the failed family does nothing.
+	reconcileShard(t, newRetainedTestReconciler(c), shard)
+	assert.Empty(t, backend.deleteCallsTo)
+}
+
+// TestBackupDeletionReentryFailsOnMarkedFamily proves the request's half of
+// an uncounted failure: its re-entry reads the shard-0 marker before the
+// shard-0 repair, marks itself Processed with the reason, clears its pending
+// annotation and deletes the family, so no unowned work continues; the tail
+// does not run, so the tarball stays for the retry's regather.
+func TestBackupDeletionReentryFailsOnMarkedFamily(t *testing.T) {
+	backup := retainedTestBackup()
+	backup.Status.Phase = velerov1api.BackupPhaseDeleting
+	location := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "default").Provider("objStoreProvider").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+
+	dbr := defaultTestDbr()
+	dbr.Status.Phase = velerov1api.DeleteBackupRequestPhaseInProgress
+	dbr.Annotations = map[string]string{velerov1api.RetainedSnapshotsPendingAnnotation: "true"}
+	td := setupBackupDeletionControllerTest(t, dbr, backup, location)
+
+	require.NoError(t, retainedsnapshot.WriteEntries(t.Context(), td.fakeClient, backup, map[string]*retainedsnapshot.Entry{
+		"foo-du": {CSISnapshotHandle: retainedTestHandle, Driver: retainedTestDriver, Trusted: true},
+	}))
+	require.NoError(t, retainedsnapshot.WriteManifest(t.Context(), td.fakeClient, backup))
+	require.NoError(t, retainedsnapshot.MarkFailed(t.Context(), td.fakeClient, backup, "Failed to get snapshot credentials"))
+
+	_, err := td.controller.Reconcile(t.Context(), td.req)
+	require.NoError(t, err)
+
+	res := getRequest(t, td.fakeClient, dbr)
+	assert.Equal(t, velerov1api.DeleteBackupRequestPhaseProcessed, res.Status.Phase)
+	require.Len(t, res.Status.Errors, 1)
+	assert.Contains(t, res.Status.Errors[0], "Failed to get snapshot credentials")
+	assert.NotContains(t, res.Annotations, velerov1api.RetainedSnapshotsPendingAnnotation)
+	td.backupStore.AssertNotCalled(t, "DeleteBackup", mock.Anything)
+
+	family, err := retainedsnapshot.LoadFamily(t.Context(), td.fakeClient, backup)
+	require.NoError(t, err)
+	assert.Nil(t, family.Manifest, "shard 0 is deleted, so no unowned work continues")
+	assert.Empty(t, family.Shards, "the family is deleted; the retry regathers from the tarball")
 }
 
 // TestRetainedSnapshotControllerCountedErrorKeepsRequestAlive proves design

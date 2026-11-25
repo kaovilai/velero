@@ -27,7 +27,6 @@ import (
 	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
@@ -175,6 +174,13 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error reading the retained snapshot records")
 	}
+	if reason := family.FailedReason(); reason != "" {
+		// The deletion failed on an uncounted error; the waiting request
+		// reads the marker and fails itself. Nothing runs until a retry
+		// writes a fresh shard 0.
+		log.Debugf("The retained snapshot records are marked failed (%s), waiting for the request to fail", reason)
+		return ctrl.Result{}, nil
+	}
 
 	retry := false
 	for _, entryShard := range family.Shards {
@@ -183,20 +189,20 @@ func (r *retainedSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if err != nil {
 				// An uncounted failure -- credentials, clear-status, an
 				// unknown message, an API error -- fails the backup deletion
-				// so it can be retried, and deletes shard 0 so no unowned
-				// work continues; the retry is a new request that regathers
-				// into the inert entry shards, which is idempotent, writes
-				// shard 0 again and replays only the unfinished entries
-				// (design section 4).
-				if deactivateErr := retainedsnapshot.DeleteManifest(ctx, r.Client, backup); deactivateErr != nil {
-					log.WithError(deactivateErr).Error("Error deleting the retained snapshot record manifest")
-					return ctrl.Result{}, deactivateErr
+				// so it can be retried. This controller never writes the
+				// DeleteBackupRequest: it writes the reason into shard 0 and
+				// stops working on the family. The shard-0 update re-enters
+				// the waiting request through its family watch (and its
+				// backstop requeue), which reads the marker before anything
+				// else, fails itself with the reason and deletes the family;
+				// the retry is a new request that regathers from the backup
+				// tarball and writes shard 0 again (design section 4).
+				message := fmt.Sprintf("error deleting the retained snapshot of DataUpload %s: %v", name, err)
+				if markErr := retainedsnapshot.MarkFailed(ctx, r.Client, backup, message); markErr != nil {
+					log.WithError(markErr).Error("Error marking the retained snapshot records failed")
+					return ctrl.Result{}, markErr
 				}
-				if failErr := r.failDeleteBackupRequest(ctx, backup, err); failErr != nil {
-					log.WithError(failErr).Error("Error failing the backup deletion")
-					return ctrl.Result{}, failErr
-				}
-				log.WithError(err).Errorf("Error deleting the retained snapshot of DataUpload %s, failing the backup deletion", name)
+				log.WithError(err).Errorf("Error deleting the retained snapshot of DataUpload %s, the backup deletion fails", name)
 				return ctrl.Result{}, nil
 			}
 			switch outcome {
@@ -514,44 +520,6 @@ func (r *retainedSnapshotReconciler) garbageCollectShard(ctx context.Context, sh
 	for _, s := range shards {
 		if err := client.IgnoreNotFound(r.Delete(ctx, s)); err != nil {
 			return errors.Wrapf(err, "error deleting the retained snapshot record shard %s", s.Name)
-		}
-	}
-	return nil
-}
-
-// failDeleteBackupRequest marks the DeleteBackupRequest that waits on this
-// family Processed with the deletion error, so the backup deletion fails and
-// can be retried; a retry creates a new request that regathers from the
-// ConfigMap, which is idempotent.
-func (r *retainedSnapshotReconciler) failDeleteBackupRequest(ctx context.Context, backup *velerov1api.Backup, err error) error {
-	message := fmt.Sprintf("backup deletion failed: error deleting the retained snapshots: %v", err)
-	return r.patchWaitingRequest(ctx, backup, func(req *velerov1api.DeleteBackupRequest) {
-		req.Status.Phase = velerov1api.DeleteBackupRequestPhaseProcessed
-		req.Status.Errors = []string{message}
-	})
-}
-
-func (r *retainedSnapshotReconciler) patchWaitingRequest(ctx context.Context, backup *velerov1api.Backup, mutate func(*velerov1api.DeleteBackupRequest)) error {
-	list := &velerov1api.DeleteBackupRequestList{}
-	// The request is selected by the backup UID alone: the requests carry a
-	// sanitized backup-name label, which does not match the raw name of a
-	// backup with a long name.
-	selector := labels.SelectorFromSet(map[string]string{
-		velerov1api.BackupUIDLabel: string(backup.UID),
-	})
-	if err := r.List(ctx, list, &client.ListOptions{Namespace: backup.Namespace, LabelSelector: selector}); err != nil {
-		return errors.Wrap(err, "error listing the DeleteBackupRequests of the backup")
-	}
-	for i := range list.Items {
-		req := &list.Items[i]
-		if req.Status.Phase != velerov1api.DeleteBackupRequestPhaseInProgress ||
-			req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation] == "" {
-			continue
-		}
-		original := req.DeepCopy()
-		mutate(req)
-		if err := r.Patch(ctx, req, client.MergeFrom(original)); err != nil {
-			return errors.Wrap(err, "error patching the DeleteBackupRequest")
 		}
 	}
 	return nil

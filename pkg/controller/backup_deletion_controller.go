@@ -179,9 +179,9 @@ func tempVSCDeletedPredicate() predicate.Funcs {
 // familyEntriesSettledPredicate admits only an update of a record family shard
 // -- a ConfigMap labeled with a backup UID -- that settles a pending entry:
 // the entry was confirmed deleted and moved to the completed set, or escalated
-// or skipped to the orphan-snapshot ConfigMap. Writes that add entries or
-// persist an attempt count are not admitted; they change nothing the request
-// should act on.
+// or skipped to the orphan-snapshot ConfigMap; or that marks shard 0 failed on
+// an uncounted error. Writes that add entries or persist an attempt count are
+// not admitted; they change nothing the request should act on.
 func familyEntriesSettledPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return false },
@@ -195,6 +195,9 @@ func familyEntriesSettledPredicate() predicate.Funcs {
 			newShard, ok := e.ObjectNew.(*corev1api.ConfigMap)
 			if !ok || newShard.Labels[velerov1api.BackupUIDLabel] == "" {
 				return false
+			}
+			if newShard.Data[retainedsnapshot.FailedKey] != "" && oldShard.Data[retainedsnapshot.FailedKey] == "" {
+				return true
 			}
 			return len(pendingShardKeys(newShard)) < len(pendingShardKeys(oldShard))
 		},
@@ -714,8 +717,41 @@ func (r *backupDeletionReconciler) reconcileRetainedSnapshots(
 ) (ctrl.Result, error) {
 	log.Info("Evaluating the retained snapshot records of the backup")
 
-	// Repair the shard-0 write a crash may have interrupted.
-	if err := retainedsnapshot.WriteManifest(ctx, r.Client, backup); err != nil {
+	// An uncounted failure of the retained-snapshot controller is carried in
+	// shard 0, read before the shard-0 repair below: the request fails itself
+	// with the reason, clears its own pending annotation and deletes the
+	// family, so no unowned work continues. The backup tarball is still in
+	// place -- the tail did not run -- so the retry is a new request that
+	// regathers the records from it and writes shard 0 again.
+	if manifest, err := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "error reading the retained snapshot records")
+	} else if reason := manifest.FailedReason(); reason != "" {
+		log.Errorf("The retained snapshot deletion failed: %s", reason)
+		if err := retainedsnapshot.Delete(ctx, r.Client, backup); err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "error removing the failed retained snapshot records")
+		}
+		if _, err := r.patchDeleteBackupRequest(ctx, dbr, func(req *velerov1api.DeleteBackupRequest) {
+			req.Status.Phase = velerov1api.DeleteBackupRequestPhaseProcessed
+			req.Status.Errors = []string{"backup deletion failed: error deleting the retained snapshots: " + reason}
+			if req.Annotations != nil {
+				annotations := map[string]string{}
+				for key, value := range req.Annotations {
+					if key != velerov1api.RetainedSnapshotsPendingAnnotation {
+						annotations[key] = value
+					}
+				}
+				req.Annotations = annotations
+			}
+		}); err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "error failing the backup deletion")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Repair the shard-0 write a crash may have interrupted. The repair keeps
+	// a failure marker written after the read above; the next re-entry, from
+	// the family watch or the backstop requeue, acts on it.
+	if err := retainedsnapshot.RepairManifest(ctx, r.Client, backup); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error repairing the retained snapshot record manifest")
 	}
 
@@ -817,7 +853,7 @@ func (r *backupDeletionReconciler) gatherRetainedSnapshotRecords(ctx context.Con
 func pendingShardKeys(shard *corev1api.ConfigMap) []string {
 	keys := []string{}
 	for key := range shard.Data {
-		if key == retainedsnapshot.ShardCountKey || key == retainedsnapshot.CompletedKey {
+		if key == retainedsnapshot.ShardCountKey || key == retainedsnapshot.CompletedKey || key == retainedsnapshot.FailedKey {
 			continue
 		}
 		keys = append(keys, key)

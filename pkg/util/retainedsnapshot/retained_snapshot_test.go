@@ -622,3 +622,35 @@ func shardPendingKeys(t *testing.T, shard *corev1api.ConfigMap) []string {
 	}
 	return keys
 }
+
+// TestMarkFailed proves the uncounted-failure marker: it lives in shard 0, is
+// not an entry, stops the family's work, and a fresh shard-0 write for a retry
+// clears it.
+func TestMarkFailed(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	backup := testBackup()
+
+	// No shard 0: nothing to mark.
+	require.NoError(t, MarkFailed(t.Context(), c, backup, "reason"))
+
+	require.NoError(t, WriteEntries(t.Context(), c, backup, map[string]*Entry{"du-1": testEntry("handle-1")}))
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	require.NoError(t, MarkFailed(t.Context(), c, backup, "Failed to get snapshot credentials"))
+
+	family, err := LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Equal(t, "Failed to get snapshot credentials", family.FailedReason())
+	assert.Equal(t, 1, family.PendingEntries(), "the marker is not an entry")
+	assert.False(t, family.HasPendingWork(), "a failed family has no work")
+
+	require.NoError(t, RepairManifest(t.Context(), c, backup))
+	family, err = LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Equal(t, "Failed to get snapshot credentials", family.FailedReason(), "a re-entry's repair keeps the marker")
+
+	require.NoError(t, WriteManifest(t.Context(), c, backup))
+	family, err = LoadFamily(t.Context(), c, backup)
+	require.NoError(t, err)
+	assert.Empty(t, family.FailedReason(), "a retry's shard-0 write clears the marker")
+	assert.True(t, family.HasPendingWork())
+}

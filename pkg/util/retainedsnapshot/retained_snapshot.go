@@ -79,6 +79,14 @@ const (
 	// a temporary content.
 	ShardCountKey = "shardCount"
 
+	// FailedKey is the data key of shard 0 that carries the reason of an
+	// uncounted deletion failure -- a credential failure, a clear-status
+	// failure, an unknown message, an API error. The retained-snapshot
+	// controller never writes the DeleteBackupRequest: it writes this marker
+	// and stops working on the family, and the request's re-entry reads the
+	// marker, fails itself with the reason and deactivates the family.
+	FailedKey = "failed"
+
 	// CompletedKey holds the JSON array of DataUpload names whose snapshots
 	// were confirmed deleted. An entry shard with no pending entries keeps its
 	// completed set -- the evidence that suppresses replay -- until the
@@ -375,16 +383,25 @@ func (f *Family) PendingEntries() int {
 }
 
 // HasPendingWork reports whether the family has work for the retained-snapshot
-// controller: a shard 0 and a pending entry. An inert family has no work but
-// also does not count as finished for a request that has not activated it
-// yet; the request decides through IsActivated.
+// controller: a shard 0 without a failure marker and a pending entry. An inert
+// family has no work but also does not count as finished for a request that
+// has not activated it yet; the request decides through IsActivated.
 func (f *Family) HasPendingWork() bool {
-	return f.IsActivated() && f.PendingEntries() > 0
+	return f.IsActivated() && f.FailedReason() == "" && f.PendingEntries() > 0
 }
 
 // IsActivated reports whether the family has its shard 0, the manifest.
 func (f *Family) IsActivated() bool {
 	return f.Manifest != nil
+}
+
+// FailedReason returns the uncounted deletion failure shard 0 carries, empty
+// when there is none.
+func (f *Family) FailedReason() string {
+	if f.Manifest == nil {
+		return ""
+	}
+	return f.Manifest.Data[FailedKey]
 }
 
 // Entry returns the pending entry of the named DataUpload.
@@ -421,7 +438,7 @@ func (f *Family) CompletedSet() map[string]struct{} {
 func pendingKeys(shard *corev1api.ConfigMap) []string {
 	var keys []string
 	for key := range shard.Data {
-		if key == ShardCountKey || key == CompletedKey {
+		if key == ShardCountKey || key == CompletedKey || key == FailedKey {
 			continue
 		}
 		keys = append(keys, key)
@@ -839,6 +856,17 @@ func RemoveEntry(ctx context.Context, c client.Client, backup *velerov1api.Backu
 // a manifest write a crash interrupted. No manifest is written for a family
 // without entry shards, so a backup with zero entries has no family.
 func WriteManifest(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
+	return writeManifest(ctx, c, backup, true)
+}
+
+// RepairManifest is WriteManifest for the request's re-entry: it repairs a
+// shard-0 write a crash interrupted, but keeps a failure marker, which the
+// retained-snapshot controller may have written after the re-entry read it.
+func RepairManifest(ctx context.Context, c client.Client, backup *velerov1api.Backup) error {
+	return writeManifest(ctx, c, backup, false)
+}
+
+func writeManifest(ctx context.Context, c client.Client, backup *velerov1api.Backup, clearFailure bool) error {
 	shards, err := listEntryShards(ctx, c, backup)
 	if err != nil {
 		return err
@@ -874,11 +902,17 @@ func WriteManifest(ctx context.Context, c client.Client, backup *velerov1api.Bac
 	case err != nil:
 		return errors.Wrap(err, "error getting the retained snapshot record manifest")
 	}
-	if manifest.Data[ShardCountKey] == strconv.Itoa(count) && manifest.Labels[FamilyLabel] == "true" {
+	// A fresh activation clears a failure marker an earlier request left
+	// behind: this write starts a new attempt. A repair keeps it.
+	stale := clearFailure && manifest.Data[FailedKey] != ""
+	if manifest.Data[ShardCountKey] == strconv.Itoa(count) && manifest.Labels[FamilyLabel] == "true" && !stale {
 		return nil
 	}
 	if manifest.Data == nil {
 		manifest.Data = map[string]string{}
+	}
+	if clearFailure {
+		delete(manifest.Data, FailedKey)
 	}
 	manifest.Data[ShardCountKey] = strconv.Itoa(count)
 	if manifest.Labels == nil {
@@ -889,6 +923,29 @@ func WriteManifest(ctx context.Context, c client.Client, backup *velerov1api.Bac
 	}
 	if err := c.Update(ctx, manifest); err != nil {
 		return errors.Wrapf(err, "error updating the retained snapshot record manifest %s", manifest.Name)
+	}
+	return nil
+}
+
+// MarkFailed writes the reason of an uncounted deletion failure into shard 0.
+// The retained-snapshot controller stops working on a family whose shard 0
+// carries it, and the request's re-entry fails itself with the reason and
+// deletes the family; the retry regathers from the backup tarball. A family
+// without a shard 0 has no waiting request to inform and is left alone.
+func MarkFailed(ctx context.Context, c client.Client, backup *velerov1api.Backup, reason string) error {
+	manifest := &corev1api.ConfigMap{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: ManifestName(string(backup.UID))}, manifest); err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return errors.Wrap(err, "error getting the retained snapshot record manifest")
+	}
+	if manifest.Data == nil {
+		manifest.Data = map[string]string{}
+	}
+	manifest.Data[FailedKey] = reason
+	if err := c.Update(ctx, manifest); err != nil {
+		return errors.Wrapf(err, "error marking the retained snapshot record manifest %s failed", manifest.Name)
 	}
 	return nil
 }
