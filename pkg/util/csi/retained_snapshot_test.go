@@ -1171,3 +1171,35 @@ func TestLatestSnapshotDeleteErrorMessage(t *testing.T) {
 		assert.Empty(t, kind)
 	})
 }
+
+// TestDeleteRetainedSnapshotMissingSecretNeverCounts proves a timed-out
+// deletion counts toward the escalation bound only when its deletion secret
+// exists: a missing secret is retryable, so a restored secret lets the
+// deletion succeed instead of escalating the record.
+func TestDeleteRetainedSnapshotMissingSecretNeverCounts(t *testing.T) {
+	shortenRetainedSnapshotDeletionTimeout(t)
+	record := retainedTestRecord()
+	record.DeletionSecretRef = &corev1api.SecretReference{Name: "rook-csi-rbd-provisioner", Namespace: "rook-ceph"}
+
+	t.Run("missing secret is retryable", func(t *testing.T) {
+		// The snapshot never becomes deletable and the sidecar reports nothing.
+		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: false}}
+		c := backend.client(t)
+
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
+		require.ErrorContains(t, err, "deletion secret rook-ceph/rook-csi-rbd-provisioner is missing")
+		var callErr *SnapshotDeleteCallError
+		assert.NotErrorAs(t, err, &callErr, "a missing secret never counts toward escalation")
+	})
+
+	t.Run("present secret lets the timeout count", func(t *testing.T) {
+		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: false}}
+		secret := &corev1api.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "rook-ceph", Name: "rook-csi-rbd-provisioner"}}
+		c := backend.client(t, secret)
+
+		err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, velerotest.NewLogger())
+		var callErr *SnapshotDeleteCallError
+		require.ErrorAs(t, err, &callErr)
+		assert.Contains(t, callErr.Message, "is not deleted within")
+	})
+}

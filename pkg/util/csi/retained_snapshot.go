@@ -379,6 +379,21 @@ func DeleteRetainedSnapshot(
 		return errors.Wrapf(err, "error waiting for temp VolumeSnapshotContent %s to be deleted", tempVSC.Name)
 	}
 
+	// A missing deletion secret is an environment problem the sidecar can only
+	// report as a credential failure, a message the best-effort match may not
+	// recognize: it is retryable and never counts, so a restored secret lets
+	// the deletion succeed instead of escalating the record after the bound.
+	if ref := record.DeletionSecretRef; ref != nil && ref.Name != "" {
+		secret := &corev1api.Secret{}
+		if err := reader.Get(ctx, crclient.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Errorf("snapshot %s is not deleted within %v: its deletion secret %s/%s is missing; restore the secret and retry the backup deletion",
+					record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, ref.Namespace, ref.Name)
+			}
+			return errors.Wrapf(err, "snapshot %s is not deleted within %v, and its deletion secret %s/%s could not be read", record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, ref.Namespace, ref.Name)
+		}
+	}
+
 	// The timeout is the authoritative signal and counts toward the
 	// escalation bound whether or not the sidecar recorded a message this
 	// version recognizes. The latest event, when there is one, only adds

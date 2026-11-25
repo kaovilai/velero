@@ -96,6 +96,9 @@ func NewRetainedSnapshotReconcilerWithRecorder(logger logrus.FieldLogger, client
 // from a credential failure or a plain timeout, which stay retryable.
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;create;patch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=csidrivers,verbs=get;list;watch
+// The secrets get verb backs the timeout classification: a missing deletion
+// secret keeps a timed-out deletion retryable instead of counting it.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get;list;watch;create;delete
