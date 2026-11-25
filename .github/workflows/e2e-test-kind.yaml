@@ -218,7 +218,7 @@ jobs:
               \"BSL && Deletion && Snapshot\", \
               \"Backups && Deletion && FSBackup\", \
               \"RetainedSnapshot && (Lifecycle || Release)\", \
-              \"RetainedSnapshot && Chain\"\
+              \"RetainedSnapshot && (Chain || Holder)\"\
             ]}" >> $GITHUB_OUTPUT
 
   # Run E2E test against all Kubernetes versions on kind

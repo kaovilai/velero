@@ -752,6 +752,12 @@ var _ = Describe(
 	RetainedSnapshotReleaseTest,
 )
 
+var _ = Describe(
+	"Base snapshot retention of the block data mover: rolling-base holder deletion",
+	Label("RetainedSnapshotHolder", "Backups", "Deletion"),
+	RetainedSnapshotHolderTest,
+)
+
 func GetKubeConfigContext() error {
 	var err error
 	var tcDefault, tcStandby k8s.TestClient

@@ -110,9 +110,16 @@ var RetainedSnapshotLifecycleTest = func() {
 }
 
 var RetainedSnapshotChainTest = func() {
-	Context("deleting one backup of a chain keeps the other backups' retained snapshots and restores",
+	Context("the rolling base keeps one retained snapshot per volume and every backup of the chain restores",
 		Label("CSI", "DataMover", "BlockDataMover", "RetainedSnapshot", "Chain"),
 		TestFunc(&chainCase{}),
+	)
+}
+
+var RetainedSnapshotHolderTest = func() {
+	Context("deleting the backup holding the rolling base makes the next backup a full read with the reason recorded",
+		Label("CSI", "DataMover", "BlockDataMover", "RetainedSnapshot", "Holder"),
+		TestFunc(&holderCase{}),
 	)
 }
 
@@ -416,17 +423,42 @@ func (r *retainedSnapshotCase) expectRetained(du *velerov2alpha1api.DataUpload, 
 	record := du.Status.RetainedCSIStorageSnapshot
 	Expect(record.Driver).To(Equal(hostpathDriver))
 	Expect(record.CSISnapshotHandle).NotTo(BeEmpty())
+	Expect(record.CSIVolumeHandle).NotTo(BeEmpty(), "the record must carry the volume handle that keys the rolling-base chain")
+	Expect(record.Released).To(BeFalse())
 	if obs.handle != "" {
 		Expect(record.CSISnapshotHandle).To(Equal(obs.handle), "the record names a different snapshot than the backup content")
 	}
 	Expect(obs.retainBeforeRecord).To(BeFalse(), "the backup content was Retain before the DataUpload carried the record")
-	fmt.Fprintf(GinkgoWriter, "DataUpload %s: handle %s, Retain observed=%t, record observed while running=%t, fallbackReason=%q\n",
-		du.Name, record.CSISnapshotHandle, obs.retainSeen, obs.recordSeen, du.Status.FallbackReason)
+	fmt.Fprintf(GinkgoWriter, "DataUpload %s: handle %s, volume %s, base %q, Retain observed=%t, record observed while running=%t, fallbackReason=%q\n",
+		du.Name, record.CSISnapshotHandle, record.CSIVolumeHandle, record.BaseCSISnapshotHandle, obs.retainSeen, obs.recordSeen, du.Status.FallbackReason)
 
 	By("The backup VolumeSnapshot and VolumeSnapshotContent are deleted while the storage snapshot survives")
 	Expect(r.expectBackupSnapshotObjectsGone(du.Name)).To(Succeed())
 	r.expectStorageSnapshot(record.CSISnapshotHandle, true)
 	return record.CSISnapshotHandle
+}
+
+// expectReleased waits until the rolling base released the retained snapshot of
+// backup's DataUpload: the record shows released by the newer backup, and the
+// snapshot is gone at the storage level.
+func (r *retainedSnapshotCase) expectReleased(backupName, handle, releasedByBackup string) {
+	By(fmt.Sprintf("The retained snapshot %s of backup %s is released by backup %s and gone from the storage", handle, backupName, releasedByBackup))
+	releasedBy, err := r.backupUID(releasedByBackup)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(wait.PollUntilContextTimeout(r.Ctx, pollInterval, deletionTimeout, true, func(context.Context) (bool, error) {
+		du, err := r.dataUploadOf(backupName)
+		if err != nil {
+			return false, err
+		}
+		record := du.Status.RetainedCSIStorageSnapshot
+		if record == nil || !record.Released {
+			return false, nil
+		}
+		Expect(record.ReleasedBy).To(Equal(releasedBy))
+		exists, err := r.storageSnapshotExists(handle)
+		return !exists, err
+	})).To(Succeed(), "the retained snapshot %s of backup %s was not released", handle, backupName)
+	fmt.Fprintf(GinkgoWriter, "Released: backup %s snapshot %s, released by backup %s (%s)\n", backupName, handle, releasedByBackup, releasedBy)
 }
 
 // deletionObservation is what the watcher saw while a backup was deleted.
@@ -694,9 +726,11 @@ func (c *lifecycleCase) Verify() error {
 	return nil
 }
 
-// chainCase: three backups of the same volume, each retaining its snapshot.
-// Deleting the middle one, then the first one, deletes only their snapshots,
-// and the remaining backups still restore their data.
+// chainCase: three backups of the same volume. The rolling base keeps one
+// retained snapshot per volume: backup 2 releases backup 1's snapshot, backup 3
+// releases backup 2's. All three backups restore their data, deleting the
+// released backups 1 and 2 changes nothing on the storage, and deleting backup
+// 3 removes the last snapshot.
 type chainCase struct {
 	retainedSnapshotCase
 	backups   [3]string
@@ -712,9 +746,9 @@ func (c *chainCase) Init() error {
 		c.backups[i] = fmt.Sprintf("backup-%d-%s", i+1, c.CaseBaseName)
 	}
 	c.TestMsg = &TestMSG{
-		Desc:      "chain of three velero-block backups with base snapshot retention",
-		Text:      "Each backup retains its own snapshot; deleting one backup deletes only its snapshot and leaves the other backups restorable",
-		FailedMSG: "Deleting a backup of the chain broke another backup's retained snapshot or restore",
+		Desc:      "chain of three velero-block backups with the rolling base",
+		Text:      "Each completed backup releases the older retained snapshot of the volume; every backup still restores, and deleting the released backups changes nothing on the storage",
+		FailedMSG: "The rolling base kept or released the wrong snapshot, or a backup of the chain did not restore",
 	}
 	return nil
 }
@@ -727,6 +761,7 @@ func (c *chainCase) CreateResources() error {
 }
 
 func (c *chainCase) Backup() error {
+	var volumeHandle string
 	for i := range c.backups {
 		checksum, err := c.writeData(8 * (i + 1))
 		if err != nil {
@@ -738,13 +773,20 @@ func (c *chainCase) Backup() error {
 			return err
 		}
 		c.handles[i] = c.expectRetained(du, obs)
+		if i == 0 {
+			volumeHandle = du.Status.RetainedCSIStorageSnapshot.CSIVolumeHandle
+		}
+		Expect(du.Status.RetainedCSIStorageSnapshot.CSIVolumeHandle).To(Equal(volumeHandle), "every backup of the volume belongs to one chain")
+		if i > 0 {
+			c.expectReleased(c.backups[i-1], c.handles[i-1], c.backups[i])
+		}
 	}
 	Expect(c.handles[0]).NotTo(Equal(c.handles[1]))
 	Expect(c.handles[1]).NotTo(Equal(c.handles[2]))
-	By("All three retained snapshots are in the storage")
-	for _, handle := range c.handles {
-		c.expectStorageSnapshot(handle, true)
-	}
+	By("Only the last backup's snapshot is in the storage")
+	c.expectStorageSnapshot(c.handles[0], false)
+	c.expectStorageSnapshot(c.handles[1], false)
+	c.expectStorageSnapshot(c.handles[2], true)
 	return nil
 }
 
@@ -752,25 +794,107 @@ func (c *chainCase) Backup() error {
 func (c *chainCase) Destroy() error { return nil }
 
 func (c *chainCase) Restore() error {
-	By("Delete the middle backup: only its snapshot goes")
-	c.deleteBackup(c.backups[1], c.handles[1])
-	c.expectStorageSnapshot(c.handles[0], true)
-	c.expectStorageSnapshot(c.handles[2], true)
-
-	if err := c.restoreAndVerify(c.backups[0], "restore-1-"+c.CaseBaseName, c.checksums[0]); err != nil {
-		return err
+	By("Every backup of the chain restores its data: restores read the repository, not the storage snapshots")
+	for i := range c.backups {
+		if err := c.restoreAndVerify(c.backups[i], fmt.Sprintf("restore-%d-%s", i+1, c.CaseBaseName), c.checksums[i]); err != nil {
+			return err
+		}
 	}
-	if err := c.restoreAndVerify(c.backups[2], "restore-3a-"+c.CaseBaseName, c.checksums[2]); err != nil {
-		return err
-	}
-
-	By("Delete the first backup: the last backup's snapshot stays and it still restores")
-	c.deleteBackup(c.backups[0], c.handles[0])
-	c.expectStorageSnapshot(c.handles[2], true)
-	return c.restoreAndVerify(c.backups[2], "restore-3b-"+c.CaseBaseName, c.checksums[2])
+	return nil
 }
 
 func (c *chainCase) Verify() error {
+	By("Deleting the released backups 1 and 2 changes nothing on the storage")
+	c.deleteBackup(c.backups[0])
+	c.deleteBackup(c.backups[1])
+	c.expectStorageSnapshot(c.handles[2], true)
+
+	By("Deleting backup 3 removes the last snapshot")
+	c.deleteBackup(c.backups[2], c.handles[2])
+	return nil
+}
+
+// holderCase: two backups of a volume, the second holding the rolling base.
+// Deleting the holder deletes its snapshot; the next backup's parent is then
+// the first backup, whose snapshot the base move released, so the next backup
+// reads in full and records why. On kind the snapshot-metadata service is
+// missing, so every incremental falls back; the reason must name the released
+// base, not only the missing service.
+type holderCase struct {
+	retainedSnapshotCase
+	backups [3]string
+	handles [3]string
+}
+
+func (c *holderCase) Init() error {
+	if err := c.init("retain-holder"); err != nil {
+		return err
+	}
+	for i := range c.backups {
+		c.backups[i] = fmt.Sprintf("backup-%d-%s", i+1, c.CaseBaseName)
+	}
+	c.TestMsg = &TestMSG{
+		Desc:      "deleting the backup holding the rolling base",
+		Text:      "The next backup reads in full and its fallback reason names the released base",
+		FailedMSG: "The next backup after deleting the rolling-base holder did not record why it read in full",
+	}
+	return nil
+}
+
+func (c *holderCase) CreateResources() error {
+	if err := c.createPolicy(); err != nil {
+		return err
+	}
+	return c.createWorkload(resource.MustParse("64Mi"))
+}
+
+func (c *holderCase) Backup() error {
+	for i := 0; i < 2; i++ {
+		if _, err := c.writeData(8 * (i + 1)); err != nil {
+			return err
+		}
+		du, obs, err := c.backup(c.backups[i], true)
+		if err != nil {
+			return err
+		}
+		c.handles[i] = c.expectRetained(du, obs)
+		if i == 1 {
+			By("With the base retained, the fallback reason names the retained base and the driver's error, not a released base")
+			Expect(du.Status.FallbackReason).To(ContainSubstring("was retained but could not be used"))
+			Expect(du.Status.FallbackReason).NotTo(ContainSubstring("was released"))
+		}
+	}
+	c.expectReleased(c.backups[0], c.handles[0], c.backups[1])
+	return nil
+}
+
+// Destroy is a no-op: the next backup runs against the same volume.
+func (c *holderCase) Destroy() error { return nil }
+
+func (c *holderCase) Restore() error {
+	By("Delete the backup holding the rolling base")
+	c.deleteBackup(c.backups[1], c.handles[1])
+
+	if _, err := c.writeData(24); err != nil {
+		return err
+	}
+	du, obs, err := c.backup(c.backups[2], true)
+	if err != nil {
+		return err
+	}
+	c.handles[2] = c.expectRetained(du, obs)
+
+	By("The next backup read in full and its fallback reason names the released base")
+	Expect(du.Status.FallbackFull).To(BeTrue())
+	Expect(du.Status.FallbackReason).To(ContainSubstring("was released as the rolling base moved on"))
+	Expect(du.Status.FallbackReason).To(ContainSubstring(c.handles[0]))
+	Expect(du.Status.RetainedCSIStorageSnapshot.BaseCSISnapshotHandle).To(BeEmpty(), "a full read has no base")
+	fmt.Fprintf(GinkgoWriter, "Holder deleted: backup %s fallbackReason=%q\n", c.backups[2], du.Status.FallbackReason)
+	return nil
+}
+
+func (c *holderCase) Verify() error {
+	c.deleteBackup(c.backups[0])
 	c.deleteBackup(c.backups[2], c.handles[2])
 	return nil
 }
@@ -856,7 +980,12 @@ func (c *releaseCase) cancelDataUpload() error {
 		return errors.Wrap(err, "cancel the DataUpload")
 	}
 
-	By("The DataUpload ends Canceled with no record")
+	// The canceled data path usually ends the DataUpload Canceled, but when
+	// the data mover pod terminates before the cancel event is consumed, the
+	// pod-termination callback ends it Failed instead. Either way it did not
+	// complete, and the retention contract is the same: no record, snapshot
+	// released.
+	By("The DataUpload ends Canceled or Failed with no record")
 	var du *velerov2alpha1api.DataUpload
 	if err := wait.PollUntilContextTimeout(c.Ctx, pollInterval, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
 		current := new(velerov2alpha1api.DataUpload)
@@ -864,10 +993,17 @@ func (c *releaseCase) cancelDataUpload() error {
 			return false, err
 		}
 		du = current
-		return current.Status.Phase == velerov2alpha1api.DataUploadPhaseCanceled, nil
+		switch current.Status.Phase {
+		case velerov2alpha1api.DataUploadPhaseCanceled, velerov2alpha1api.DataUploadPhaseFailed:
+			return true, nil
+		case velerov2alpha1api.DataUploadPhaseCompleted:
+			return false, errors.Errorf("the canceled DataUpload %s completed", duName)
+		}
+		return false, nil
 	}); err != nil {
-		return errors.Wrapf(err, "wait for DataUpload %s to be Canceled", duName)
+		return errors.Wrapf(err, "wait for DataUpload %s to end Canceled or Failed", duName)
 	}
+	fmt.Fprintf(GinkgoWriter, "Canceled DataUpload %s ended %s: %s\n", du.Name, du.Status.Phase, du.Status.Message)
 	Expect(du.Spec.DataMoverConfig).To(HaveKeyWithValue(velerov2alpha1api.RetainSnapshotDataMoverConfigKey, "true"))
 	Expect(du.Status.RetainedCSIStorageSnapshot).To(BeNil(), "the canceled DataUpload %s kept a retained snapshot record", du.Name)
 
