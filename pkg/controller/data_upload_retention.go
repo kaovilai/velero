@@ -252,7 +252,7 @@ func shouldRetainSnapshot(du *velerov2alpha1api.DataUpload) bool {
 //
 // Any error returned here must fail the DataUpload and release the snapshot;
 // the content keeps Delete in that case and section 3's patch-back reclaims it.
-func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) error {
+func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, du *velerov2alpha1api.DataUpload, fallbackFull bool, log logrus.FieldLogger) error {
 	if !shouldRetainSnapshot(du) {
 		return nil
 	}
@@ -267,6 +267,10 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	record := csi.GetRetainedSnapshotFromVSC(vsc)
 	if record == nil {
 		return errors.Errorf("the backup VolumeSnapshotContent %s carries no snapshot handle to retain", du.Name)
+	}
+	record.CSIVolumeHandle = r.sourceCSIVolumeHandle(ctx, du, log)
+	if !fallbackFull {
+		record.BaseCSISnapshotHandle = r.baseSnapshotHandle(ctx, du, log)
 	}
 
 	holder := fmt.Sprintf("%s-%d", r.nodeName, r.Clock.Now().UnixNano())
@@ -364,6 +368,36 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	}
 
 	return nil
+}
+
+// sourceCSIVolumeHandle returns the CSI volume handle of the DataUpload's source
+// volume, which keys the rolling-base chain with the driver. A lookup failure
+// leaves it empty: the snapshot is still retained and deleted with its backup,
+// but no newer backup releases it early.
+func (r *DataUploadReconciler) sourceCSIVolumeHandle(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) string {
+	pvc, err := r.kubeClient.CoreV1().PersistentVolumeClaims(du.Spec.SourceNamespace).Get(ctx, du.Spec.SourcePVC, metav1.GetOptions{})
+	if err != nil || pvc.Spec.VolumeName == "" {
+		log.WithError(err).Warnf("Failed to read the source PVC %s/%s, the retained snapshot is not chained for the rolling base", du.Spec.SourceNamespace, du.Spec.SourcePVC)
+		return ""
+	}
+	pv, err := r.kubeClient.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
+	if err != nil || pv.Spec.CSI == nil {
+		log.WithError(err).Warnf("Failed to read the CSI volume handle of PV %s, the retained snapshot is not chained for the rolling base", pvc.Spec.VolumeName)
+		return ""
+	}
+	return pv.Spec.CSI.VolumeHandle
+}
+
+// baseSnapshotHandle returns the retained snapshot an incremental DataUpload's
+// changed blocks were computed against: the record of the most recently
+// completed DataUpload of the same PVC, which is the parent the block data mover
+// selects. A DataUpload that read the volume in full has no base.
+func (r *DataUploadReconciler) baseSnapshotHandle(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) string {
+	previous := r.previousCompletedDataUpload(ctx, du, log)
+	if previous == nil || previous.Status.RetainedCSIStorageSnapshot == nil {
+		return ""
+	}
+	return previous.Status.RetainedCSIStorageSnapshot.CSISnapshotHandle
 }
 
 // confirmRetainedSnapshotCleanup finishes the exposer cleanup on the retention

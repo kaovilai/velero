@@ -575,7 +575,7 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 	// VolumeSnapshotContent switched to Retain, so the snapshot survives the
 	// cleanup below. Any failure here must fail the DataUpload and release the
 	// snapshot instead of leaving it in the storage untracked.
-	retainErr := r.retainSnapshotOnCompletion(ctx, &du, log)
+	retainErr := r.retainSnapshotOnCompletion(ctx, &du, result.Backup.FallbackFull, log)
 
 	// cleans up any objects generated during the snapshot expose
 	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]

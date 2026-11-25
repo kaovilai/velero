@@ -271,6 +271,28 @@ type RetainedCSIStorageSnapshot struct {
 	// so the temporary content rebuilt to delete the snapshot must carry it too.
 	// +optional
 	ManagedByLabelValue string `json:"managedByLabelValue,omitempty"`
+
+	// CSIVolumeHandle is the CSI volume handle of the source volume the snapshot was
+	// taken of. With the driver it keys the volume's chain: one retained snapshot per
+	// chain is kept as the rolling base, and a newer one releases the older ones.
+	// +optional
+	CSIVolumeHandle string `json:"csiVolumeHandle,omitempty"`
+
+	// BaseCSISnapshotHandle is the handle of the retained snapshot this DataUpload's
+	// changed blocks were computed against; empty when the DataUpload read the volume
+	// in full.
+	// +optional
+	BaseCSISnapshotHandle string `json:"baseCSISnapshotHandle,omitempty"`
+
+	// Released reports that the snapshot was deleted from the storage because a newer
+	// DataUpload of the same chain completed and became the rolling base. A released
+	// record no longer owns a snapshot: backup deletion skips it.
+	// +optional
+	Released bool `json:"released,omitempty"`
+
+	// ReleasedBy is the UID of the backup whose DataUpload released the snapshot.
+	// +optional
+	ReleasedBy string `json:"releasedBy,omitempty"`
 }
 
 // TODO(2.0) After converting all resources to use the runttime-controller client,

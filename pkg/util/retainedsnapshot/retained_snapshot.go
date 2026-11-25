@@ -189,6 +189,13 @@ type Entry struct {
 	DeletionSecretRef *corev1api.SecretReference `json:"deletionSecretRef,omitempty"`
 	// ManagedByLabelValue is the managed-by label value of the backup content.
 	ManagedByLabelValue string `json:"managedByLabelValue,omitempty"`
+	// CSIVolumeHandle keys the volume's chain with the driver.
+	CSIVolumeHandle string `json:"csiVolumeHandle,omitempty"`
+	// BaseCSISnapshotHandle is the base the delta used; empty on a full read.
+	BaseCSISnapshotHandle string `json:"baseCSISnapshotHandle,omitempty"`
+	// Released and ReleasedBy carry the rolling-base release of the record.
+	Released   bool   `json:"released,omitempty"`
+	ReleasedBy string `json:"releasedBy,omitempty"`
 	// Attempts is the persisted number of DeleteSnapshot failures that came
 	// from the call itself. A retry of `velero backup delete` is a new
 	// DeleteBackupRequest and any in-memory count would reset on it, so the
@@ -208,21 +215,29 @@ func FromDataUploadStatus(du *velerov2alpha1api.DataUpload) *Entry {
 		return nil
 	}
 	return &Entry{
-		CSISnapshotHandle:   record.CSISnapshotHandle,
-		Driver:              record.Driver,
-		DeletionSecretRef:   record.DeletionSecretRef,
-		ManagedByLabelValue: record.ManagedByLabelValue,
-		Trusted:             true,
+		CSISnapshotHandle:     record.CSISnapshotHandle,
+		Driver:                record.Driver,
+		DeletionSecretRef:     record.DeletionSecretRef,
+		ManagedByLabelValue:   record.ManagedByLabelValue,
+		CSIVolumeHandle:       record.CSIVolumeHandle,
+		BaseCSISnapshotHandle: record.BaseCSISnapshotHandle,
+		Released:              record.Released,
+		ReleasedBy:            record.ReleasedBy,
+		Trusted:               true,
 	}
 }
 
 // Record returns the retained snapshot record of the entry.
 func (e *Entry) Record() *velerov2alpha1api.RetainedCSIStorageSnapshot {
 	return &velerov2alpha1api.RetainedCSIStorageSnapshot{
-		CSISnapshotHandle:   e.CSISnapshotHandle,
-		Driver:              e.Driver,
-		DeletionSecretRef:   e.DeletionSecretRef,
-		ManagedByLabelValue: e.ManagedByLabelValue,
+		CSISnapshotHandle:     e.CSISnapshotHandle,
+		Driver:                e.Driver,
+		DeletionSecretRef:     e.DeletionSecretRef,
+		ManagedByLabelValue:   e.ManagedByLabelValue,
+		CSIVolumeHandle:       e.CSIVolumeHandle,
+		BaseCSISnapshotHandle: e.BaseCSISnapshotHandle,
+		Released:              e.Released,
+		ReleasedBy:            e.ReleasedBy,
 	}
 }
 

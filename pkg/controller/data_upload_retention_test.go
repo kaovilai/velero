@@ -302,7 +302,7 @@ func TestRetainSnapshotOnCompletionLeaseFencing(t *testing.T) {
 				velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
 			}
 
-			retainErr := r.retainSnapshotOnCompletion(t.Context(), du, velerotest.NewLogger())
+			retainErr := r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger())
 
 			updated := getDataUpload(t, r, du)
 			if tc.wantRetained {
@@ -338,7 +338,7 @@ func TestRetainSnapshotOnCompletionPatchPrecondition(t *testing.T) {
 		return false, nil, nil
 	})
 
-	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, velerotest.NewLogger()))
+	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger()))
 
 	require.Len(t, patchPayloads, 1)
 	assert.Equal(t, "42", patchPayloads[0]["metadata"].(map[string]any)["resourceVersion"],
@@ -633,7 +633,7 @@ func TestReconcileDoesNotReleaseDuringRetentionCleanup(t *testing.T) {
 
 	// The completion callback persists the record and switches the content to
 	// Retain; the lease is renewed to cover the cleanup that follows.
-	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, velerotest.NewLogger()))
+	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger()))
 
 	// The callback is now inside the retention-path cleanup, bounded by the
 	// deletion timeout. Advance the clock past the original one-minute lease
@@ -869,7 +869,7 @@ func TestRetainSnapshotOnCompletionStaleResourceVersionConflicts(t *testing.T) {
 		return false, nil, nil
 	})
 
-	err = r.retainSnapshotOnCompletion(t.Context(), du, velerotest.NewLogger())
+	err = r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "error switching the backup VolumeSnapshotContent", "the stale Retain patch must fail")
 
@@ -929,7 +929,7 @@ func TestRetainSnapshotOnCompletionFreshResourceVersionAfterRecheck(t *testing.T
 		return false, nil, nil
 	})
 
-	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, velerotest.NewLogger()),
+	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger()),
 		"the Retain patch must carry the post-recheck resourceVersion, not the stale one from the first Get")
 
 	current, getErr := getBackupVSC(t, r, du)
@@ -1539,4 +1539,59 @@ func TestFallbackReasonOf(t *testing.T) {
 		fs.Spec.DataMover = "velero"
 		assert.Equal(t, "no usable parent repository snapshot", r.fallbackReasonOf(t.Context(), fs, datapath.BackupResult{FallbackFull: true, FallbackReason: "no usable parent repository snapshot"}, velerotest.NewLogger()))
 	})
+}
+
+// TestRetainSnapshotOnCompletionRecordsChain proves the record carries the
+// rolling-base chain: the source volume's CSI volume handle, and the base the
+// delta used -- the record of the previous completed DataUpload of the same
+// PVC -- except on a full read, which has no base.
+func TestRetainSnapshotOnCompletionRecordsChain(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		fallbackFull bool
+		wantBase     string
+	}{
+		{name: "incremental records the previous record as its base", wantBase: "base-handle"},
+		{name: "full read records no base", fallbackFull: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := initDataUploaderReconciler()
+			require.NoError(t, err)
+			ctx := t.Context()
+
+			_, err = r.kubeClient.CoreV1().PersistentVolumeClaims("fake-ns").Create(ctx, &corev1api.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "fake-ns", Name: "test-pvc"},
+				Spec:       corev1api.PersistentVolumeClaimSpec{VolumeName: "pv-1"},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+			_, err = r.kubeClient.CoreV1().PersistentVolumes().Create(ctx, &corev1api.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "pv-1"},
+				Spec: corev1api.PersistentVolumeSpec{PersistentVolumeSource: corev1api.PersistentVolumeSource{
+					CSI: &corev1api.CSIPersistentVolumeSource{Driver: retentionDriver, VolumeHandle: "volume-handle-1"},
+				}},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			earlier := metav1.NewTime(time.Now().Add(-time.Hour))
+			previous := retentionDataUploadBuilder().Result()
+			previous.Name = "previous-du"
+			previous.Labels = map[string]string{velerov1api.PVCUIDLabel: "pvc-uid"}
+			previous.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
+			previous.Status.CompletionTimestamp = &earlier
+			previous.Status.RetainedCSIStorageSnapshot = &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "base-handle", Driver: retentionDriver}
+			require.NoError(t, r.client.Create(ctx, previous))
+
+			du := retentionDataUploadBuilder().Result()
+			du.Labels = map[string]string{velerov1api.PVCUIDLabel: "pvc-uid"}
+			createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
+
+			require.NoError(t, r.retainSnapshotOnCompletion(ctx, du, tc.fallbackFull, velerotest.NewLogger()))
+
+			record := getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot
+			require.NotNil(t, record)
+			assert.Equal(t, "volume-handle-1", record.CSIVolumeHandle)
+			assert.Equal(t, tc.wantBase, record.BaseCSISnapshotHandle)
+			assert.False(t, record.Released)
+		})
+	}
 }
