@@ -268,6 +268,13 @@ func shouldRetainSnapshot(du *velerov2alpha1api.DataUpload) bool {
 //     rollback that has patched or
 //     deleted the content in between makes the delayed write fail instead of
 //     landing after it.
+//   - Every step is safe to re-enter, so a restarted node-agent finishes a
+//     completion its predecessor died in: a record already present is kept as
+//     it is, and a backup content that is gone, or being deleted under Retain,
+//     while the record exists means the exposer cleanup already ran under
+//     Retain, so the completion goes on to Completed and the release. A gone
+//     content without a record, or after a patch-back marked the DataUpload,
+//     still fails it.
 //
 // Any error returned here must fail the DataUpload and release the snapshot;
 // the content keeps Delete in that case and section 3's patch-back reclaims it.
@@ -279,8 +286,14 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	// The backup VSC is named after the DataUpload, see
 	// csiSnapshotExposer.createBackupVSC. The exposer creates it synchronously,
 	// with the handle already in spec.source.snapshotHandle.
+	holder := fmt.Sprintf("%s-%d", r.nodeName, r.Clock.Now().UnixNano())
 	vsc, err := r.csiSnapshotClient.VolumeSnapshotContents().Get(ctx, du.Name, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if resumed, resumeErr := r.resumeAfterRetainedCleanup(ctx, du, holder, log); resumed || resumeErr != nil {
+				return resumeErr
+			}
+		}
 		return errors.Wrapf(err, "error getting the backup VolumeSnapshotContent %s to retain its snapshot", du.Name)
 	}
 	record := csi.GetRetainedSnapshotFromVSC(vsc)
@@ -292,12 +305,27 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 		record.BaseCSISnapshotHandle = r.baseSnapshotHandle(ctx, du, log)
 	}
 
-	holder := fmt.Sprintf("%s-%d", r.nodeName, r.Clock.Now().UnixNano())
 	if err := r.acquireRetainLease(ctx, du, holder, log); err != nil {
 		return err
 	}
 
-	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(current *velerov2alpha1api.DataUpload) bool {
+	// A record already present is kept as it is: a restarted node-agent
+	// re-enters the completion of a DataUpload whose dead predecessor already
+	// recorded the snapshot.
+	resumed := false
+	existing := &velerov2alpha1api.DataUpload{}
+	if err := r.uncachedReader().Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, existing); err != nil {
+		return errors.Wrap(err, "error reading the DataUpload before recording its retained snapshot")
+	}
+	if kept := existing.Status.RetainedCSIStorageSnapshot; kept != nil {
+		if kept.CSISnapshotHandle != record.CSISnapshotHandle || kept.Driver != record.Driver {
+			return errors.Errorf("DataUpload %s records snapshot %s of driver %s, not the snapshot %s of its backup VolumeSnapshotContent", du.Name,
+				kept.CSISnapshotHandle, kept.Driver, record.CSISnapshotHandle)
+		}
+		resumed = true
+		record = kept
+		log.Infof("DataUpload %s already records the retained snapshot %s, resuming its completion", du.Name, record.CSISnapshotHandle)
+	} else if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(current *velerov2alpha1api.DataUpload) bool {
 		if isDataUploadInFinalState(current) {
 			return false
 		}
@@ -344,6 +372,12 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 		return errors.Wrapf(err, "error re-reading the backup VolumeSnapshotContent %s before retaining its snapshot", du.Name)
 	}
 	if fresh.DeletionTimestamp != nil {
+		if resumed && fresh.Spec.DeletionPolicy == snapshotv1api.VolumeSnapshotContentRetain && !hasRollbackMark(existing) {
+			// The predecessor's cleanup is deleting the content under Retain:
+			// the snapshot survives, the completion goes on.
+			log.Infof("The backup VolumeSnapshotContent %s is being deleted under Retain, the cleanup already ran", du.Name)
+			return r.renewRetainLeaseForCleanup(ctx, du, holder, log)
+		}
 		return errors.Errorf("the backup VolumeSnapshotContent %s is being deleted, not retaining its snapshot", du.Name)
 	}
 	held, err := r.dataUploadLeaseHeld(ctx, du, dataUploadRetainLeaseAnnotation, holder)
@@ -385,6 +419,12 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	// renewal means a rollback is running or ran: the callback must not
 	// continue, it fails the DataUpload and keeps the record, leaving the
 	// snapshot to the patch-back and the backup deletion.
+	return r.renewRetainLeaseForCleanup(ctx, du, holder, log)
+}
+
+// renewRetainLeaseForCleanup renews the completion side's mark, as the same
+// holder, to cover the bounded cleanup that follows the Retain patch.
+func (r *DataUploadReconciler) renewRetainLeaseForCleanup(ctx context.Context, du *velerov2alpha1api.DataUpload, holder string, log logrus.FieldLogger) error {
 	renewed, _, err := r.tryAcquireDataUploadLease(ctx, du, dataUploadRetainLeaseAnnotation, holder, csi.RetainedSnapshotDeletionTimeout+2*dataUploadLeaseCleanupMargin, log)
 	if err != nil {
 		return errors.Wrapf(err, "error renewing the retention lease of DataUpload %s for its cleanup", du.Name)
@@ -392,8 +432,48 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	if !renewed {
 		return errors.Errorf("another actor holds the retention lease of DataUpload %s, not retaining its snapshot for the cleanup", du.Name)
 	}
-
 	return nil
+}
+
+// resumeAfterRetainedCleanup handles a completion re-entered by a restarted
+// node-agent whose backup VolumeSnapshotContent is NotFound. With a record
+// already on the DataUpload, the predecessor recorded the snapshot, switched
+// the content to Retain and ran the exposer cleanup before it died, so the
+// snapshot survives and the completion goes on to Completed and the release:
+// it reports resumed after taking over the completion-side lease. Without a
+// record, or after a patch-back ever marked the DataUpload -- its deletion may
+// have removed the snapshot -- it reports not resumed and the caller fails the
+// DataUpload as before.
+func (r *DataUploadReconciler) resumeAfterRetainedCleanup(ctx context.Context, du *velerov2alpha1api.DataUpload, holder string, log logrus.FieldLogger) (bool, error) {
+	resumable := func() (bool, error) {
+		current := &velerov2alpha1api.DataUpload{}
+		if err := r.uncachedReader().Get(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, current); err != nil {
+			return false, errors.Wrap(err, "error reading the DataUpload to resume its completion")
+		}
+		return current.Status.RetainedCSIStorageSnapshot != nil && !hasRollbackMark(current), nil
+	}
+	if ok, err := resumable(); !ok || err != nil {
+		return false, err
+	}
+	if err := r.acquireRetainLease(ctx, du, holder, log); err != nil {
+		return true, err
+	}
+	// Re-read under the lease: a patch-back that marked the DataUpload in
+	// between leaves the decision to it.
+	if ok, err := resumable(); err != nil {
+		return true, err
+	} else if !ok {
+		return false, nil
+	}
+	log.Infof("The backup VolumeSnapshotContent %s is gone and DataUpload %s records its snapshot: the cleanup already ran under Retain, resuming the completion", du.Name, du.Name)
+	return true, r.renewRetainLeaseForCleanup(ctx, du, holder, log)
+}
+
+// hasRollbackMark reports whether a patch-back ever marked the DataUpload,
+// expired or not. The completion side never writes that mark.
+func hasRollbackMark(du *velerov2alpha1api.DataUpload) bool {
+	_, ok := du.Annotations[dataUploadRollbackLeaseAnnotation]
+	return ok
 }
 
 // acquireRetainLease acquires the completion side's lease mark for holder. A

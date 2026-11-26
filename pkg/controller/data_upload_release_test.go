@@ -433,3 +433,136 @@ func TestFullReadAfterUnfinishedParentReleasesOlderBase(t *testing.T) {
 	assert.Equal(t, map[string]bool{"snap-a": false, "snap-c": true}, sidecar.snapshots, "only the new base is left on the storage")
 	assert.Equal(t, []string{"RetainedSnapshotReleased"}, events.reasons)
 }
+
+// completionChainFixture creates the source PV of the volume vol-1 and a
+// completed parent DataUpload of that chain recorded an hour ago.
+func completionChainFixture(t *testing.T, r *DataUploadReconciler) {
+	t.Helper()
+	ctx := t.Context()
+	_, err := r.kubeClient.CoreV1().PersistentVolumeClaims("fake-ns").Create(ctx, &corev1api.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "fake-ns", Name: "test-pvc"},
+		Spec:       corev1api.PersistentVolumeClaimSpec{VolumeName: "pv-1"},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = r.kubeClient.CoreV1().PersistentVolumes().Create(ctx, &corev1api.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-1"},
+		Spec: corev1api.PersistentVolumeSpec{PersistentVolumeSource: corev1api.PersistentVolumeSource{
+			CSI: &corev1api.CSIPersistentVolumeSource{Driver: retentionDriver, VolumeHandle: "vol-1"},
+		}},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	parent := chainDU("parent-du", "vol-1", "parent-snap", velerov2alpha1api.DataUploadPhaseCompleted, time.Hour)
+	parent.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now().Add(-time.Hour)}
+	require.NoError(t, r.client.Create(ctx, parent))
+}
+
+// TestOnDataUploadCompletedIsReentrant proves the completion callback is safe
+// to re-enter for a restarted node-agent whose predecessor died inside it,
+// holding a renewed completion-side mark. A record already present is kept as
+// it is. A backup content that is gone while the record exists means the
+// exposer cleanup already ran under Retain, and so does a content being
+// deleted under Retain: the successor takes the mark over, writes Completed
+// and releases the older record of the chain. A gone content without a
+// record, or after a patch-back marked the DataUpload, still fails it.
+func TestOnDataUploadCompletedIsReentrant(t *testing.T) {
+	keptRecord := func() *velerov2alpha1api.RetainedCSIStorageSnapshot {
+		record := retentionRecord()
+		record.CSIVolumeHandle = "vol-1"
+		record.BaseCSISnapshotHandle = "kept-base"
+		return record
+	}
+	for _, tc := range []struct {
+		name          string
+		record        *velerov2alpha1api.RetainedCSIStorageSnapshot
+		vsc           func() *snapshotv1api.VolumeSnapshotContent
+		rollbackMark  bool
+		wantRetain    bool
+		wantCompleted bool
+	}{
+		{
+			name:          "died after the cleanup: content gone, record kept, Completed and release",
+			record:        keptRecord(),
+			wantCompleted: true,
+		},
+		{
+			name:   "died during the cleanup: content deleting under Retain, Completed and release",
+			record: keptRecord(),
+			vsc: func() *snapshotv1api.VolumeSnapshotContent {
+				vsc := retentionBackupVSC()
+				vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
+				vsc.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+				vsc.Finalizers = []string{"snapshot.storage.kubernetes.io/volumesnapshotcontent-bound-protection"}
+				return vsc
+			},
+			wantCompleted: true,
+		},
+		{
+			name:          "died after recording: content still Delete, record kept, retained and Completed",
+			record:        keptRecord(),
+			vsc:           retentionBackupVSC,
+			wantRetain:    true,
+			wantCompleted: true,
+		},
+		{
+			name: "content gone without a record still fails",
+		},
+		{
+			name:         "content gone after a patch-back marked the DataUpload still fails",
+			record:       keptRecord(),
+			rollbackMark: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := initDataUploaderReconciler()
+			require.NoError(t, err)
+			r.eventRecorder = &recordingEvents{}
+			ctx := t.Context()
+			completionChainFixture(t, r)
+
+			// The dead predecessor's mark, renewed for the cleanup.
+			start := r.Clock.Now()
+			deadMarkExpiry := start.Add(csi.RetainedSnapshotDeletionTimeout + 2*dataUploadLeaseCleanupMargin)
+			du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
+			du.Labels = map[string]string{velerov1api.BackupUIDLabel: "holder-uid", velerov1api.PVCUIDLabel: "pvc-1"}
+			du.Annotations = map[string]string{dataUploadRetainLeaseAnnotation: (&dataUploadLease{Holder: "node-1-dead", ExpiresAt: deadMarkExpiry}).String()}
+			if tc.rollbackMark {
+				du.Annotations[dataUploadRollbackLeaseAnnotation] = (&dataUploadLease{Holder: "node-2", ExpiresAt: start.Add(-time.Hour)}).String()
+			}
+			du.Status.RetainedCSIStorageSnapshot = tc.record
+			var vsc *snapshotv1api.VolumeSnapshotContent
+			if tc.vsc != nil {
+				vsc = tc.vsc()
+			}
+			createRetainedSnapshotObjects(t, r, du, vsc)
+			patches := &vscPatchRecorder{}
+			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+				patches.patches = append(patches.patches, string(action.(clientTesting.PatchAction).GetPatch()))
+				return false, nil, nil
+			})
+			watcher := &phaseAtVSCCreate{Client: r.client, watched: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}}
+			r.client = watcher
+			r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
+				velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
+			}
+
+			r.OnDataUploadCompleted(ctx, du.Namespace, du.Name, datapath.Result{Backup: datapath.BackupResult{SnapshotID: "fake-id"}})
+
+			assert.Equal(t, tc.wantRetain, patches.hasDeletionPolicy("Retain"), "only a content still Delete is switched to Retain")
+			updated := getDataUpload(t, r, du)
+			if !tc.wantCompleted {
+				assert.Equal(t, velerov2alpha1api.DataUploadPhaseFailed, updated.Status.Phase)
+				assert.Empty(t, watcher.phases, "a failed completion releases nothing")
+				return
+			}
+			assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updated.Status.Phase, "re-entry never fails the DataUpload")
+			assert.Equal(t, keptRecord(), updated.Status.RetainedCSIStorageSnapshot, "the record is kept as it is")
+			assert.Empty(t, updated.Status.Message)
+			assert.NotContains(t, updated.Annotations, dataUploadRetainLeaseAnnotation, "Completed clears the marks")
+			assert.False(t, r.Clock.Now().Before(deadMarkExpiry), "the successor waited the dead holder's mark out")
+			_, vscErr := getBackupVSC(t, r, du)
+			assert.True(t, apierrors.IsNotFound(vscErr), "the backup content is gone after the cleanup, got %v", vscErr)
+			assert.Equal(t, []velerov2alpha1api.DataUploadPhase{velerov2alpha1api.DataUploadPhaseCompleted}, watcher.phases,
+				"the release of the older chain record runs, after Completed")
+		})
+	}
+}

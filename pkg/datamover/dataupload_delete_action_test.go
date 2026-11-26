@@ -241,6 +241,9 @@ func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 		wantDeleted bool
 	}{
 		{
+			// Also the Completed DataUpload deleted through the API: the
+			// catch-up no longer sees its record, and the backup deletion
+			// reads it from the tarball.
 			name: "a record from the tarball alone is deleted",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
