@@ -831,7 +831,10 @@ func (r *DataUploadReconciler) events() kube.EventRecorder {
 // completed DataUpload of the same PVC carries no retention record, the base
 // snapshot was not retained -- the most common Case 2 cause, which the
 // driver's own error (Ceph RBD answers a deleted base with an internal error)
-// cannot name. The uploader's reason stays as the detail.
+// cannot name. When the parent the uploader took is the repository snapshot
+// of a movement that ended failed or canceled, whose storage snapshot the
+// patch-back removed, the reason names that DataUpload instead of the
+// previous completed one. The uploader's reason stays as the detail.
 func (r *DataUploadReconciler) fallbackReasonOf(ctx context.Context, du *velerov2alpha1api.DataUpload, result datapath.BackupResult, log logrus.FieldLogger) string {
 	if !result.FallbackFull {
 		return ""
@@ -844,6 +847,17 @@ func (r *DataUploadReconciler) fallbackReasonOf(ctx context.Context, du *velerov
 		strings.HasPrefix(reason, block.FallbackReasonNoParent) ||
 		strings.HasPrefix(reason, block.FallbackReasonCBTUnavailable) {
 		return reason
+	}
+
+	// The block uploader takes the newest repository snapshot of the volume as
+	// the parent whatever the DataUpload's phase, so a movement that ended
+	// failed or canceled after its repository snapshot was committed is the
+	// parent, and its own storage snapshot was removed by the patch-back.
+	// Choosing a parent whose base is still retained is Open Issue 5; the
+	// reason names the parent actually used.
+	if parent := r.parentRepositorySnapshotOwner(ctx, du, log); parent != nil && parent.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted {
+		return fmt.Sprintf("parent repository snapshot %s belongs to DataUpload %s (%s), whose snapshot was not retained; %s",
+			parent.Status.SnapshotID, parent.Name, parent.Status.Phase, reason)
 	}
 
 	previous := r.previousCompletedDataUpload(ctx, du, log)
@@ -861,6 +875,40 @@ func (r *DataUploadReconciler) fallbackReasonOf(ctx context.Context, du *velerov
 	}
 	return fmt.Sprintf("base snapshot %s of the previous backup (DataUpload %s) was retained but could not be used; %s",
 		previous.Status.RetainedCSIStorageSnapshot.CSISnapshotHandle, previous.Name, reason)
+}
+
+// parentRepositorySnapshotOwner returns the DataUpload whose repository
+// snapshot the block uploader took as the parent of du, mirroring its choice
+// (pkg/uploader/block/snapshot.go findPreviousSnapshot: the newest repository
+// snapshot of the source by start time, whatever the outcome of the movement
+// that wrote it): among the velero-block DataUploads of the same PVC and
+// backup storage location that recorded a repository snapshot and started
+// before du, the one that started last. Nil when there is none or the lookup
+// fails; the lookup only refines a diagnostic.
+func (r *DataUploadReconciler) parentRepositorySnapshotOwner(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) *velerov2alpha1api.DataUpload {
+	pvcUID := du.Labels[velerov1api.PVCUIDLabel]
+	if pvcUID == "" || du.Status.StartTimestamp == nil {
+		return nil
+	}
+	list := &velerov2alpha1api.DataUploadList{}
+	if err := r.client.List(ctx, list, crclient.InNamespace(du.Namespace), crclient.MatchingLabels{velerov1api.PVCUIDLabel: pvcUID}); err != nil {
+		log.WithError(err).Debug("Failed to list the DataUploads of the PVC for the fallback reason")
+		return nil
+	}
+	var parent *velerov2alpha1api.DataUpload
+	for i := range list.Items {
+		candidate := &list.Items[i]
+		if candidate.Name == du.Name || candidate.Status.SnapshotID == "" || candidate.Status.StartTimestamp == nil ||
+			!datamover.IsVeleroBlockDataMover(candidate.Spec.DataMover) ||
+			candidate.Spec.BackupStorageLocation != du.Spec.BackupStorageLocation ||
+			!candidate.Status.StartTimestamp.Before(du.Status.StartTimestamp) {
+			continue
+		}
+		if parent == nil || candidate.Status.StartTimestamp.After(parent.Status.StartTimestamp.Time) {
+			parent = candidate
+		}
+	}
+	return parent
 }
 
 // previousCompletedDataUpload returns the most recently completed DataUpload

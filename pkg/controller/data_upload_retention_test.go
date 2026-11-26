@@ -1293,9 +1293,10 @@ func TestErrorOutAfterUploadPersistsSnapshotID(t *testing.T) {
 // fallback reason (design, Implementation: diagnostics): a driver-side failure
 // is named "base snapshot not retained" when the previous completed
 // DataUpload of the PVC carries no retention record, kept as the retained
-// handle's failure when it does, and passed through for a missing parent or
-// an absent CBT service, where the previous backup's retention is beside the
-// point.
+// handle's failure when it does, names the unfinished DataUpload whose
+// committed repository snapshot the uploader took as the parent, and is passed
+// through for a missing parent or an absent CBT service, where the previous
+// backup's retention is beside the point.
 func TestFallbackReasonOf(t *testing.T) {
 	start := metav1.NewTime(time.Now())
 	earlier := metav1.NewTime(start.Add(-time.Hour))
@@ -1313,6 +1314,14 @@ func TestFallbackReasonOf(t *testing.T) {
 	}
 	current := newDU("current", velerov2alpha1api.DataUploadPhaseInProgress, nil, nil)
 	current.Status.StartTimestamp = &start
+	// committed stamps the repository snapshot the movement wrote and when it
+	// started, which is what the uploader's parent search orders by.
+	committed := func(du *velerov2alpha1api.DataUpload, snapshotID string, startedAgo time.Duration) *velerov2alpha1api.DataUpload {
+		du.Status.SnapshotID = snapshotID
+		du.Status.StartTimestamp = ptr.To(metav1.NewTime(start.Add(-startedAgo)))
+		return du
+	}
+	retained := &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h-1", Driver: retentionDriver}
 
 	tests := []struct {
 		name     string
@@ -1354,6 +1363,43 @@ func TestFallbackReasonOf(t *testing.T) {
 				newDU("failed", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil),
 			},
 			want: "base snapshot not retained by the previous backup (DataUpload prev); " + block.FallbackReasonDriverError + ": rbd",
+		},
+		{
+			// A movement that failed after its repository snapshot was
+			// committed is the newest repository snapshot, so the uploader
+			// took it as the parent; its storage snapshot is gone, while the
+			// previous completed backup's base is retained but unused.
+			name:   "an unfinished DataUpload with a committed repository snapshot is named as the parent",
+			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
+			previous: []*velerov2alpha1api.DataUpload{
+				committed(newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, ptr.To(metav1.NewTime(start.Add(-90*time.Minute))), retained.DeepCopy()), "repo-prev", 2*time.Hour),
+				committed(newDU("failed", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil), "repo-failed", 80*time.Minute),
+			},
+			want: "parent repository snapshot repo-failed belongs to DataUpload failed (Failed), whose snapshot was not retained; " + block.FallbackReasonDriverError + ": rbd",
+		},
+		{
+			name:   "a canceled one is named the same way",
+			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
+			previous: []*velerov2alpha1api.DataUpload{
+				committed(newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, ptr.To(metav1.NewTime(start.Add(-90*time.Minute))), retained.DeepCopy()), "repo-prev", 2*time.Hour),
+				committed(newDU("canceled", velerov2alpha1api.DataUploadPhaseCanceled, &earlier, nil), "repo-canceled", 80*time.Minute),
+			},
+			want: "parent repository snapshot repo-canceled belongs to DataUpload canceled (Canceled), whose snapshot was not retained; " + block.FallbackReasonBaseGone + ": not found",
+		},
+		{
+			// The newest repository snapshot is the completed backup's: the
+			// previous-backup reasoning applies; an unfinished movement that
+			// started after the current one, or wrote no repository snapshot,
+			// is not the parent.
+			name:   "a completed newest parent keeps the previous-backup reason",
+			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
+			previous: []*velerov2alpha1api.DataUpload{
+				committed(newDU("failed-before", velerov2alpha1api.DataUploadPhaseFailed, ptr.To(metav1.NewTime(start.Add(-2*time.Hour))), nil), "repo-failed-before", 3*time.Hour),
+				committed(newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, retained.DeepCopy()), "repo-prev", 2*time.Hour),
+				newDU("failed-no-snapshot", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil),
+				committed(newDU("failed-after", velerov2alpha1api.DataUploadPhaseFailed, &later, nil), "repo-failed-after", -time.Minute),
+			},
+			want: "base snapshot h-1 of the previous backup (DataUpload prev) was retained but could not be used; " + block.FallbackReasonBaseGone + ": not found",
 		},
 		{
 			name:   "an empty uploader reason still records the fall back",

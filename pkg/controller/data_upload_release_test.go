@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientTesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/velero-io/velero/pkg/datapath"
 	"github.com/velero-io/velero/pkg/exposer"
 	velerotest "github.com/velero-io/velero/pkg/test"
+	"github.com/velero-io/velero/pkg/uploader/block"
 	"github.com/velero-io/velero/pkg/util/csi"
 )
 
@@ -387,4 +389,47 @@ func TestOnDataUploadCompletedTakesOverDeadHolderLease(t *testing.T) {
 	assert.False(t, r.Clock.Now().Before(start.Add(dataUploadLeaseDuration)), "the successor waited the dead holder's mark out")
 	assert.Equal(t, []velerov2alpha1api.DataUploadPhase{velerov2alpha1api.DataUploadPhaseCompleted}, watcher.phases,
 		"the release of the parent runs, after Completed")
+}
+
+// TestFullReadAfterUnfinishedParentReleasesOlderBase proves that the full read
+// forced by an unfinished parent leaks nothing: a movement failed after its
+// repository snapshot was committed, so it is the next backup's parent while
+// its own storage snapshot is gone and the older completed backup's base sits
+// unused. The next backup reads in full, its reason names the unfinished
+// DataUpload, and its completion releases the older retained base through the
+// catch-up, leaving only its own snapshot on the storage.
+func TestFullReadAfterUnfinishedParentReleasesOlderBase(t *testing.T) {
+	shortRelease(t)
+	now := time.Now()
+	retainedParent := chainDU("du-a", "vol-1", "snap-a", velerov2alpha1api.DataUploadPhaseCompleted, 2*time.Hour)
+	retainedParent.Spec.DataMover = "velero-block"
+	retainedParent.Status.SnapshotID = "repo-a"
+	retainedParent.Status.StartTimestamp = ptr.To(metav1.NewTime(now.Add(-3 * time.Hour)))
+	// The patch-back removed the failed movement's snapshot; its record was
+	// never written, as when the node-agent died recording it.
+	unfinished := chainDU("du-b", "vol-1", "", velerov2alpha1api.DataUploadPhaseFailed, time.Hour)
+	unfinished.Spec.DataMover = "velero-block"
+	unfinished.Status.RetainedCSIStorageSnapshot = nil
+	unfinished.Status.SnapshotID = "repo-b"
+	unfinished.Status.StartTimestamp = ptr.To(metav1.NewTime(now.Add(-90 * time.Minute)))
+	full := chainDU("du-c", "vol-1", "snap-c", velerov2alpha1api.DataUploadPhaseCompleted, 0)
+	full.Spec.DataMover = "velero-block"
+	full.Status.StartTimestamp = ptr.To(metav1.NewTime(now.Add(-10 * time.Minute)))
+	sidecar := &releaseSidecar{snapshots: map[string]bool{"snap-a": true, "snap-c": true}}
+	c := sidecar.client(t, retainedParent, unfinished, full)
+	r, events := releaseReconciler(t, c)
+
+	reason := r.fallbackReasonOf(t.Context(), full, datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"}, velerotest.NewLogger())
+	assert.Equal(t, "parent repository snapshot repo-b belongs to DataUpload du-b (Failed), whose snapshot was not retained; "+block.FallbackReasonDriverError+": rbd", reason)
+	assert.NotContains(t, reason, "was retained but could not be used")
+
+	r.releaseOlderRetainedSnapshots(t.Context(), types.NamespacedName{Namespace: full.Namespace, Name: full.Name}, velerotest.NewLogger())
+
+	assert.Equal(t, []string{"snap-a"}, sidecar.deleteCalls, "the older retained base is released by the full backup's catch-up")
+	record := duRecord(t, c, "du-a")
+	assert.True(t, record.Released)
+	assert.Equal(t, "du-c-uid", record.ReleasedBy)
+	assert.False(t, duRecord(t, c, "du-c").Released, "the full backup's own snapshot is the new base")
+	assert.Equal(t, map[string]bool{"snap-a": false, "snap-c": true}, sidecar.snapshots, "only the new base is left on the storage")
+	assert.Equal(t, []string{"RetainedSnapshotReleased"}, events.reasons)
 }
