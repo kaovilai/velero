@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
@@ -28,6 +29,9 @@ import (
 type DataUploadDeleteAction struct {
 	logger logrus.FieldLogger
 	client client.Client
+	// resourceTimeout bounds the wait for a retained snapshot's deletion: the
+	// --resource-timeout of the server that runs the action.
+	resourceTimeout time.Duration
 
 	// timedOut records the backups whose deletion already waited out the
 	// bound once: the action runs inside the backup-deletion controller's
@@ -138,7 +142,7 @@ func (d *DataUploadDeleteAction) deleteRetainedSnapshot(bak *velerov1.Backup, du
 	noWait := d.timedOut[bak.UID]
 	d.mu.Unlock()
 	log.Infof("Deleting the retained snapshot %s of driver %s", record.CSISnapshotHandle, record.Driver)
-	err := csi.DeleteRetainedSnapshot(ctx, d.client, d.client, record, bak.UID, csi.RetainedSnapshotDeletionOptions{NoWait: noWait}, log)
+	err := csi.DeleteRetainedSnapshot(ctx, d.client, d.client, record, bak.UID, csi.RetainedSnapshotDeletionOptions{Timeout: d.resourceTimeout, NoWait: noWait}, log)
 	var pending *csi.RetainedSnapshotDeletionPendingError
 	if errors.As(err, &pending) && !noWait {
 		d.mu.Lock()
@@ -219,9 +223,13 @@ func genConfigmap(bak *velerov1.Backup, du velerov2alpha1.DataUpload) *corev1api
 	}
 }
 
-func NewDataUploadDeleteAction(logger logrus.FieldLogger, client client.Client) *DataUploadDeleteAction {
+// NewDataUploadDeleteAction returns the DataUpload delete item action; a
+// retained snapshot's deletion is bounded by resourceTimeout, the server's
+// --resource-timeout, or the helper's default when zero.
+func NewDataUploadDeleteAction(logger logrus.FieldLogger, client client.Client, resourceTimeout time.Duration) *DataUploadDeleteAction {
 	return &DataUploadDeleteAction{
-		logger: logger,
-		client: client,
+		logger:          logger,
+		client:          client,
+		resourceTimeout: resourceTimeout,
 	}
 }

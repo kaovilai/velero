@@ -81,7 +81,7 @@ func newCompletedDataUpload(name, ownerBackup string) *velerov2alpha1.DataUpload
 }
 
 func TestDataUploadDeleteActionAppliesTo(t *testing.T) {
-	a := NewDataUploadDeleteAction(logrus.StandardLogger(), nil)
+	a := NewDataUploadDeleteAction(logrus.StandardLogger(), nil, 0)
 	selector, err := a.AppliesTo()
 	require.NoError(t, err)
 	require.Equal(t, velero.ResourceSelector{IncludedResources: []string{"datauploads.velero.io"}}, selector)
@@ -127,7 +127,7 @@ func TestDataUploadDeleteActionExecute(t *testing.T) {
 			crClient := velerotest.NewFakeControllerRuntimeClient(t)
 			logger, hook := logrustest.NewNullLogger()
 			logger.SetLevel(logrus.DebugLevel)
-			action := NewDataUploadDeleteAction(logger, crClient)
+			action := NewDataUploadDeleteAction(logger, crClient, 0)
 
 			du := newCompletedDataUpload(tc.duName, tc.duOwnerBackup)
 			backup := builder.ForBackup("velero", tc.executingBackup).StorageLocation("default").Result()
@@ -294,7 +294,7 @@ func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 			}
 			sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: !tc.gone}}
 			crClient := sidecar.client(t, objs...)
-			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
 
 			require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, tarball), Backup: backup}))
 
@@ -324,7 +324,7 @@ func TestDataUploadDeleteActionUnknownDriver(t *testing.T) {
 
 	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}}
 	crClient := sidecar.client(t)
-	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
 
 	require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
 	contents := &snapshotv1api.VolumeSnapshotContentList{}
@@ -358,7 +358,7 @@ func TestDataUploadDeleteActionRetainedSnapshotFailure(t *testing.T) {
 
 	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true, "second-snap": true}, driverFails: true}
 	crClient := sidecar.client(t)
-	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
 
 	var pending *csi.RetainedSnapshotDeletionPendingError
 	err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, first), Backup: backup})
@@ -379,9 +379,31 @@ func TestDataUploadDeleteActionRetainedSnapshotFailure(t *testing.T) {
 
 	// A retry of the backup deletion is a new request, a new action.
 	sidecar.driverFails = false
-	retry := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+	retry := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
 	require.NoError(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, first), Backup: backup}))
 	require.NoError(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, second), Backup: backup}))
 	assert.False(t, sidecar.snapshots[deleteTestHandle])
 	assert.False(t, sidecar.snapshots["second-snap"])
+}
+
+// TestDataUploadDeleteActionBoundIsTheResourceTimeout proves the wait for a
+// retained snapshot's deletion is bounded by the server's --resource-timeout
+// handed to the action, not the helper's ten-minute default.
+func TestDataUploadDeleteActionBoundIsTheResourceTimeout(t *testing.T) {
+	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
+	backup.UID = "daily-uid"
+	du := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
+	du.Spec.DataMover = "velero-block"
+	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}, driverFails: true}
+	resourceTimeout := 300 * time.Millisecond
+	action := NewDataUploadDeleteAction(velerotest.NewLogger(), sidecar.client(t), resourceTimeout)
+
+	start := time.Now()
+	err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup})
+	var pending *csi.RetainedSnapshotDeletionPendingError
+	require.ErrorAs(t, err, &pending)
+	assert.Equal(t, resourceTimeout, pending.Waited)
+	assert.Less(t, time.Since(start), 30*time.Second)
+	assert.Contains(t, err.Error(), "300ms")
 }

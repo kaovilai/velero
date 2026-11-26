@@ -17,6 +17,8 @@ limitations under the License.
 package plugin
 
 import (
+	"time"
+
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -132,7 +134,7 @@ func NewCommand(f client.Factory) *cobra.Command {
 				).
 				RegisterDeleteItemAction(
 					"velero.io/dataupload-delete",
-					newDateUploadDeleteItemAction(f),
+					newDateUploadDeleteItemAction(f, config.ResourceTimeout),
 				).
 				RegisterDeleteItemAction(
 					"velero.io/csi-volumesnapshotcontent-delete",
@@ -387,13 +389,13 @@ func newDataUploadRetrieveAction(f client.Factory) plugincommon.HandlerInitializ
 	}
 }
 
-func newDateUploadDeleteItemAction(f client.Factory) plugincommon.HandlerInitializer {
+func newDateUploadDeleteItemAction(f client.Factory, resourceTimeout time.Duration) plugincommon.HandlerInitializer {
 	return func(logger logrus.FieldLogger) (any, error) {
 		client, err := f.KubebuilderClient()
 		if err != nil {
 			return nil, err
 		}
-		return datamover.NewDataUploadDeleteAction(logger, client), nil
+		return datamover.NewDataUploadDeleteAction(logger, client, resourceTimeout), nil
 	}
 }
 
