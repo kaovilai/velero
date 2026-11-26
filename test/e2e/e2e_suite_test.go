@@ -753,6 +753,12 @@ var _ = Describe(
 )
 
 var _ = Describe(
+	"Base snapshot retention of the block data mover: completion without retention",
+	Label("RetainedSnapshotDegraded", "Backups", "Deletion"),
+	RetainedSnapshotDegradedTest,
+)
+
+var _ = Describe(
 	"Base snapshot retention of the block data mover: rolling-base holder deletion",
 	Label("RetainedSnapshotHolder", "Backups", "Deletion"),
 	RetainedSnapshotHolderTest,

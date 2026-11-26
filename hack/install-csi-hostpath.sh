@@ -35,6 +35,12 @@ ATTACHER_VERSION="${ATTACHER_VERSION:-v4.12.0}"
 RESIZER_VERSION="${RESIZER_VERSION:-v2.2.1}"
 HEALTH_MONITOR_VERSION="${HEALTH_MONITOR_VERSION:-v0.18.0}"
 
+# Deploys the external-snapshot-metadata sidecar and its SnapshotMetadataService,
+# so the velero-block data mover can compute changed blocks against a base
+# snapshot instead of reading every backup in full.
+ENABLE_SNAPSHOT_METADATA="${ENABLE_SNAPSHOT_METADATA:-false}"
+SNAPSHOT_METADATA_VERSION="${SNAPSHOT_METADATA_VERSION:-v1.0.0}"
+
 # The StorageClass the tests can be pointed at with --storage-class.
 STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-csi-hostpath-sc}"
 
@@ -86,9 +92,45 @@ $KUBECTL apply -f "${snapshotter_raw}/deploy/kubernetes/csi-snapshotter/rbac-csi
 $KUBECTL apply -f "https://raw.githubusercontent.com/kubernetes-csi/external-resizer/${RESIZER_VERSION}/deploy/kubernetes/rbac.yaml"
 $KUBECTL apply -f "https://raw.githubusercontent.com/kubernetes-csi/external-health-monitor/${HEALTH_MONITOR_VERSION}/deploy/kubernetes/external-health-monitor-controller/rbac.yaml"
 
+plugin_yaml="$(curl -fsSL "${hostpath_raw}/deploy/${HOSTPATH_DEPLOY_DIR}/hostpath/csi-hostpath-plugin.yaml")"
+if [ "${ENABLE_SNAPSHOT_METADATA}" = "true" ]; then
+  # The same components and plugin edits as csi-driver-host-path's own
+  # deploy/util/deploy-hostpath.sh with SNAPSHOT_METADATA_TESTS=true.
+  metadata_raw="https://raw.githubusercontent.com/kubernetes-csi/external-snapshot-metadata/${SNAPSHOT_METADATA_VERSION}"
+  echo "==> Installing the snapshot metadata service (external-snapshot-metadata ${SNAPSHOT_METADATA_VERSION})"
+  $KUBECTL apply -f "${metadata_raw}/client/config/crd/cbt.storage.k8s.io_snapshotmetadataservices.yaml"
+  $KUBECTL wait --for=condition=established --timeout=60s crd/snapshotmetadataservices.cbt.storage.k8s.io
+  $KUBECTL apply -f "${metadata_raw}/deploy/snapshot-metadata-cluster-role.yaml"
+  $KUBECTL apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: csi-hostpathplugin-snapshot-metadata-cluster-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-snapshot-metadata-runner
+subjects:
+- kind: ServiceAccount
+  name: csi-hostpathplugin-sa
+  namespace: default
+EOF
+  for component in csi-snapshot-metadata-tls-secret snapshotmetadataservice csi-snapshot-metadata-service; do
+    $KUBECTL apply -f "${metadata_raw}/deploy/example/csi-driver/testdata/${component}.yaml"
+  done
+  work_dir="$(mktemp -d)"
+  trap 'rm -rf "${work_dir}"' EXIT
+  curl -fsSL "${hostpath_raw}/deploy/${HOSTPATH_DEPLOY_DIR}/hostpath/csi-snapshot-metadata-sidecar.patch" -o "${work_dir}/sidecar.patch"
+  printf '%s\n' "${plugin_yaml}" > "${work_dir}/plugin.yaml"
+  sed -i -e "/# end csi containers/r ${work_dir}/sidecar.patch" "${work_dir}/plugin.yaml"
+  sed -i -e 's/# end csi volumes/- name: csi-snapshot-metadata-server-certs\n          secret:\n            secretName: csi-snapshot-metadata-certs\n        # end csi volumes/' "${work_dir}/plugin.yaml"
+  sed -i -e 's/# end hostpath args/- \"--enable-snapshot-metadata\"\n            # end hostpath args/' "${work_dir}/plugin.yaml"
+  plugin_yaml="$(cat "${work_dir}/plugin.yaml")"
+fi
+
 echo "==> Installing csi-driver-host-path ${HOSTPATH_VERSION} (${HOSTPATH_DEPLOY_DIR})"
 $KUBECTL apply -f "${hostpath_raw}/deploy/${HOSTPATH_DEPLOY_DIR}/hostpath/csi-hostpath-driverinfo.yaml"
-$KUBECTL apply -f "${hostpath_raw}/deploy/${HOSTPATH_DEPLOY_DIR}/hostpath/csi-hostpath-plugin.yaml"
+printf '%s\n' "${plugin_yaml}" | $KUBECTL apply -f -
 if [ "${ENABLE_VOLUME_GROUP_SNAPSHOT}" = "true" ]; then
   # Look the container up by name: its index moves between releases. Tolerate a
   # miss here rather than letting the pipeline's exit status end the script: a

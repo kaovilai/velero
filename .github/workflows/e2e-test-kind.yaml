@@ -376,6 +376,10 @@ jobs:
           sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
       - name: Install CSI snapshot support
         run: ./hack/install-csi-hostpath.sh
+        env:
+          # Base snapshot retention releases a base only after a changed-block
+          # delta, which needs the snapshot metadata service.
+          ENABLE_SNAPSHOT_METADATA: ${{ contains(matrix.labels, 'RetainedSnapshot') }}
         timeout-minutes: 10
 
       - name: Fetch built CLI
