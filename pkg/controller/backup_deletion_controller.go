@@ -275,21 +275,6 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			log.Info("Cleaning up CSI volumesnapshots")
 			r.deleteCSIVolumeSnapshotsIfAny(ctx, backup, log)
 
-			// Without the tarball the DataUpload delete action never runs, so
-			// the local DataUploads are the only source of the retained
-			// snapshots the rolling base did not release yet. They are
-			// deleted here, synchronously, before the DataUploads and the
-			// repository data; a failure fails the request the same way a
-			// failed delete action does, so the backup stays deletable on
-			// retry.
-			if isTarballNotFoundError(err) && boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
-				if err := r.deleteLocalRetainedSnapshots(ctx, backup, log); err != nil {
-					log.WithError(err).Error("Error deleting the retained snapshots of the backup")
-					err2 := r.patchDeleteBackupRequestWithError(ctx, dbr, errors.Wrap(err, "error deleting the retained snapshots"))
-					return ctrl.Result{}, err2
-				}
-			}
-
 			// If the tarball simply does not exist (HTTP 404 / not found), the download
 			// failure is permanent and not retryable, so we let deletion proceed.
 			// For transient errors (throttling, auth failures, network issues), record
@@ -543,48 +528,6 @@ func (r *backupDeletionReconciler) deleteExistingDeletionRequests(ctx context.Co
 		}
 	}
 	return errs
-}
-
-// deleteLocalRetainedSnapshots deletes the retained snapshots recorded on the
-// backup's local DataUploads that the rolling base did not release yet. It is
-// the offline-cleanup step of a backup whose tarball is gone: the DataUpload
-// delete action, which handles them otherwise, runs on the tarball's
-// DataUploads only. Like the delete action, the request waits out the bound at
-// most once; the records after the first timeout are deleted without waiting,
-// and the first error is returned.
-func (r *backupDeletionReconciler) deleteLocalRetainedSnapshots(ctx context.Context, backup *velerov1api.Backup, log logrus.FieldLogger) error {
-	duList := &velerov2alpha1.DataUploadList{}
-	if err := r.Client.List(ctx, duList, &client.ListOptions{
-		Namespace: backup.Namespace,
-		LabelSelector: labels.SelectorFromSet(map[string]string{
-			velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
-		}),
-	}); err != nil {
-		return errors.Wrap(err, "error listing the datauploads of the backup")
-	}
-	var firstErr error
-	noWait := false
-	for i := range duList.Items {
-		record := duList.Items[i].Status.RetainedCSIStorageSnapshot
-		if record == nil || record.Released {
-			continue
-		}
-		duLog := log.WithField("dataupload", duList.Items[i].Name)
-		duLog.Infof("Deleting the retained snapshot %s of driver %s", record.CSISnapshotHandle, record.Driver)
-		err := csi.DeleteRetainedSnapshot(ctx, r.Client, r.Client, record, backup.UID, csi.RetainedSnapshotDeletionOptions{NoWait: noWait}, duLog)
-		if err == nil {
-			continue
-		}
-		var pending *csi.RetainedSnapshotDeletionPendingError
-		if errors.As(err, &pending) {
-			noWait = true
-		}
-		duLog.WithError(err).Error("Error deleting the retained snapshot")
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }
 
 // deleteCSIVolumeSnapshotsIfAny clean up the CSI snapshots created by the backup, this should be called when the backup is failed

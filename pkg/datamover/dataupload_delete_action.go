@@ -107,29 +107,18 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 	return nil
 }
 
-// deleteRetainedSnapshot deletes the retained snapshot of a DataUpload from the
-// backup tarball, unless the rolling base already released it. The local
-// DataUpload of the same name, when it still exists, wins over the tarball's
-// copy: the tarball was written when the backup completed, and a later backup
-// of the volume marks the record released on the local DataUpload only. A
-// record from the tarball alone, e.g. on a cluster the backup was synced to,
-// is deleted as recorded; a driver that reports a gone snapshot as success
-// completes. A record naming a driver the cluster does not run is skipped with
+// deleteRetainedSnapshot deletes the retained snapshot a DataUpload of the
+// backup tarball records. The tarball is the only source: no DataUpload in the
+// cluster is read. A snapshot a later backup already released is gone, and
+// deleting it again succeeds -- the helper seeds the content status, the CSI
+// snapshotter issues DeleteSnapshot, and the CSI spec requires success for a
+// snapshot that does not exist. A record naming a driver the cluster does not run is skipped with
 // a Warning event on the Backup, and its handle stays in the tarball for
 // manual cleanup. The helper's error is returned unchanged.
 func (d *DataUploadDeleteAction) deleteRetainedSnapshot(bak *velerov1.Backup, du *velerov2alpha1.DataUpload) error {
 	ctx := context.Background()
 	record := du.Status.RetainedCSIStorageSnapshot
-	local := &velerov2alpha1.DataUpload{}
-	switch err := d.client.Get(ctx, client.ObjectKey{Namespace: du.Namespace, Name: du.Name}, local); {
-	case err == nil:
-		if local.Status.RetainedCSIStorageSnapshot != nil && local.Status.RetainedCSIStorageSnapshot.Released {
-			return nil
-		}
-	case !apierrors.IsNotFound(err):
-		return errors.Wrapf(err, "error getting the local DataUpload %s/%s", du.Namespace, du.Name)
-	}
-	if record == nil || record.Released || record.CSISnapshotHandle == "" {
+	if record == nil || record.CSISnapshotHandle == "" {
 		return nil
 	}
 	log := d.logger.WithField("dataupload", du.Namespace+"/"+du.Name)

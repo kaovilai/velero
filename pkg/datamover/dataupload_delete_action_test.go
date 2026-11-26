@@ -214,7 +214,7 @@ func (f *fakeSidecar) client(t *testing.T, objs ...runtime.Object) crclient.Clie
 }
 
 func retainedRecord(handle, driver string) *velerov2alpha1.RetainedCSIStorageSnapshot {
-	return &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: handle, Driver: driver, CSIVolumeHandle: "vol-1"}
+	return &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: handle, Driver: driver}
 }
 
 func shortenDeletionBound(t *testing.T) {
@@ -225,10 +225,11 @@ func shortenDeletionBound(t *testing.T) {
 }
 
 // TestDataUploadDeleteActionDeletesRetainedSnapshot proves the synchronous
-// deletion of a retained snapshot with its backup: an unreleased record is
-// deleted through the static content before the repository data; a local
-// released record wins over the tarball's unreleased copy, and a record from
-// the tarball alone, or with an unreleased local copy, is deleted.
+// deletion of a retained snapshot with its backup: the record of every
+// DataUpload in the tarball is deleted through the static content before the
+// repository data; no DataUpload in the cluster is read; a snapshot that is
+// already gone -- released by a later backup, or never retained -- deletes
+// successfully.
 func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 	shortenDeletionBound(t)
 	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
@@ -237,21 +238,21 @@ func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 	tests := []struct {
 		name        string
 		tarball     func(*velerov2alpha1.DataUpload)
-		local       func(*velerov2alpha1.DataUpload)
+		local       bool
+		gone        bool
 		wantDeleted bool
 	}{
 		{
 			// Also the Completed DataUpload deleted through the API: the
-			// catch-up no longer sees its record, and the backup deletion
-			// reads it from the tarball.
-			name: "a record from the tarball alone is deleted",
+			// tarball still carries its record.
+			name: "a record from the tarball is deleted",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
 			},
 			wantDeleted: true,
 		},
 		{
-			name: "a failed DataUpload's surviving record is deleted too",
+			name: "a failed DataUpload's record is deleted too",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.Phase = velerov2alpha1.DataUploadPhaseFailed
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
@@ -259,32 +260,20 @@ func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 			wantDeleted: true,
 		},
 		{
-			name: "a local released record wins over the tarball's unreleased copy",
+			name: "the local DataUpload is not read: its missing record changes nothing",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
 			},
-			local: func(du *velerov2alpha1.DataUpload) {
-				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-				du.Status.RetainedCSIStorageSnapshot.Released = true
-				du.Status.RetainedCSIStorageSnapshot.ReleasedBy = "later-uid"
-			},
-		},
-		{
-			name: "an unreleased local record means the snapshot is deleted",
-			tarball: func(du *velerov2alpha1.DataUpload) {
-				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-			},
-			local: func(du *velerov2alpha1.DataUpload) {
-				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-			},
+			local:       true,
 			wantDeleted: true,
 		},
 		{
-			name: "a released record in the tarball is skipped",
+			name: "a snapshot already gone deletes successfully",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-				du.Status.RetainedCSIStorageSnapshot.Released = true
 			},
+			gone:        true,
+			wantDeleted: true,
 		},
 		{
 			name:    "a DataUpload without a record deletes nothing",
@@ -298,12 +287,12 @@ func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 			tarball.Spec.DataMover = "velero-block"
 			tc.tarball(tarball)
 			var objs []runtime.Object
-			if tc.local != nil {
+			if tc.local {
 				local := tarball.DeepCopy()
-				tc.local(local)
+				local.Status.RetainedCSIStorageSnapshot = nil
 				objs = append(objs, local)
 			}
-			sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}}
+			sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: !tc.gone}}
 			crClient := sidecar.client(t, objs...)
 			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
 

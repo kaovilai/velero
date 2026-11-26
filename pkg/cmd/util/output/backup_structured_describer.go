@@ -326,7 +326,6 @@ func describeBackupVolumesInSF(ctx context.Context, kbClient kbclient.Client, ba
 
 	describeNativeSnapshotsInSF(details, nativeSnapshots, backupVolumes)
 
-	overlayRetainedSnapshotRelease(ctx, kbClient, backup, csiSnapshots)
 	describeCSISnapshotsInSF(details, csiSnapshots, backupVolumes, legacyInfoSource)
 
 	describePodVolumeBackupsInSF(podVolumeBackupCRs, details, backupVolumes)

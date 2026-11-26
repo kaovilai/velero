@@ -25,16 +25,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	"github.com/velero-io/velero/internal/volume"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
-	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/builder"
 	"github.com/velero-io/velero/pkg/itemoperation"
-	velerotest "github.com/velero-io/velero/pkg/test"
 )
 
 func TestDescribeUploaderConfig(t *testing.T) {
@@ -1026,27 +1023,4 @@ func TestDescribeDataMovementRetentionAndFallback(t *testing.T) {
 			assert.Equal(t, tc.expect, d.buf.String())
 		})
 	}
-}
-
-// TestOverlayRetainedSnapshotRelease proves describe reports the rolling-base
-// release from the local DataUpload record, which a later backup of the chain
-// updates after this backup's metadata was written.
-func TestOverlayRetainedSnapshotRelease(t *testing.T) {
-	backup := builder.ForBackup("velero", "bak").Result()
-	backup.UID = "bak-uid"
-	du := &velerov2alpha1api.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "du-1", Labels: map[string]string{velerov1api.BackupUIDLabel: "bak-uid"}},
-		Status: velerov2alpha1api.DataUploadStatus{RetainedCSIStorageSnapshot: &velerov2alpha1api.RetainedCSIStorageSnapshot{
-			CSISnapshotHandle: "h-1", Driver: "hostpath.csi.k8s.io", Released: true, ReleasedBy: "later-uid",
-		}},
-	}
-	kbClient := velerotest.NewFakeControllerRuntimeClient(t, du)
-	released := &volume.BackupVolumeInfo{SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{RetainedCSISnapshotHandle: "h-1"}}
-	held := &volume.BackupVolumeInfo{SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{RetainedCSISnapshotHandle: "h-2"}}
-
-	overlayRetainedSnapshotRelease(t.Context(), kbClient, backup, []*volume.BackupVolumeInfo{released, held, nil})
-
-	assert.True(t, released.SnapshotDataMovementInfo.RetainedSnapshotReleased)
-	assert.Equal(t, "later-uid", released.SnapshotDataMovementInfo.RetainedSnapshotReleasedBy)
-	assert.False(t, held.SnapshotDataMovementInfo.RetainedSnapshotReleased)
 }

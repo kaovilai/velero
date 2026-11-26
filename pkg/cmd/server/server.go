@@ -36,7 +36,6 @@ import (
 	appsv1api "k8s.io/api/apps/v1"
 	batchv1api "k8s.io/api/batch/v1"
 	corev1api "k8s.io/api/core/v1"
-	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -165,32 +164,6 @@ type server struct {
 	credentialSecretStore credentials.SecretStore
 }
 
-// newVeleroServerScheme builds the scheme of the velero server's manager
-// client. Every API group a controller lists or watches through the manager
-// client must be registered here: the retained-snapshot controller lists
-// storage.k8s.io CSIDrivers to cross-check the driver of a tarball- or
-// tag-sourced record (design, Security), and a group missing from the scheme
-// fails every such read with "no kind is registered for the type", which left
-// every untrusted-record backup deletion stuck in Deleting.
-func newVeleroServerScheme() (*runtime.Scheme, error) {
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{
-		velerov1api.AddToScheme,
-		velerov2alpha1api.AddToScheme,
-		corev1api.AddToScheme,
-		storagev1api.AddToScheme,
-		snapshotv1api.AddToScheme,
-		volumegroupsnapshotv1.AddToScheme,
-		batchv1api.AddToScheme,
-		appsv1api.AddToScheme,
-	} {
-		if err := add(scheme); err != nil {
-			return nil, err
-		}
-	}
-	return scheme, nil
-}
-
 func newServer(f client.Factory, config *config.Config, logger *logrus.Logger) (*server, error) {
 	if msg, err := uploader.ValidateUploaderType(config.UploaderType); err != nil {
 		return nil, err
@@ -259,8 +232,32 @@ func newServer(f client.Factory, config *config.Config, logger *logrus.Logger) (
 		return nil, err
 	}
 
-	scheme, err := newVeleroServerScheme()
-	if err != nil {
+	scheme := runtime.NewScheme()
+	if err := velerov1api.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := velerov2alpha1api.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := corev1api.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := snapshotv1api.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := volumegroupsnapshotv1.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := batchv1api.AddToScheme(scheme); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	if err := appsv1api.AddToScheme(scheme); err != nil {
 		cancelFunc()
 		return nil, err
 	}

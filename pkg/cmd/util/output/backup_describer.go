@@ -36,7 +36,6 @@ import (
 
 	veleroapishared "github.com/velero-io/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
-	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/cmd/util/cacert"
 	"github.com/velero-io/velero/pkg/cmd/util/downloadrequest"
 	"github.com/velero-io/velero/pkg/itemoperation"
@@ -497,42 +496,10 @@ func describeBackupVolumes(
 	describeNativeSnapshots(d, details, nativeSnapshots)
 	d.Println()
 
-	overlayRetainedSnapshotRelease(ctx, kbClient, backup, csiSnapshots)
 	describeCSISnapshots(d, details, csiSnapshots, legacyInfoSource)
 	d.Println()
 
 	describePodVolumeBackups(d, details, podVolumeBackupCRs)
-}
-
-// overlayRetainedSnapshotRelease fills the rolling-base release of each retained
-// snapshot from the backup's local DataUploads: the volume info in the backup
-// metadata was written when the backup completed, and a later backup of the same
-// chain releases the snapshot after that, on the DataUpload record only. Without
-// a local DataUpload, e.g. on a cluster the backup was synced to, the release is
-// not known and nothing is printed; a lookup failure only drops the detail.
-func overlayRetainedSnapshotRelease(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, csiSnapshots []*volume.BackupVolumeInfo) {
-	if kbClient == nil || backup.UID == "" {
-		return
-	}
-	dataUploads := &velerov2alpha1api.DataUploadList{}
-	if err := kbClient.List(ctx, dataUploads, kbclient.InNamespace(backup.Namespace), kbclient.MatchingLabels{velerov1api.BackupUIDLabel: string(backup.UID)}); err != nil {
-		return
-	}
-	released := map[string]string{}
-	for i := range dataUploads.Items {
-		if record := dataUploads.Items[i].Status.RetainedCSIStorageSnapshot; record != nil && record.Released {
-			released[record.CSISnapshotHandle] = record.ReleasedBy
-		}
-	}
-	for _, info := range csiSnapshots {
-		if info == nil || info.SnapshotDataMovementInfo == nil {
-			continue
-		}
-		if by, ok := released[info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle]; ok {
-			info.SnapshotDataMovementInfo.RetainedSnapshotReleased = true
-			info.SnapshotDataMovementInfo.RetainedSnapshotReleasedBy = by
-		}
-	}
 }
 
 func retrieveNativeSnapshotLegacy(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string, bslCACert string) ([]*volume.BackupVolumeInfo, error) {
