@@ -325,3 +325,66 @@ func TestReconcileDeletedDataUploadRunsPatchBack(t *testing.T) {
 		})
 	}
 }
+
+// TestOnDataUploadCompletedTakesOverDeadHolderLease proves the restart
+// interleaving: a node-agent died inside the completion callback right after
+// it acquired the retaining mark, before the record was written, and its
+// restarted successor runs the callback again. The successor waits out the
+// dead holder's mark instead of failing the DataUpload, then finishes the
+// completion: record, Retain, cleanup, Completed, and the release of the
+// parent after Completed.
+func TestOnDataUploadCompletedTakesOverDeadHolderLease(t *testing.T) {
+	r, err := initDataUploaderReconciler()
+	require.NoError(t, err)
+	r.eventRecorder = &recordingEvents{}
+	ctx := t.Context()
+
+	_, err = r.kubeClient.CoreV1().PersistentVolumeClaims("fake-ns").Create(ctx, &corev1api.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "fake-ns", Name: "test-pvc"},
+		Spec:       corev1api.PersistentVolumeClaimSpec{VolumeName: "pv-1"},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = r.kubeClient.CoreV1().PersistentVolumes().Create(ctx, &corev1api.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-1"},
+		Spec: corev1api.PersistentVolumeSpec{PersistentVolumeSource: corev1api.PersistentVolumeSource{
+			CSI: &corev1api.CSIPersistentVolumeSource{Driver: retentionDriver, VolumeHandle: "vol-1"},
+		}},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	parent := chainDU("parent-du", "vol-1", "parent-snap", velerov2alpha1api.DataUploadPhaseCompleted, time.Hour)
+	parent.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now().Add(-time.Hour)}
+	require.NoError(t, r.client.Create(ctx, parent))
+
+	// The dead process's mark: acquired with the lease duration, never renewed.
+	start := r.Clock.Now()
+	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
+	du.Labels = map[string]string{velerov1api.BackupUIDLabel: "holder-uid", velerov1api.PVCUIDLabel: "pvc-1"}
+	du.Annotations = map[string]string{dataUploadRetainLeaseAnnotation: (&dataUploadLease{
+		Holder:    "node-1-dead",
+		ExpiresAt: start.Add(dataUploadLeaseDuration),
+	}).String()}
+	createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
+	patches := &vscPatchRecorder{}
+	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+		patches.patches = append(patches.patches, string(action.(clientTesting.PatchAction).GetPatch()))
+		return false, nil, nil
+	})
+	watcher := &phaseAtVSCCreate{Client: r.client, watched: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}}
+	r.client = watcher
+	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
+		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
+	}
+
+	r.OnDataUploadCompleted(ctx, du.Namespace, du.Name, datapath.Result{Backup: datapath.BackupResult{SnapshotID: "fake-id"}})
+
+	updated := getDataUpload(t, r, du)
+	assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updated.Status.Phase, "the dead holder's mark never fails the DataUpload")
+	require.NotNil(t, updated.Status.RetainedCSIStorageSnapshot)
+	assert.Equal(t, retentionHandle, updated.Status.RetainedCSIStorageSnapshot.CSISnapshotHandle)
+	assert.True(t, patches.hasDeletionPolicy("Retain"), "the successor retained the snapshot")
+	assert.NotContains(t, updated.Annotations, dataUploadRetainLeaseAnnotation, "Completed clears the marks")
+	assert.False(t, r.Clock.Now().Before(start.Add(dataUploadLeaseDuration)), "the successor waited the dead holder's mark out")
+	assert.Equal(t, []velerov2alpha1api.DataUploadPhase{velerov2alpha1api.DataUploadPhaseCompleted}, watcher.phases,
+		"the release of the parent runs, after Completed")
+}

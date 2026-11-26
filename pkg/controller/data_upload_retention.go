@@ -260,10 +260,12 @@ func shouldRetainSnapshot(du *velerov2alpha1api.DataUpload) bool {
 //     the content keeps Delete.
 //   - The completion callback and the rollback path are fenced against each
 //     other by a lease on the DataUpload: the callback conditionally marks the
-//     DataUpload as retaining, re-checks that the mark is still its own
-//     immediately before it patches the content, and the Retain patch is itself
-//     preconditioned on the content's resourceVersion, captured right after the
-//     re-check and used without a re-read, so a rollback that has patched or
+//     DataUpload as retaining (waiting out and taking a completion-side mark
+//     another holder left, see acquireRetainLease), re-checks that the mark
+//     is still its own immediately before it patches the content, and the
+//     Retain patch is itself preconditioned on the content's resourceVersion,
+//     captured right after the re-check and used without a re-read, so a
+//     rollback that has patched or
 //     deleted the content in between makes the delayed write fail instead of
 //     landing after it.
 //
@@ -291,12 +293,8 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	}
 
 	holder := fmt.Sprintf("%s-%d", r.nodeName, r.Clock.Now().UnixNano())
-	acquired, _, err := r.tryAcquireDataUploadLease(ctx, du, dataUploadRetainLeaseAnnotation, holder, dataUploadLeaseDuration, log)
-	if err != nil {
+	if err := r.acquireRetainLease(ctx, du, holder, log); err != nil {
 		return err
-	}
-	if !acquired {
-		return errors.Errorf("another actor holds the retention lease of DataUpload %s", du.Name)
 	}
 
 	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(current *velerov2alpha1api.DataUpload) bool {
@@ -396,6 +394,47 @@ func (r *DataUploadReconciler) retainSnapshotOnCompletion(ctx context.Context, d
 	}
 
 	return nil
+}
+
+// acquireRetainLease acquires the completion side's lease mark for holder. A
+// mark of the completion side left by another holder -- a node-agent that died
+// inside the completion callback, whose restarted successor now runs the
+// callback again -- is treated like an expired mark: the callback waits out
+// its expiry and takes it, and never fails the DataUpload on that refusal, so
+// the restarted node-agent finishes the completion. The wait is bounded by the
+// longest mark the completion side writes, the renewal that covers the
+// cleanup, plus one lease duration. A live patch-back mark, or a DataUpload
+// that reached a final phase, refuses for good: the patch-back owns the
+// snapshot then.
+func (r *DataUploadReconciler) acquireRetainLease(ctx context.Context, du *velerov2alpha1api.DataUpload, holder string, log logrus.FieldLogger) error {
+	deadline := r.Clock.Now().Add(csi.RetainedSnapshotDeletionTimeout + 2*dataUploadLeaseCleanupMargin + dataUploadLeaseDuration)
+	for {
+		acquired, blockedFor, err := r.tryAcquireDataUploadLease(ctx, du, dataUploadRetainLeaseAnnotation, holder, dataUploadLeaseDuration, log)
+		if err != nil {
+			return err
+		}
+		if acquired {
+			return nil
+		}
+		rollingBack, err := r.dataUploadLeaseLive(ctx, du, dataUploadRollbackLeaseAnnotation)
+		if err != nil {
+			return err
+		}
+		if rollingBack {
+			return errors.Errorf("a rollback of DataUpload %s is in progress, not retaining its snapshot", du.Name)
+		}
+		if blockedFor <= 0 {
+			return errors.Errorf("DataUpload %s reached a final phase before its snapshot was retained", du.Name)
+		}
+		if r.Clock.Now().Add(blockedFor).After(deadline) {
+			return errors.Errorf("another holder keeps the retention lease of DataUpload %s beyond the longest completion-side mark", du.Name)
+		}
+		log.Infof("The retention lease of DataUpload %s is held by another holder, e.g. a node-agent that died inside the completion callback; taking it once it expires in %v", du.Name, blockedFor)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r.Clock.Sleep(blockedFor + time.Second)
+	}
 }
 
 // sourceCSIVolumeHandle returns the CSI volume handle of the DataUpload's source

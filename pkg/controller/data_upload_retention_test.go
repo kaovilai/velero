@@ -250,19 +250,28 @@ func TestOnDataUploadCompletedRetentionRecordBeforeRetain(t *testing.T) {
 }
 
 // TestRetainSnapshotOnCompletionLeaseFencing proves the lease fence of section
-// 3: the rollback path cannot run while an unexpired retaining mark exists,
-// and the completion callback cannot retain while a rollback is in progress.
+// 3: the completion callback cannot retain while a rollback is in progress,
+// and a completion-side mark another holder left -- a node-agent that died
+// inside the callback -- is waited out and taken, not a reason to fail, unless
+// it outlasts the longest mark the completion side ever writes.
 func TestRetainSnapshotOnCompletionLeaseFencing(t *testing.T) {
 	tests := []struct {
 		name         string
 		annotation   string
 		future       bool
+		farFuture    bool
 		wantRetained bool
 	}{
 		{
-			name:         "an unexpired retaining lease blocks the completion callback",
+			name:         "an unexpired retaining lease of another holder is waited out and taken",
 			annotation:   dataUploadRetainLeaseAnnotation,
 			future:       true,
+			wantRetained: true,
+		},
+		{
+			name:         "a retaining lease beyond the longest completion-side mark blocks the completion callback",
+			annotation:   dataUploadRetainLeaseAnnotation,
+			farFuture:    true,
 			wantRetained: false,
 		},
 		{
@@ -286,6 +295,9 @@ func TestRetainSnapshotOnCompletionLeaseFencing(t *testing.T) {
 			offset := -10 * time.Minute
 			if tc.future {
 				offset = 10 * time.Minute
+			}
+			if tc.farFuture {
+				offset = time.Hour
 			}
 			lease := (&dataUploadLease{Holder: "other-node-1", ExpiresAt: r.Clock.Now().Add(offset)}).String()
 
