@@ -21,12 +21,15 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -37,10 +40,9 @@ import (
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/builder"
-	"github.com/velero-io/velero/pkg/label"
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	velerotest "github.com/velero-io/velero/pkg/test"
-	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
+	"github.com/velero-io/velero/pkg/util/csi"
 )
 
 func toUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) runtime.Unstructured {
@@ -174,176 +176,220 @@ func TestDataUploadDeleteActionExecute(t *testing.T) {
 	}
 }
 
-// TestDataUploadDeleteActionGathersRetainedSnapshotRecords proves the gather
-// behavior of section 5: a DataUpload carrying a record contributes an entry to
-// the sharded family, keyed by the DataUpload name whatever its phase, and the
-// gather merges into a family an earlier attempt left behind.
-func TestDataUploadDeleteActionGathersRetainedSnapshotRecords(t *testing.T) {
-	record := &velerov2alpha1.RetainedCSIStorageSnapshot{
-		CSISnapshotHandle: "0001-0009-rook-ceph-0000000000000001-snap",
-		Driver:            "rbd.csi.ceph.com",
-	}
+const deleteTestHandle = "0001-0009-rook-ceph-0000000000000001-snap"
+
+// fakeSidecar plays the CSI snapshotter sidecar for the static
+// VolumeSnapshotContent of a retained snapshot: on every read of a content
+// being deleted with a seeded handle it calls DeleteSnapshot, which deletes the
+// snapshot and drops the finalizer unless the driver fails.
+type fakeSidecar struct {
+	snapshots   map[string]bool
+	driverFails bool
+	deleteCalls []string
+}
+
+func (f *fakeSidecar) client(t *testing.T, objs ...runtime.Object) crclient.Client {
+	t.Helper()
+	objs = append(objs, &storagev1api.CSIDriver{ObjectMeta: metav1.ObjectMeta{Name: "rbd.csi.ceph.com"}})
+	base := velerotest.NewFakeControllerRuntimeClientBuilder(t).
+		WithRuntimeObjects(objs...).
+		WithStatusSubresource(&snapshotv1api.VolumeSnapshotContent{}).
+		Build()
+	return interceptor.NewClient(base.(crclient.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c crclient.WithWatch, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
+			if _, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
+				vsc := &snapshotv1api.VolumeSnapshotContent{}
+				if err := c.Get(ctx, key, vsc); err == nil && vsc.DeletionTimestamp != nil && vsc.Status != nil && vsc.Status.SnapshotHandle != nil {
+					f.deleteCalls = append(f.deleteCalls, *vsc.Status.SnapshotHandle)
+					if !f.driverFails {
+						f.snapshots[*vsc.Status.SnapshotHandle] = false
+						vsc.Finalizers = nil
+						_ = c.Update(ctx, vsc)
+					}
+				}
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+}
+
+func retainedRecord(handle, driver string) *velerov2alpha1.RetainedCSIStorageSnapshot {
+	return &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: handle, Driver: driver, CSIVolumeHandle: "vol-1"}
+}
+
+func shortenDeletionBound(t *testing.T) {
+	t.Helper()
+	orig := csi.RetainedSnapshotDeletionTimeout
+	csi.RetainedSnapshotDeletionTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { csi.RetainedSnapshotDeletionTimeout = orig })
+}
+
+// TestDataUploadDeleteActionDeletesRetainedSnapshot proves the synchronous
+// deletion of a retained snapshot with its backup: an unreleased record is
+// deleted through the static content before the repository data; a local
+// released record wins over the tarball's unreleased copy, and a record from
+// the tarball alone, or with an unreleased local copy, is deleted.
+func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
+	shortenDeletionBound(t)
 	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
 	backup.UID = "daily-uid"
 
 	tests := []struct {
-		name         string
-		phase        velerov2alpha1.DataUploadPhase
-		repeat       bool
-		wantEntries  int
-		wantSnapshot string
+		name        string
+		tarball     func(*velerov2alpha1.DataUpload)
+		local       func(*velerov2alpha1.DataUpload)
+		wantDeleted bool
 	}{
 		{
-			name:         "a completed DataUpload with a record contributes an entry",
-			phase:        velerov2alpha1.DataUploadPhaseCompleted,
-			wantEntries:  1,
-			wantSnapshot: "0001-0009-rook-ceph-0000000000000001-snap",
+			name: "a record from the tarball alone is deleted",
+			tarball: func(du *velerov2alpha1.DataUpload) {
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+			},
+			wantDeleted: true,
 		},
 		{
-			// Section 3 clears the record only after the backup content is
-			// gone, so a surviving record means the snapshot was never
-			// released, whatever the DataUpload's final phase.
-			name:         "a failed DataUpload with a record also contributes an entry",
-			phase:        velerov2alpha1.DataUploadPhaseFailed,
-			wantEntries:  1,
-			wantSnapshot: "0001-0009-rook-ceph-0000000000000001-snap",
+			name: "a failed DataUpload's surviving record is deleted too",
+			tarball: func(du *velerov2alpha1.DataUpload) {
+				du.Status.Phase = velerov2alpha1.DataUploadPhaseFailed
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+			},
+			wantDeleted: true,
 		},
 		{
-			name:        "a DataUpload without a record contributes nothing",
-			phase:       velerov2alpha1.DataUploadPhaseCompleted,
-			wantEntries: 0,
+			name: "a local released record wins over the tarball's unreleased copy",
+			tarball: func(du *velerov2alpha1.DataUpload) {
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+			},
+			local: func(du *velerov2alpha1.DataUpload) {
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+				du.Status.RetainedCSIStorageSnapshot.Released = true
+				du.Status.RetainedCSIStorageSnapshot.ReleasedBy = "later-uid"
+			},
 		},
 		{
-			// The family is written create-or-update: an existing map from an
-			// earlier, failed attempt of the same deletion is merged into,
-			// never rejected.
-			name:         "a repeated gather merges into the existing family",
-			phase:        velerov2alpha1.DataUploadPhaseCompleted,
-			repeat:       true,
-			wantEntries:  1,
-			wantSnapshot: "0001-0009-rook-ceph-0000000000000001-snap",
+			name: "an unreleased local record means the snapshot is deleted",
+			tarball: func(du *velerov2alpha1.DataUpload) {
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+			},
+			local: func(du *velerov2alpha1.DataUpload) {
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+			},
+			wantDeleted: true,
+		},
+		{
+			name: "a released record in the tarball is skipped",
+			tarball: func(du *velerov2alpha1.DataUpload) {
+				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+				du.Status.RetainedCSIStorageSnapshot.Released = true
+			},
+		},
+		{
+			name:    "a DataUpload without a record deletes nothing",
+			tarball: func(*velerov2alpha1.DataUpload) {},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			crClient := velerotest.NewFakeControllerRuntimeClient(t)
+			tarball := newCompletedDataUpload("daily-backup-abcde", "daily-backup")
+			tarball.Spec.DataMover = "velero-block"
+			tc.tarball(tarball)
+			var objs []runtime.Object
+			if tc.local != nil {
+				local := tarball.DeepCopy()
+				tc.local(local)
+				objs = append(objs, local)
+			}
+			sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}}
+			crClient := sidecar.client(t, objs...)
 			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
 
-			du := newCompletedDataUpload("daily-backup-abcde", "daily-backup")
-			du.Status.Phase = tc.phase
-			if tc.wantSnapshot != "" {
-				du.Status.RetainedCSIStorageSnapshot = record
-			}
-			input := &velero.DeleteItemActionExecuteInput{
-				Item:   toUnstructured(t, du),
-				Backup: backup,
-			}
+			require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, tarball), Backup: backup}))
 
-			require.NoError(t, action.Execute(input))
-			if tc.repeat {
-				require.NoError(t, action.Execute(input))
+			if tc.wantDeleted {
+				assert.Equal(t, []string{deleteTestHandle}, sidecar.deleteCalls)
+				assert.False(t, sidecar.snapshots[deleteTestHandle])
+			} else {
+				assert.Empty(t, sidecar.deleteCalls)
+				assert.True(t, sidecar.snapshots[deleteTestHandle])
 			}
-
-			family, err := retainedsnapshot.LoadFamily(t.Context(), crClient, backup)
-			require.NoError(t, err)
-			assert.Equal(t, tc.wantEntries, family.PendingEntries())
-			if tc.wantSnapshot != "" {
-				entry, ok := family.Entry("daily-backup-abcde")
-				require.True(t, ok)
-				assert.Equal(t, tc.wantSnapshot, entry.CSISnapshotHandle)
-				assert.False(t, entry.Trusted, "a record read from the tarball is not trusted, only a live DataUpload read establishes trust")
-			}
+			contents := &snapshotv1api.VolumeSnapshotContentList{}
+			require.NoError(t, crClient.List(t.Context(), contents))
+			assert.Empty(t, contents.Items, "no static content is left behind")
 		})
 	}
 }
 
-// TestDataUploadDeleteActionGathersRecordWithoutSnapshotID proves the
-// retained-record gather does not depend on the snapshot-info ConfigMap: a
-// failed DataUpload that carries a retained record but no SnapshotID --
-// retention recorded the handle, then a cleanup failure failed the upload
-// before the ID was written -- still contributes its entry, or the record
-// would be lost as soon as the DataUpload is gone from the cluster.
-func TestDataUploadDeleteActionGathersRecordWithoutSnapshotID(t *testing.T) {
-	crClient := velerotest.NewFakeControllerRuntimeClient(t)
-	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
-
-	du := newCompletedDataUpload("daily-backup-abcde", "daily-backup")
-	du.Status.Phase = velerov2alpha1.DataUploadPhaseFailed
-	du.Status.SnapshotID = ""
-	du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{
-		CSISnapshotHandle: "0001-0009-rook-ceph-0000000000000001-snap",
-		Driver:            "rbd.csi.ceph.com",
-	}
+// TestDataUploadDeleteActionUnknownDriver proves a record naming a driver the
+// cluster does not run is skipped with a Warning event on the Backup: no
+// static content is created and the deletion proceeds.
+func TestDataUploadDeleteActionUnknownDriver(t *testing.T) {
 	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
 	backup.UID = "daily-uid"
+	du := newCompletedDataUpload("daily-backup-abcde", "daily-backup")
+	du.Spec.DataMover = "velero-block"
+	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "unknown.csi.example.com")
 
-	require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{
-		Item:   toUnstructured(t, du),
-		Backup: backup,
-	}))
+	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}}
+	crClient := sidecar.client(t)
+	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
 
-	err := crClient.Get(t.Context(), crclient.ObjectKey{Namespace: backup.Namespace, Name: "daily-backup-abcde-info"}, &corev1api.ConfigMap{})
-	assert.True(t, apierrors.IsNotFound(err), "no snapshot-info ConfigMap is created without a SnapshotID")
-
-	family, err := retainedsnapshot.LoadFamily(t.Context(), crClient, backup)
-	require.NoError(t, err)
-	assert.Equal(t, 1, family.PendingEntries(), "the retained record is gathered without a SnapshotID")
-	entry, ok := family.Entry("daily-backup-abcde")
-	require.True(t, ok)
-	assert.Equal(t, "0001-0009-rook-ceph-0000000000000001-snap", entry.CSISnapshotHandle)
+	require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+	contents := &snapshotv1api.VolumeSnapshotContentList{}
+	require.NoError(t, crClient.List(t.Context(), contents))
+	assert.Empty(t, contents.Items)
+	events := &corev1api.EventList{}
+	require.NoError(t, crClient.List(t.Context(), events))
+	require.Len(t, events.Items, 1)
+	assert.Equal(t, "RetainedSnapshotDriverUnknown", events.Items[0].Reason)
+	assert.Equal(t, corev1api.EventTypeWarning, events.Items[0].Type)
+	assert.Equal(t, "Backup", events.Items[0].InvolvedObject.Kind)
 }
 
-// TestDataUploadDeleteActionWritesEntriesBeforeInfoConfigMap proves design
-// section 5: the record entries are written before the snapshot-info
-// ConfigMap, and an info-CM failure does not strand the retained snapshot. It
-// also covers the long-name case that used to fail the info-CM create: a
-// backup name over 63 characters is sanitized in the label, as the
-// backup-deletion controller's own lookup expects.
-func TestDataUploadDeleteActionWritesEntriesBeforeInfoConfigMap(t *testing.T) {
-	longName := strings.Repeat("a", 80)
-	backup := builder.ForBackup("velero", longName).StorageLocation("default").Result()
-	backup.UID = "long-uid"
+// TestDataUploadDeleteActionRetainedSnapshotFailure proves the failure path
+// and the one-wait rule: a deletion that does not finish within the bound
+// returns the helper's error unchanged, which fails the request before the
+// repository data, the DataUploads and the tarball are touched, and leaves the
+// static content being deleted; the next record of the same request is
+// deleted without waiting and returns an error at once; a retry of the backup
+// deletion resumes the deletions in progress.
+func TestDataUploadDeleteActionRetainedSnapshotFailure(t *testing.T) {
+	shortenDeletionBound(t)
+	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
+	backup.UID = "daily-uid"
+	first := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
+	first.Spec.DataMover = "velero-block"
+	first.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+	second := newCompletedDataUpload("daily-backup-bbbbb", "daily-backup")
+	second.Spec.DataMover = "velero-block"
+	second.Status.RetainedCSIStorageSnapshot = retainedRecord("second-snap", "rbd.csi.ceph.com")
 
-	t.Run("a long backup name writes a valid info-CM label", func(t *testing.T) {
-		crClient := velerotest.NewFakeControllerRuntimeClient(t)
-		action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true, "second-snap": true}, driverFails: true}
+	crClient := sidecar.client(t)
+	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
 
-		du := newCompletedDataUpload("long-du", label.GetValidName(longName))
-		du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h", Driver: "d"}
-		require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+	var pending *csi.RetainedSnapshotDeletionPendingError
+	err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, first), Backup: backup})
+	require.ErrorAs(t, err, &pending, "the helper's error is returned unchanged")
+	assert.Positive(t, pending.Waited, "the first timeout waits out the bound")
 
-		cm := &corev1api.ConfigMap{}
-		require.NoError(t, crClient.Get(t.Context(), crclient.ObjectKey{Namespace: "velero", Name: "long-du-info"}, cm))
-		assert.Equal(t, label.GetValidName(longName), cm.Labels[velerov1.BackupNameLabel])
-		assert.LessOrEqual(t, len(cm.Labels[velerov1.BackupNameLabel]), 63)
+	start := time.Now()
+	err = action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, second), Backup: backup})
+	require.ErrorAs(t, err, &pending)
+	assert.Zero(t, pending.Waited, "after the first timeout the request does not wait again")
+	assert.Less(t, time.Since(start), csi.RetainedSnapshotDeletionTimeout)
+	contents := &snapshotv1api.VolumeSnapshotContentList{}
+	require.NoError(t, crClient.List(t.Context(), contents))
+	require.Len(t, contents.Items, 2, "both static contents are left being deleted for the sidecar")
+	for i := range contents.Items {
+		assert.NotNil(t, contents.Items[i].DeletionTimestamp)
+	}
 
-		family, err := retainedsnapshot.LoadFamily(t.Context(), crClient, backup)
-		require.NoError(t, err)
-		assert.Equal(t, 1, family.PendingEntries())
-	})
-
-	t.Run("an info-CM failure leaves the record entry in place", func(t *testing.T) {
-		base := velerotest.NewFakeControllerRuntimeClient(t)
-		crClient := interceptor.NewClient(base.(crclient.WithWatch), interceptor.Funcs{
-			Create: func(ctx context.Context, c crclient.WithWatch, obj crclient.Object, opts ...crclient.CreateOption) error {
-				if cm, ok := obj.(*corev1api.ConfigMap); ok && strings.HasSuffix(cm.Name, "-info") {
-					return apierrors.NewInvalid(corev1api.SchemeGroupVersion.WithKind("ConfigMap").GroupKind(), cm.Name, nil)
-				}
-				return c.Create(ctx, obj, opts...)
-			},
-		})
-		action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
-
-		du := newCompletedDataUpload("long-du", label.GetValidName(longName))
-		du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h", Driver: "d"}
-		err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup})
-		require.Error(t, err, "the info-CM failure is still reported")
-
-		family, err := retainedsnapshot.LoadFamily(t.Context(), base, backup)
-		require.NoError(t, err)
-		entry, ok := family.Entry("long-du")
-		require.True(t, ok, "the record entry was written before the info-CM")
-		assert.Equal(t, "h", entry.CSISnapshotHandle)
-	})
+	// A retry of the backup deletion is a new request, a new action.
+	sidecar.driverFails = false
+	retry := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
+	require.NoError(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, first), Backup: backup}))
+	require.NoError(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, second), Backup: backup}))
+	assert.False(t, sidecar.snapshots[deleteTestHandle])
+	assert.False(t, sidecar.snapshots["second-snap"])
 }

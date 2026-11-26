@@ -8,22 +8,12 @@ rules:
   - ""
   resources:
   - configmaps
+  - secrets
   verbs:
   - create
   - delete
   - get
   - list
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - get
-  - list
-  - patch
 - apiGroups:
   - ""
   resources:
@@ -40,32 +30,19 @@ rules:
   verbs:
   - get
 - apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-- apiGroups:
   - snapshot.storage.k8s.io
   resources:
   - volumesnapshotcontents
   verbs:
-  - create
   - delete
   - get
-  - list
   - patch
-  - watch
 - apiGroups:
   - snapshot.storage.k8s.io
   resources:
   - volumesnapshotcontents/status
   verbs:
   - get
-  - patch
   - update
 - apiGroups:
   - snapshot.storage.k8s.io
@@ -74,14 +51,6 @@ rules:
   verbs:
   - delete
   - get
-- apiGroups:
-  - storage.k8s.io
-  resources:
-  - csidrivers
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - velero.io
   resources:

@@ -35,12 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/velero-io/velero/internal/credentials"
 	"github.com/velero-io/velero/internal/delete"
@@ -62,31 +57,15 @@ import (
 	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/filesystem"
 	"github.com/velero-io/velero/pkg/util/kube"
-	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 	veleroutil "github.com/velero-io/velero/pkg/util/velero"
 )
 
 const (
 	deleteBackupRequestMaxAge = 24 * time.Hour
-
-	// retainedSnapshotsBackstopRequeue is the RequeueAfter of a request
-	// waiting on the retained-snapshot controller. The primary wake is the
-	// pair of watches registered in SetupWithManager; this is the backstop
-	// for an event lost between the step's read and its return, and it keeps
-	// the request level-triggered even when both watches miss (design
-	// section 4).
-	retainedSnapshotsBackstopRequeue = 30 * time.Second
 )
 
 type backupDeletionReconciler struct {
 	client.Client
-	// apiReader reads from the API server instead of the cache: the reads the
-	// deletion's safety decisions are made on -- whether the record family
-	// has pending work, and which entries still need their handle resolved --
-	// must not miss a shard a gather just created or see a pre-activation
-	// copy, or the tail would remove the Backup and the tarball while
-	// retained snapshots are still pending.
-	apiReader         client.Reader
 	logger            logrus.FieldLogger
 	backupTracker     BackupTracker
 	repoMgr           repomanager.Manager
@@ -99,12 +78,10 @@ type backupDeletionReconciler struct {
 	repoEnsurer       *repository.Ensurer
 }
 
-// NewBackupDeletionReconciler creates a new backup deletion reconciler. The
-// apiReader reads uncached; a nil apiReader falls back to the cached client.
+// NewBackupDeletionReconciler creates a new backup deletion reconciler.
 func NewBackupDeletionReconciler(
 	logger logrus.FieldLogger,
 	client client.Client,
-	apiReader client.Reader,
 	backupTracker BackupTracker,
 	repoMgr repomanager.Manager,
 	metrics *metrics.ServerMetrics,
@@ -116,7 +93,6 @@ func NewBackupDeletionReconciler(
 ) *backupDeletionReconciler {
 	return &backupDeletionReconciler{
 		Client:            client,
-		apiReader:         apiReader,
 		logger:            logger,
 		backupTracker:     backupTracker,
 		repoMgr:           repoMgr,
@@ -130,115 +106,18 @@ func NewBackupDeletionReconciler(
 	}
 }
 
-// familyReader returns the reader the retained snapshot record family is
-// loaded through: the uncached API reader when one is given, the client
-// itself otherwise, e.g. in tests.
-func (r *backupDeletionReconciler) familyReader() client.Reader {
-	if r.apiReader != nil {
-		return r.apiReader
-	}
-	return r.Client
-}
-
 func (r *backupDeletionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Make sure the expired requests can be deleted eventually
 	s := kube.NewPeriodicalEnqueueSource(r.logger.WithField("controller", constant.ControllerBackupDeletion), mgr.GetClient(), &velerov1api.DeleteBackupRequestList{}, time.Hour, kube.PeriodicalEnqueueSourceOption{})
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov1api.DeleteBackupRequest{}).
 		WatchesRawSource(s).
-		// Re-entry of a request waiting on the retained-snapshot controller
-		// is watch-driven (design section 4): the temp vsc-<hash> content
-		// disappearing after a successful DeleteSnapshot, and the record
-		// family update that marks an entry completed or escalated, both
-		// mapped to the pending request through the velero.io/backup-uid
-		// label. The retained-snapshot controller never writes to the
-		// request.
-		Watches(&snapshotv1api.VolumeSnapshotContent{},
-			handler.EnqueueRequestsFromMapFunc(r.pendingRequestsOfBackupUID),
-			builder.WithPredicates(tempVSCDeletedPredicate())).
-		Watches(&corev1api.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.pendingRequestsOfBackupUID),
-			builder.WithPredicates(familyEntriesSettledPredicate())).
 		Complete(r)
-}
-
-// tempVSCDeletedPredicate admits only the delete event of a VolumeSnapshotContent
-// labeled with a backup UID, which is a temp vsc-<hash> content of a retained
-// snapshot going away after the sidecar's DeleteSnapshot.
-func tempVSCDeletedPredicate() predicate.Funcs {
-	return predicate.Funcs{
-		CreateFunc:  func(event.CreateEvent) bool { return false },
-		UpdateFunc:  func(event.UpdateEvent) bool { return false },
-		GenericFunc: func(event.GenericEvent) bool { return false },
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			return e.Object != nil && e.Object.GetLabels()[velerov1api.BackupUIDLabel] != ""
-		},
-	}
-}
-
-// familyEntriesSettledPredicate admits only an update of a record family shard
-// -- a ConfigMap labeled with a backup UID -- that settles a pending entry:
-// the entry was confirmed deleted and moved to the completed set, or escalated
-// or skipped to the orphan-snapshot ConfigMap; or that marks shard 0 failed on
-// an uncounted error. Writes that add entries or persist an attempt count are
-// not admitted; they change nothing the request should act on.
-func familyEntriesSettledPredicate() predicate.Funcs {
-	return predicate.Funcs{
-		CreateFunc:  func(event.CreateEvent) bool { return false },
-		DeleteFunc:  func(event.DeleteEvent) bool { return false },
-		GenericFunc: func(event.GenericEvent) bool { return false },
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldShard, ok := e.ObjectOld.(*corev1api.ConfigMap)
-			if !ok {
-				return false
-			}
-			newShard, ok := e.ObjectNew.(*corev1api.ConfigMap)
-			if !ok || newShard.Labels[velerov1api.BackupUIDLabel] == "" {
-				return false
-			}
-			if newShard.Data[retainedsnapshot.FailedKey] != "" && oldShard.Data[retainedsnapshot.FailedKey] == "" {
-				return true
-			}
-			return len(pendingShardKeys(newShard)) < len(pendingShardKeys(oldShard))
-		},
-	}
-}
-
-// pendingRequestsOfBackupUID maps an object labeled with a backup UID to the
-// DeleteBackupRequests of that backup that are waiting on the retained-snapshot
-// controller: InProgress and annotated retained-snapshots-pending.
-func (r *backupDeletionReconciler) pendingRequestsOfBackupUID(ctx context.Context, obj client.Object) []reconcile.Request {
-	uid := obj.GetLabels()[velerov1api.BackupUIDLabel]
-	if uid == "" {
-		return nil
-	}
-	list := &velerov1api.DeleteBackupRequestList{}
-	if err := r.Client.List(ctx, list, &client.ListOptions{
-		LabelSelector: labels.SelectorFromSet(map[string]string{velerov1api.BackupUIDLabel: uid}),
-	}); err != nil {
-		r.logger.WithError(err).WithField("backupUID", uid).Warn("Error listing the DeleteBackupRequests of the backup UID")
-		return nil
-	}
-	var requests []reconcile.Request
-	for i := range list.Items {
-		req := &list.Items[i]
-		if req.Status.Phase != velerov1api.DeleteBackupRequestPhaseInProgress ||
-			req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation] == "" {
-			continue
-		}
-		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: req.Namespace, Name: req.Name}})
-	}
-	return requests
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=velero.io,resources=deletebackuprequests/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=velero.io,resources=backups,verbs=delete
-// The two watches of SetupWithManager: the temp VolumeSnapshotContent of a
-// retained snapshot going away, and the record ConfigMap family settling an
-// entry, both mapped to the pending request by the backup UID label.
-// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
 func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.logger.WithFields(logrus.Fields{
@@ -258,17 +137,8 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Since we use the reconciler along with the PeriodicalEnqueueSource, there may be reconciliation triggered by
 	// stale requests.
-	// A request carrying the retained-snapshots-pending annotation is let back
-	// in to evaluate completion, and only such a request: the re-entry path
-	// below repairs the family activation, re-reads the family, and runs the
-	// tail, meaning tarball removal and completion, only when nothing is
-	// active; a re-entry that finds pending work goes back to waiting without
-	// touching the tail. The annotated request is exempt from the max-age
-	// deletion, so a slow snapshot controller cannot have its request deleted
-	// mid-deletion.
 	if dbr.Status.Phase == velerov1api.DeleteBackupRequestPhaseProcessed ||
-		(dbr.Status.Phase == velerov1api.DeleteBackupRequestPhaseInProgress &&
-			dbr.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation] == "") {
+		dbr.Status.Phase == velerov1api.DeleteBackupRequestPhaseInProgress {
 		age := r.clock.Now().Sub(dbr.CreationTimestamp.Time)
 		if age >= deleteBackupRequestMaxAge { // delete the expired request
 			log.Debugf("The request is expired, status: %s, deleting it.", dbr.Status.Phase)
@@ -384,14 +254,6 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err2
 	}
 
-	// Re-entry of a request waiting on the retained-snapshot controller: the
-	// deletion steps do not re-run, the request only evaluates the record
-	// family and runs the tail when nothing is active.
-	if dbr.Status.Phase == velerov1api.DeleteBackupRequestPhaseInProgress &&
-		dbr.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation] != "" {
-		return r.reconcileRetainedSnapshots(ctx, dbr, backup, backupStore, log)
-	}
-
 	actions, err := pluginManager.GetDeleteItemActions()
 	log.Debugf("%d actions before invoking actions", len(actions))
 	if err != nil {
@@ -412,6 +274,21 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// for backups which failed before tarball object could be uploaded we do offline cleanup
 			log.Info("Cleaning up CSI volumesnapshots")
 			r.deleteCSIVolumeSnapshotsIfAny(ctx, backup, log)
+
+			// Without the tarball the DataUpload delete action never runs, so
+			// the local DataUploads are the only source of the retained
+			// snapshots the rolling base did not release yet. They are
+			// deleted here, synchronously, before the DataUploads and the
+			// repository data; a failure fails the request the same way a
+			// failed delete action does, so the backup stays deletable on
+			// retry.
+			if isTarballNotFoundError(err) && boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
+				if err := r.deleteLocalRetainedSnapshots(ctx, backup, log); err != nil {
+					log.WithError(err).Error("Error deleting the retained snapshots of the backup")
+					err2 := r.patchDeleteBackupRequestWithError(ctx, dbr, errors.Wrap(err, "error deleting the retained snapshots"))
+					return ctrl.Result{}, err2
+				}
+			}
 
 			// If the tarball simply does not exist (HTTP 404 / not found), the download
 			// failure is permanent and not retryable, so we let deletion proceed.
@@ -486,31 +363,11 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
-		// The record sources are merged, not just ordered: the local
-		// DataUploads are read even when the tarball exists, and where both
-		// carry a record for the same DataUpload, the local record wins -- it
-		// entered through the API, where the tarball record is backup-storage
-		// data. Local presence is authoritative: when a local DataUpload exists
-		// for an entry and carries no record, the tarball's record for that
-		// DataUpload is dropped, not resurrected. When the tarball is missing,
-		// the controller itself writes the family from the local DataUploads;
-		// without that fallback every retained snapshot of such a backup would
-		// leak silently.
-		if gatherErrs := r.gatherRetainedSnapshotRecords(ctx, backup); len(gatherErrs) > 0 {
-			for _, err := range gatherErrs {
-				errs = append(errs, errors.Wrap(err, "error gathering the retained snapshot records").Error())
-			}
-		}
-
 		log.Info("Removing snapshot data by data mover")
-		if len(errs) == 0 {
-			if deleteErrs := r.deleteMovedSnapshots(ctx, backup); len(deleteErrs) > 0 {
-				for _, err := range deleteErrs {
-					errs = append(errs, errors.Wrap(err, "error deleting moved snapshot data").Error())
-				}
+		if deleteErrs := r.deleteMovedSnapshots(ctx, backup); len(deleteErrs) > 0 {
+			for _, err := range deleteErrs {
+				errs = append(errs, errors.Wrap(err, "error deleting moved snapshot data").Error())
 			}
-		} else {
-			log.Info("Skipping removal of snapshot data by data mover due to previous errors")
 		}
 		duList := &velerov2alpha1.DataUploadList{}
 		log.Info("Removing local datauploads")
@@ -532,62 +389,6 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	// Deleting a retained snapshot cannot be undone, which is why it runs
-	// last, before the tarball is deleted: any earlier failure leaves the
-	// snapshot and the record in place, and the backup deletion can be
-	// retried. The request's snapshot step does not wait: a DeleteBackupRequest
-	// in InProgress or Processed is not reconciled again, and the
-	// backup-deletion controller runs with one worker, so any wait inside it
-	// would block the deletion of every unrelated backup behind it. The step
-	// writes the pending annotation and then shard 0 of the record family,
-	// the manifest that activates it -- annotate first, then shard 0, never
-	// the reverse -- and returns with the backstop RequeueAfter, leaving the
-	// request InProgress
-	// for the retained-snapshot controller, which runs its own workers and is
-	// keyed by the record ConfigMaps. The primary wake is the pair of watches
-	// in SetupWithManager.
-	if len(errs) == 0 && boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
-		family, familyErr := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup)
-		if familyErr != nil {
-			errs = append(errs, errors.Wrap(familyErr, "error reading the retained snapshot records").Error())
-		} else if family.PendingEntries() > 0 {
-			var annotateErr error
-			dbr, annotateErr = r.patchDeleteBackupRequest(ctx, dbr, func(req *velerov1api.DeleteBackupRequest) {
-				if req.Annotations == nil {
-					req.Annotations = map[string]string{}
-				}
-				req.Annotations[velerov1api.RetainedSnapshotsPendingAnnotation] = "true"
-			})
-			if annotateErr != nil {
-				errs = append(errs, errors.Wrap(annotateErr, "error marking the request as waiting on retained snapshots").Error())
-			} else if activateErr := retainedsnapshot.WriteManifest(ctx, r.Client, backup); activateErr != nil {
-				errs = append(errs, errors.Wrap(activateErr, "error writing the retained snapshot record manifest").Error())
-			} else {
-				log.Info("Waiting for the retained-snapshot controller to delete the retained snapshots")
-				return ctrl.Result{RequeueAfter: retainedSnapshotsBackstopRequeue}, nil
-			}
-		}
-	}
-
-	return r.runDeletionTail(ctx, dbr, backup, backupStore, backupScheduleName, errs, log)
-}
-
-// runDeletionTail runs the steps after the retained snapshots: the backup
-// tarball in the backup storage is deleted only when all prior steps
-// succeeded, then the restores, the Backup object and the request itself. The
-// shard family of the retained snapshot records is removed by the tail itself
-// -- the Backup deletion is not its GC trigger -- after the deletion finishes,
-// so a shard with no pending entries keeps its completed set, the evidence
-// that suppresses replay, until then.
-func (r *backupDeletionReconciler) runDeletionTail(
-	ctx context.Context,
-	dbr *velerov1api.DeleteBackupRequest,
-	backup *velerov1api.Backup,
-	backupStore persistence.BackupStore,
-	backupScheduleName string,
-	errs []string,
-	log logrus.FieldLogger,
-) (ctrl.Result, error) {
 	if backupStore != nil && len(errs) == 0 {
 		log.Info("Removing backup from backup storage")
 		if err := backupStore.DeleteBackup(backup.Name); err != nil {
@@ -683,182 +484,10 @@ func (r *backupDeletionReconciler) runDeletionTail(
 			// If this errors, all we can do is log it.
 			r.logger.WithError(err).WithField("backup", kube.NamespaceAndName(backup)).Error("error deleting all associated DeleteBackupRequests after successfully deleting the backup")
 		}
-
-		// The tail removes the record family itself; a GC that finds a family
-		// whose Backup is gone by other means is the retained-snapshot
-		// controller's business.
-		if boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData) {
-			if err := retainedsnapshot.Delete(ctx, r.Client, backup); err != nil {
-				log.WithError(err).Warn("Error removing the retained snapshot record family")
-			}
-		}
 	}
 	log.Infof("Reconciliation done")
 
 	return ctrl.Result{}, nil
-}
-
-// reconcileRetainedSnapshots is the re-entry path of a request waiting on the
-// retained-snapshot controller. It is level-triggered, not edge-triggered: on
-// re-entry it first repairs shard 0 -- the annotation write and the shard-0
-// write cannot be one atomic write, and a crash in between must not strand
-// the inert entry shards -- so when the family has entry shards but no shard
-// 0, shard 0 is written before anything else, one idempotent write; only then
-// does it re-read the family, shard 0 then exactly the entry shards it counts,
-// and when there is nothing active it clears its own annotation and runs the
-// tail in the same reconcile, so a retry that starts after the family is gone
-// cannot wedge waiting for a transition that already fired.
-func (r *backupDeletionReconciler) reconcileRetainedSnapshots(
-	ctx context.Context,
-	dbr *velerov1api.DeleteBackupRequest,
-	backup *velerov1api.Backup,
-	backupStore persistence.BackupStore,
-	log logrus.FieldLogger,
-) (ctrl.Result, error) {
-	log.Info("Evaluating the retained snapshot records of the backup")
-
-	// An uncounted failure of the retained-snapshot controller is carried in
-	// shard 0, read before the shard-0 repair below: the request fails itself
-	// with the reason, clears its own pending annotation and deletes the
-	// family, so no unowned work continues. The backup tarball is still in
-	// place -- the tail did not run -- so the retry is a new request that
-	// regathers the records from it and writes shard 0 again.
-	if manifest, err := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "error reading the retained snapshot records")
-	} else if reason := manifest.FailedReason(); reason != "" {
-		log.Errorf("The retained snapshot deletion failed: %s", reason)
-		if err := retainedsnapshot.Delete(ctx, r.Client, backup); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "error removing the failed retained snapshot records")
-		}
-		if _, err := r.patchDeleteBackupRequest(ctx, dbr, func(req *velerov1api.DeleteBackupRequest) {
-			req.Status.Phase = velerov1api.DeleteBackupRequestPhaseProcessed
-			req.Status.Errors = []string{"backup deletion failed: error deleting the retained snapshots: " + reason}
-			if req.Annotations != nil {
-				annotations := map[string]string{}
-				for key, value := range req.Annotations {
-					if key != velerov1api.RetainedSnapshotsPendingAnnotation {
-						annotations[key] = value
-					}
-				}
-				req.Annotations = annotations
-			}
-		}); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "error failing the backup deletion")
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// Repair the shard-0 write a crash may have interrupted. The repair keeps
-	// a failure marker written after the read above; the next re-entry, from
-	// the family watch or the backstop requeue, acts on it.
-	if err := retainedsnapshot.RepairManifest(ctx, r.Client, backup); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "error repairing the retained snapshot record manifest")
-	}
-
-	family, err := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "error reading the retained snapshot records")
-	}
-	// The wait is on pending entries whether or not the family has its shard
-	// 0: an inert shard the repair above has not covered yet must hold the
-	// tail back, not let it through.
-	if family.PendingEntries() > 0 {
-		log.Info("The retained snapshots are still being deleted, going back to waiting")
-		return ctrl.Result{RequeueAfter: retainedSnapshotsBackstopRequeue}, nil
-	}
-
-	// Nothing is active: no family, because a previous attempt already emptied
-	// and deleted it; empty shards; or every entry escalated or skipped. The
-	// request clears its own annotation -- the waker never clears it -- and
-	// runs the tail.
-	if _, err := r.patchDeleteBackupRequest(ctx, dbr, func(req *velerov1api.DeleteBackupRequest) {
-		// The file imports the internal/delete package, which shadows the map
-		// delete builtin, so the annotation is dropped by rebuild.
-		if req.Annotations != nil {
-			annotations := map[string]string{}
-			for key, value := range req.Annotations {
-				if key != velerov1api.RetainedSnapshotsPendingAnnotation {
-					annotations[key] = value
-				}
-			}
-			req.Annotations = annotations
-		}
-	}); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "error clearing the retained snapshot pending annotation")
-	}
-
-	backupScheduleName := backup.GetLabels()[velerov1api.ScheduleNameLabel]
-	return r.runDeletionTail(ctx, dbr, backup, backupStore, backupScheduleName, nil, log)
-}
-
-// gatherRetainedSnapshotRecords merges the record sources of a backup's
-// retained snapshots into the shard family: the entries the DataUpload delete
-// action gathered from the backup tarball, and the local DataUploads. A local
-// record wins over the tarball's, a local DataUpload without a record drops
-// the tarball's entry for it, and the tarball supplies entries only for
-// DataUploads that no longer exist locally. Regathering respects what the
-// family already did: an entry whose snapshot was confirmed deleted stays in
-// the completed set and is not recreated, and a persisted attempt count is
-// merged, not reset.
-func (r *backupDeletionReconciler) gatherRetainedSnapshotRecords(ctx context.Context, backup *velerov1api.Backup) []error {
-	family, err := retainedsnapshot.LoadFamily(ctx, r.familyReader(), backup)
-	if err != nil {
-		return []error{errors.Wrap(err, "error reading the retained snapshot records")}
-	}
-
-	duList := &velerov2alpha1.DataUploadList{}
-	if err := r.Client.List(ctx, duList, &client.ListOptions{
-		Namespace: backup.Namespace,
-		LabelSelector: labels.SelectorFromSet(map[string]string{
-			velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
-		}),
-	}); err != nil {
-		return []error{errors.Wrap(err, "error listing the local datauploads")}
-	}
-
-	local := map[string]*retainedsnapshot.Entry{}
-	dropped := map[string]struct{}{}
-	for i := range duList.Items {
-		du := &duList.Items[i]
-		if entry := retainedsnapshot.FromDataUploadStatus(du); entry != nil {
-			local[du.Name] = entry
-		} else {
-			dropped[du.Name] = struct{}{}
-		}
-	}
-
-	var errs []error
-	for name := range dropped {
-		// Local presence is authoritative: a local DataUpload with no record
-		// -- the patch-back cleared it after the snapshot was released, or the
-		// volume was never opted in -- drops the tarball's record for this
-		// DataUpload rather than resurrecting it.
-		if _, ok := family.Entry(name); ok {
-			if err := retainedsnapshot.RemoveEntry(ctx, r.Client, backup, name); err != nil {
-				errs = append(errs, errors.Wrapf(err, "error dropping the tarball record of DataUpload %s", name))
-			}
-		}
-	}
-
-	if len(local) == 0 && len(family.Shards) == 0 {
-		return errs
-	}
-	if err := retainedsnapshot.WriteEntries(ctx, r.Client, backup, local); err != nil {
-		errs = append(errs, errors.Wrap(err, "error writing the retained snapshot records"))
-	}
-	return errs
-}
-
-// pendingShardKeys lists the pending entry keys of a shard.
-func pendingShardKeys(shard *corev1api.ConfigMap) []string {
-	keys := []string{}
-	for key := range shard.Data {
-		if key == retainedsnapshot.ShardCountKey || key == retainedsnapshot.CompletedKey || key == retainedsnapshot.FailedKey {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	return keys
 }
 
 func (r *backupDeletionReconciler) volumeSnapshottersForVSL(
@@ -914,6 +543,48 @@ func (r *backupDeletionReconciler) deleteExistingDeletionRequests(ctx context.Co
 		}
 	}
 	return errs
+}
+
+// deleteLocalRetainedSnapshots deletes the retained snapshots recorded on the
+// backup's local DataUploads that the rolling base did not release yet. It is
+// the offline-cleanup step of a backup whose tarball is gone: the DataUpload
+// delete action, which handles them otherwise, runs on the tarball's
+// DataUploads only. Like the delete action, the request waits out the bound at
+// most once; the records after the first timeout are deleted without waiting,
+// and the first error is returned.
+func (r *backupDeletionReconciler) deleteLocalRetainedSnapshots(ctx context.Context, backup *velerov1api.Backup, log logrus.FieldLogger) error {
+	duList := &velerov2alpha1.DataUploadList{}
+	if err := r.Client.List(ctx, duList, &client.ListOptions{
+		Namespace: backup.Namespace,
+		LabelSelector: labels.SelectorFromSet(map[string]string{
+			velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
+		}),
+	}); err != nil {
+		return errors.Wrap(err, "error listing the datauploads of the backup")
+	}
+	var firstErr error
+	noWait := false
+	for i := range duList.Items {
+		record := duList.Items[i].Status.RetainedCSIStorageSnapshot
+		if record == nil || record.Released {
+			continue
+		}
+		duLog := log.WithField("dataupload", duList.Items[i].Name)
+		duLog.Infof("Deleting the retained snapshot %s of driver %s", record.CSISnapshotHandle, record.Driver)
+		err := csi.DeleteRetainedSnapshot(ctx, r.Client, r.Client, record, backup.UID, csi.RetainedSnapshotDeletionOptions{NoWait: noWait}, duLog)
+		if err == nil {
+			continue
+		}
+		var pending *csi.RetainedSnapshotDeletionPendingError
+		if errors.As(err, &pending) {
+			noWait = true
+		}
+		duLog.WithError(err).Error("Error deleting the retained snapshot")
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // deleteCSIVolumeSnapshotsIfAny clean up the CSI snapshots created by the backup, this should be called when the backup is failed

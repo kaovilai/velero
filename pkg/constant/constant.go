@@ -14,7 +14,6 @@ const (
 	ControllerDownloadRequest       = "download-request"
 	ControllerGarbageCollection     = "gc"
 	ControllerPodVolumeBackup       = "pod-volume-backup"
-	ControllerRetainedSnapshot      = "retained-snapshot"
 	ControllerPodVolumeRestore      = "pod-volume-restore"
 	ControllerRestore               = "restore"
 	ControllerRestoreOperations     = "restore-operations"

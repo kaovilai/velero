@@ -68,48 +68,12 @@ func DescribeBackupInSF(
 
 		DescribeBackupSpecInSF(d, backup.Spec)
 
-		retainedHandles := DescribeBackupStatusInSF(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertFile, podVolumeBackups)
+		DescribeBackupStatusInSF(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertFile, podVolumeBackups)
 
 		if len(deleteRequests) > 0 {
 			DescribeDeleteBackupRequestsInSF(d, deleteRequests)
 		}
-
-		DescribeOrphanSnapshotRecordsInSF(ctx, kbClient, d, backup, retainedHandles)
 	}, outputFormat)
-}
-
-// DescribeOrphanSnapshotRecordsInSF names the orphan-snapshot ConfigMaps that
-// hold retained snapshot records of this backup, in structured format; the
-// entries of an earlier instance of the backup that name its retained
-// snapshots are flagged stale.
-func DescribeOrphanSnapshotRecordsInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, backup *velerov1api.Backup, retainedHandles []string) {
-	records, err := orphanSnapshotRecordsOf(ctx, kbClient, backup, retainedHandles)
-	if err != nil {
-		d.Describe("orphanSnapshotRecords", map[string]any{"error": err.Error()})
-		return
-	}
-	if len(records) == 0 {
-		return
-	}
-	out := map[string]any{}
-	for _, cm := range sortedKeys(records) {
-		entries := []map[string]any{}
-		for _, rec := range records[cm] {
-			item := map[string]any{
-				"dataUpload":     rec.dataUpload,
-				"backupUID":      rec.backupUID,
-				"driver":         rec.entry.Driver,
-				"snapshotHandle": rec.entry.CSISnapshotHandle,
-				"attempts":       rec.entry.Attempts,
-			}
-			if rec.stale {
-				item["stale"] = true
-			}
-			entries = append(entries, item)
-		}
-		out[backup.Namespace+"/"+cm] = entries
-	}
-	d.Describe("orphanSnapshotRecords", out)
 }
 
 // DescribeBackupSpecInSF describes a backup spec in structured format.
@@ -225,7 +189,7 @@ func DescribeBackupSpecInSF(d *StructuredDescriber, spec velerov1api.BackupSpec)
 
 // DescribeBackupStatusInSF describes a backup status in structured format.
 func DescribeBackupStatusInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, backup *velerov1api.Backup, details bool,
-	insecureSkipTLSVerify bool, caCertPath string, podVolumeBackups []velerov1api.PodVolumeBackup) (retainedHandles []string) {
+	insecureSkipTLSVerify bool, caCertPath string, podVolumeBackups []velerov1api.PodVolumeBackup) {
 	status := backup.Status
 	backupStatusInfo := make(map[string]any)
 
@@ -265,13 +229,12 @@ func DescribeBackupStatusInSF(ctx context.Context, kbClient kbclient.Client, d *
 		describeBackupResourceListInSF(ctx, kbClient, backupStatusInfo, backup, insecureSkipTLSVerify, caCertPath)
 	}
 
-	retainedHandles = describeBackupVolumesInSF(ctx, kbClient, backup, details, insecureSkipTLSVerify, caCertPath, podVolumeBackups, backupStatusInfo)
+	describeBackupVolumesInSF(ctx, kbClient, backup, details, insecureSkipTLSVerify, caCertPath, podVolumeBackups, backupStatusInfo)
 
 	if status.HookStatus != nil {
 		backupStatusInfo["hooksAttempted"] = status.HookStatus.HooksAttempted
 		backupStatusInfo["hooksFailed"] = status.HookStatus.HooksFailed
 	}
-	return retainedHandles
 }
 
 func describeBackupResourceListInSF(ctx context.Context, kbClient kbclient.Client, backupStatusInfo map[string]any, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string) {
@@ -310,7 +273,7 @@ func describeBackupResourceListInSF(ctx context.Context, kbClient kbclient.Clien
 }
 
 func describeBackupVolumesInSF(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, details bool,
-	insecureSkipTLSVerify bool, caCertPath string, podVolumeBackupCRs []velerov1api.PodVolumeBackup, backupStatusInfo map[string]any) (retainedHandles []string) {
+	insecureSkipTLSVerify bool, caCertPath string, podVolumeBackupCRs []velerov1api.PodVolumeBackup, backupStatusInfo map[string]any) {
 	backupVolumes := make(map[string]any)
 
 	// Get BSL cacert if available
@@ -331,24 +294,24 @@ func describeBackupVolumesInSF(ctx context.Context, kbClient kbclient.Client, ba
 		nativeSnapshots, err = retrieveNativeSnapshotLegacy(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
 		if err != nil {
 			backupVolumes["errorConcludeNativeSnapshot"] = fmt.Sprintf("error concluding native snapshot info: %v", err)
-			return nil
+			return
 		}
 
 		csiSnapshots, err = retrieveCSISnapshotLegacy(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
 		if err != nil {
 			backupVolumes["errorConcludeCSISnapshot"] = fmt.Sprintf("error concluding CSI snapshot info: %v", err)
-			return nil
+			return
 		}
 
 		legacyInfoSource = true
 	} else if err != nil {
 		backupVolumes["errorGetBackupVolumeInfo"] = fmt.Sprintf("error getting backup volume info: %v", err)
-		return nil
+		return
 	} else {
 		var volumeInfos []volume.BackupVolumeInfo
 		if err := json.NewDecoder(buf).Decode(&volumeInfos); err != nil {
 			backupVolumes["errorReadBackupVolumeInfo"] = fmt.Sprintf("error reading backup volume info: %v", err)
-			return nil
+			return
 		}
 
 		for i := range volumeInfos {
@@ -369,7 +332,6 @@ func describeBackupVolumesInSF(ctx context.Context, kbClient kbclient.Client, ba
 	describePodVolumeBackupsInSF(podVolumeBackupCRs, details, backupVolumes)
 
 	backupStatusInfo["backupVolumes"] = backupVolumes
-	return retainedSnapshotHandles(csiSnapshots)
 }
 
 func describeNativeSnapshotsInSF(details bool, infos []*volume.BackupVolumeInfo, backupVolumes map[string]any) {

@@ -51,7 +51,6 @@ import (
 	"github.com/velero-io/velero/pkg/label"
 	velerocsi "github.com/velero-io/velero/pkg/util/csi"
 	veleroexec "github.com/velero-io/velero/pkg/util/exec"
-	"github.com/velero-io/velero/pkg/util/retainedsnapshot"
 	velerotest "github.com/velero-io/velero/test"
 	. "github.com/velero-io/velero/test/e2e/test"
 	"github.com/velero-io/velero/test/util/common"
@@ -482,7 +481,7 @@ func (r *retainedSnapshotCase) deleteBackup(backupName string, handles ...string
 	for _, handle := range handles {
 		tempVSCs = append(tempVSCs, velerocsi.TempVSCName(hostpathDriver, handle))
 	}
-	familyPrefix := retainedsnapshot.FamilyNamePrefix(uid)
+	familyPrefix := "retained-snapshots-" + uid + "-"
 
 	ctx, cancel := context.WithCancel(r.Ctx)
 	done := make(chan struct{})
@@ -575,7 +574,7 @@ func (r *retainedSnapshotCase) familyShards(ctx context.Context, prefix string) 
 // expectNoOrphanEntry asserts that no orphan-snapshot ConfigMap names the
 // handle: an entry there would mean the deletion gave up on the snapshot.
 func (r *retainedSnapshotCase) expectNoOrphanEntry(handle string) {
-	list, err := r.Client.ClientGo.CoreV1().ConfigMaps(r.VeleroCfg.VeleroNamespace).List(r.Ctx, metav1.ListOptions{LabelSelector: retainedsnapshot.OrphanLabel})
+	list, err := r.Client.ClientGo.CoreV1().ConfigMaps(r.VeleroCfg.VeleroNamespace).List(r.Ctx, metav1.ListOptions{LabelSelector: "velero.io/orphan-snapshots"})
 	Expect(err).NotTo(HaveOccurred())
 	for _, cm := range list.Items {
 		for key, value := range cm.Data {

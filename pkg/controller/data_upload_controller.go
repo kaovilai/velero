@@ -221,27 +221,6 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// remove finalizer no matter whether the cr is being deleted or not for it is no longer needed when internal resources are all cleaned up
 		// also in final status cr won't block the direct delete of the velero namespace
 		if controllerutil.ContainsFinalizer(du, DataUploadDownloadFinalizer) {
-			// A record-carrying DataUpload that is API-deleted before the
-			// backup tarball serializes it would die with its record, and the
-			// storage snapshot would survive with neither record nor tag to
-			// recover it. The finalizer is therefore kept on a record-carrying
-			// DataUpload in its final state -- the unconditional removal below
-			// would leave nothing to hold at deletion time -- and when the
-			// DataUpload is deleted, the record is first delivered to a
-			// durable home -- the backup-UID family, inactive, when the
-			// Backup still exists, or the orphan-snapshot ConfigMap when it is
-			// gone -- and only then is the finalizer removed (design section 3).
-			if record := du.Status.RetainedCSIStorageSnapshot; record != nil && !record.Released {
-				if du.DeletionTimestamp.IsZero() {
-					log.Debug("DataUpload carries a retained snapshot record, keeping its finalizer until deletion delivers the record")
-					return ctrl.Result{}, nil
-				}
-				if err := r.deliverRetainedSnapshotRecord(ctx, du, log); err != nil {
-					log.WithError(err).Error("error delivering the retained snapshot record of the deleted DataUpload, holding its finalizer")
-					return ctrl.Result{}, err
-				}
-			}
-
 			if err := UpdateDataUploadWithRetry(ctx, r.client, req.NamespacedName, log, func(du *velerov2alpha1api.DataUpload) bool {
 				if !controllerutil.ContainsFinalizer(du, DataUploadDownloadFinalizer) {
 					return false

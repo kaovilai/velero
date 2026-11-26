@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
+	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -18,13 +21,21 @@ import (
 	"github.com/velero-io/velero/pkg/label"
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	repotypes "github.com/velero-io/velero/pkg/repository/types"
+	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/datamover"
-	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 type DataUploadDeleteAction struct {
 	logger logrus.FieldLogger
 	client client.Client
+
+	// timedOut records the backups whose deletion already waited out the
+	// bound once: the action runs inside the backup-deletion controller's
+	// reconcile, which handles one request at a time, so after the first
+	// record that times out, the remaining records of the same request are
+	// deleted without waiting.
+	mu       sync.Mutex
+	timedOut map[types.UID]bool
 }
 
 func (d *DataUploadDeleteAction) AppliesTo() (velero.ResourceSelector, error) {
@@ -75,39 +86,18 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 		)
 		return nil
 	}
-	// The DataUploads are deleted in an earlier step of the backup deletion
-	// than the retained snapshots, so the working record of a retained
-	// snapshot is gathered here, from the backup tarball, into the sharded
-	// ConfigMap family the retained-snapshot controller is keyed by. A
-	// surviving record means the snapshot was not released, whatever the
-	// DataUpload's final phase, and even a stale record is harmless, because
-	// a deletion that finds the snapshot already gone is a success. The
-	// family is written create-or-update, so a retry of the backup deletion
-	// merges into the map an earlier, failed attempt left behind.
-	entries := map[string]*retainedsnapshot.Entry{}
-	if entry := retainedsnapshot.FromDataUploadStatus(du); entry != nil {
-		// A record read from the tarball is not trusted, whatever it was on
-		// the live DataUpload: the tarball is backup-storage data, written by
-		// anyone who can write the storage, so only a live DataUpload read --
-		// the backup-deletion controller's own gather -- establishes trust.
-		// An untrusted record naming a driver the cluster does not run is
-		// moved to the orphan-snapshot ConfigMap instead of timing out
-		// against a temp content the driver will never delete.
-		entry.Trusted = false
-		entries[du.Name] = entry
-	}
-	if err := retainedsnapshot.WriteEntries(context.Background(), d.client, input.Backup, entries); err != nil {
-		return errors.WithStack(errors.Wrapf(err, "failed to gather the retained snapshot record of DataUpload %s/%s", du.Namespace, du.Name))
+	// A retained snapshot the rolling base did not release yet belongs to this
+	// backup and is deleted here, synchronously, before the repository data:
+	// a failure fails the delete actions, which fails the deletion request
+	// before the repository data, the DataUploads and the tarball are touched,
+	// so the backup stays deletable on retry.
+	if err := d.deleteRetainedSnapshot(input.Backup, du); err != nil {
+		return err
 	}
 
-	// The snapshot-info ConfigMap of the repository data is written after the
-	// record entries, and its failure neither blocks nor fails the gather
-	// above: a delete action that returned on the info-CM failure before
-	// writing the entries would strand the retained snapshot (design section
-	// 5). The info-CM is only created for a DataUpload the config can be
-	// generated for, so the gather must not depend on it either, or a failed
-	// or interrupted DataUpload with a retained record but no SnapshotID would
-	// lose its record as soon as the DataUpload is gone from the cluster.
+	// The snapshot-info ConfigMap of the repository data. It is only created
+	// for a DataUpload the config can be generated for; the retained snapshot
+	// deletion above does not depend on it.
 	if cm := genConfigmap(input.Backup, *du); cm != nil {
 		err := d.client.Create(context.Background(), cm)
 		if err != nil && !apierrors.IsAlreadyExists(err) {
@@ -115,6 +105,87 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 		}
 	}
 	return nil
+}
+
+// deleteRetainedSnapshot deletes the retained snapshot of a DataUpload from the
+// backup tarball, unless the rolling base already released it. The local
+// DataUpload of the same name, when it still exists, wins over the tarball's
+// copy: the tarball was written when the backup completed, and a later backup
+// of the volume marks the record released on the local DataUpload only. A
+// record from the tarball alone, e.g. on a cluster the backup was synced to,
+// is deleted as recorded; a driver that reports a gone snapshot as success
+// completes. A record naming a driver the cluster does not run is skipped with
+// a Warning event on the Backup, and its handle stays in the tarball for
+// manual cleanup. The helper's error is returned unchanged.
+func (d *DataUploadDeleteAction) deleteRetainedSnapshot(bak *velerov1.Backup, du *velerov2alpha1.DataUpload) error {
+	ctx := context.Background()
+	record := du.Status.RetainedCSIStorageSnapshot
+	local := &velerov2alpha1.DataUpload{}
+	switch err := d.client.Get(ctx, client.ObjectKey{Namespace: du.Namespace, Name: du.Name}, local); {
+	case err == nil:
+		if local.Status.RetainedCSIStorageSnapshot != nil && local.Status.RetainedCSIStorageSnapshot.Released {
+			return nil
+		}
+	case !apierrors.IsNotFound(err):
+		return errors.Wrapf(err, "error getting the local DataUpload %s/%s", du.Namespace, du.Name)
+	}
+	if record == nil || record.Released || record.CSISnapshotHandle == "" {
+		return nil
+	}
+	log := d.logger.WithField("dataupload", du.Namespace+"/"+du.Name)
+
+	driver := &storagev1api.CSIDriver{}
+	if err := d.client.Get(ctx, client.ObjectKey{Name: record.Driver}, driver); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "error getting CSIDriver %s", record.Driver)
+		}
+		message := fmt.Sprintf("the cluster does not run CSI driver %s; the retained snapshot %s of DataUpload %s is left for manual cleanup", record.Driver, record.CSISnapshotHandle, du.Name)
+		log.Warn(message)
+		d.warnOnBackup(ctx, bak, "RetainedSnapshotDriverUnknown", message, log)
+		return nil
+	}
+
+	d.mu.Lock()
+	noWait := d.timedOut[bak.UID]
+	d.mu.Unlock()
+	log.Infof("Deleting the retained snapshot %s of driver %s", record.CSISnapshotHandle, record.Driver)
+	err := csi.DeleteRetainedSnapshot(ctx, d.client, d.client, record, bak.UID, csi.RetainedSnapshotDeletionOptions{NoWait: noWait}, log)
+	var pending *csi.RetainedSnapshotDeletionPendingError
+	if errors.As(err, &pending) && !noWait {
+		d.mu.Lock()
+		if d.timedOut == nil {
+			d.timedOut = map[types.UID]bool{}
+		}
+		d.timedOut[bak.UID] = true
+		d.mu.Unlock()
+	}
+	return err
+}
+
+// warnOnBackup records a Warning event on the Backup; a failure to record it
+// is logged only.
+func (d *DataUploadDeleteAction) warnOnBackup(ctx context.Context, bak *velerov1.Backup, reason, message string, log logrus.FieldLogger) {
+	now := metav1.Now()
+	event := &corev1api.Event{
+		ObjectMeta: metav1.ObjectMeta{Namespace: bak.Namespace, GenerateName: bak.Name + "."},
+		InvolvedObject: corev1api.ObjectReference{
+			APIVersion: velerov1.SchemeGroupVersion.String(),
+			Kind:       "Backup",
+			Namespace:  bak.Namespace,
+			Name:       bak.Name,
+			UID:        bak.UID,
+		},
+		Reason:         reason,
+		Message:        message,
+		Type:           corev1api.EventTypeWarning,
+		Source:         corev1api.EventSource{Component: "velero"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+	}
+	if err := d.client.Create(ctx, event); err != nil {
+		log.WithError(err).Warn("Failed to record the event on the Backup")
+	}
 }
 
 // generate the configmap which is to be created and used as a way to communicate the snapshot info to the backup deletion controller

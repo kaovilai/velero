@@ -45,7 +45,6 @@ import (
 	"github.com/velero-io/velero/internal/volume"
 	"github.com/velero-io/velero/pkg/util/collections"
 	"github.com/velero-io/velero/pkg/util/results"
-	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 // DescribeBackup describes a backup in human-readable format.
@@ -119,14 +118,12 @@ func DescribeBackup(
 		DescribeBackupSpec(d, backup.Spec)
 
 		d.Println()
-		retainedHandles := DescribeBackupStatus(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertFile, podVolumeBackups)
+		DescribeBackupStatus(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertFile, podVolumeBackups)
 
 		if len(deleteRequests) > 0 {
 			d.Println()
 			DescribeDeleteBackupRequests(d, deleteRequests)
 		}
-
-		DescribeOrphanSnapshotRecords(ctx, kbClient, d, backup, retainedHandles)
 	})
 }
 
@@ -144,143 +141,6 @@ func describeRetention(info *volume.BackupSnapshotDataMovementInfo) string {
 	default:
 		return ""
 	}
-}
-
-// DescribeOrphanSnapshotRecords names the orphan-snapshot ConfigMaps that hold
-// retained snapshot records of this backup the deletion skipped or escalated:
-// the ConfigMap is the post-deletion lookup for manual cleanup, and describing
-// it while the Backup exists is how the operator learns its name (design
-// section 4, Security Considerations). Entries recorded under an earlier UID of
-// the same backup -- its Backup object was gone and a BSL resync recreated it
-// -- are matched by the retained snapshot handles the backup carries and
-// reported as stale: deleting this backup deletes the snapshot and removes
-// them. A lookup failure is reported, not fatal.
-func DescribeOrphanSnapshotRecords(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, retainedHandles []string) {
-	records, err := orphanSnapshotRecordsOf(ctx, kbClient, backup, retainedHandles)
-	if err != nil {
-		d.Println()
-		d.Printf("Orphan Snapshot Records: <error looking up the orphan-snapshot ConfigMaps: %v>\n", err)
-		return
-	}
-	own, stale := countOrphanRecords(records)
-	if own+stale == 0 {
-		return
-	}
-	d.Println()
-	if own > 0 {
-		d.Printf("Orphan Snapshot Records: %d retained snapshot(s) were skipped or escalated and need manual cleanup\n", own)
-		for _, cm := range sortedKeys(records) {
-			printed := false
-			for _, rec := range records[cm] {
-				if rec.stale {
-					continue
-				}
-				if !printed {
-					d.Printf("\tConfigMap %s/%s:\n", backup.Namespace, cm)
-					printed = true
-				}
-				d.Printf("\t\tDataUpload %s: driver %s, snapshot handle %s, attempts %d\n", rec.dataUpload, rec.entry.Driver, rec.entry.CSISnapshotHandle, rec.entry.Attempts)
-			}
-		}
-	}
-	if stale > 0 {
-		if own > 0 {
-			d.Println()
-		}
-		d.Printf("Stale Orphan Snapshot Records: %d entry(ies) of an earlier instance of this backup name snapshots this backup still retains; deleting this backup deletes the snapshots and removes the entries\n", stale)
-		for _, cm := range sortedKeys(records) {
-			printed := false
-			for _, rec := range records[cm] {
-				if !rec.stale {
-					continue
-				}
-				if !printed {
-					d.Printf("\tConfigMap %s/%s:\n", backup.Namespace, cm)
-					printed = true
-				}
-				d.Printf("\t\tDataUpload %s (backup UID %s): driver %s, snapshot handle %s, attempts %d\n", rec.dataUpload, rec.backupUID, rec.entry.Driver, rec.entry.CSISnapshotHandle, rec.entry.Attempts)
-			}
-		}
-	}
-}
-
-// orphanRecord is one orphan-snapshot ConfigMap entry of the backup.
-type orphanRecord struct {
-	dataUpload string
-	backupUID  string
-	// stale is true for an entry keyed by another UID that names one of this
-	// backup's retained snapshots: the entry of an earlier instance of the
-	// backup, recreated by a BSL resync.
-	stale bool
-	entry *retainedsnapshot.Entry
-}
-
-// orphanSnapshotRecordsOf lists the orphan-snapshot ConfigMaps of the backup's
-// namespace and returns, by ConfigMap, the entries keyed by this backup's UID
-// and the entries of other UIDs that name one of the backup's retained
-// snapshots. The handles come from the backup's volume info, when the caller
-// has it, and from the backup's local DataUploads.
-func orphanSnapshotRecordsOf(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, retainedHandles []string) (map[string][]orphanRecord, error) {
-	if kbClient == nil || backup.UID == "" {
-		return nil, nil
-	}
-	entries, err := retainedsnapshot.LoadOrphanEntries(ctx, kbClient, backup.Namespace)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	handles := map[string]struct{}{}
-	for _, h := range retainedHandles {
-		handles[h] = struct{}{}
-	}
-	// The local DataUploads are a second source of the backup's handles; a
-	// failure to list them only narrows the match.
-	dataUploads := &velerov2alpha1api.DataUploadList{}
-	if err := kbClient.List(ctx, dataUploads, kbclient.InNamespace(backup.Namespace), kbclient.MatchingLabels{velerov1api.BackupUIDLabel: string(backup.UID)}); err == nil {
-		for i := range dataUploads.Items {
-			if entry := retainedsnapshot.FromDataUploadStatus(&dataUploads.Items[i]); entry != nil && entry.CSISnapshotHandle != "" {
-				handles[entry.CSISnapshotHandle] = struct{}{}
-			}
-		}
-	}
-	records := map[string][]orphanRecord{}
-	for _, o := range entries {
-		switch {
-		case o.BackupUID == string(backup.UID):
-			records[o.Shard] = append(records[o.Shard], orphanRecord{dataUpload: o.DataUpload, backupUID: o.BackupUID, entry: o.Entry})
-		default:
-			if _, ok := handles[o.Entry.CSISnapshotHandle]; ok && o.Entry.CSISnapshotHandle != "" {
-				records[o.Shard] = append(records[o.Shard], orphanRecord{dataUpload: o.DataUpload, backupUID: o.BackupUID, stale: true, entry: o.Entry})
-			}
-		}
-	}
-	return records, nil
-}
-
-// countOrphanRecords returns the number of the backup's own entries and of
-// the stale entries of an earlier instance.
-func countOrphanRecords(records map[string][]orphanRecord) (own, stale int) {
-	for _, recs := range records {
-		for _, rec := range recs {
-			if rec.stale {
-				stale++
-			} else {
-				own++
-			}
-		}
-	}
-	return own, stale
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // DescribeResourcePolicies describes resource policies in human-readable format
@@ -441,7 +301,7 @@ func DescribeBackupStatus(ctx context.Context,
 	details bool,
 	insecureSkipTLSVerify bool,
 	caCertPath string,
-	podVolumeBackups []velerov1api.PodVolumeBackup) (retainedHandles []string) {
+	podVolumeBackups []velerov1api.PodVolumeBackup) {
 	status := backup.Status
 
 	// Status.Version has been deprecated, use Status.FormatVersion
@@ -486,14 +346,13 @@ func DescribeBackupStatus(ctx context.Context,
 		d.Println()
 	}
 
-	retainedHandles = describeBackupVolumes(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertPath, podVolumeBackups)
+	describeBackupVolumes(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertPath, podVolumeBackups)
 
 	if status.HookStatus != nil {
 		d.Println()
 		d.Printf("HooksAttempted:\t%d\n", status.HookStatus.HooksAttempted)
 		d.Printf("HooksFailed:\t%d\n", status.HookStatus.HooksFailed)
 	}
-	return retainedHandles
 }
 
 func describeBackupItemOperations(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, details bool, insecureSkipTLSVerify bool, caCertPath string) {
@@ -584,7 +443,7 @@ func describeBackupVolumes(
 	insecureSkipTLSVerify bool,
 	caCertPath string,
 	podVolumeBackupCRs []velerov1api.PodVolumeBackup,
-) (retainedHandles []string) {
+) {
 	d.Println("Backup Volumes:")
 
 	// Get BSL cacert if available
@@ -605,24 +464,24 @@ func describeBackupVolumes(
 		nativeSnapshots, err = retrieveNativeSnapshotLegacy(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
 		if err != nil {
 			d.Printf("\t<error concluding native snapshot info: %v>\n", err)
-			return nil
+			return
 		}
 
 		csiSnapshots, err = retrieveCSISnapshotLegacy(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
 		if err != nil {
 			d.Printf("\t<error concluding CSI snapshot info: %v>\n", err)
-			return nil
+			return
 		}
 
 		legacyInfoSource = true
 	} else if err != nil {
 		d.Printf("\t<error getting backup volume info: %v>\n", err)
-		return nil
+		return
 	} else {
 		var volumeInfos []volume.BackupVolumeInfo
 		if err := json.NewDecoder(buf).Decode(&volumeInfos); err != nil {
 			d.Printf("\t<error reading backup volume info: %v>\n", err)
-			return nil
+			return
 		}
 
 		for i := range volumeInfos {
@@ -643,7 +502,6 @@ func describeBackupVolumes(
 	d.Println()
 
 	describePodVolumeBackups(d, details, podVolumeBackupCRs)
-	return retainedSnapshotHandles(csiSnapshots)
 }
 
 // overlayRetainedSnapshotRelease fills the rolling-base release of each retained
@@ -675,19 +533,6 @@ func overlayRetainedSnapshotRelease(ctx context.Context, kbClient kbclient.Clien
 			info.SnapshotDataMovementInfo.RetainedSnapshotReleasedBy = by
 		}
 	}
-}
-
-// retainedSnapshotHandles returns the retained snapshot handles the backup's
-// data movements recorded, for the orphan record lookup: a resynced backup has
-// a new UID, so its stale orphan entries can only be matched by the snapshot.
-func retainedSnapshotHandles(csiSnapshots []*volume.BackupVolumeInfo) []string {
-	handles := []string{}
-	for _, info := range csiSnapshots {
-		if info != nil && info.SnapshotDataMovementInfo != nil && info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
-			handles = append(handles, info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle)
-		}
-	}
-	return handles
 }
 
 func retrieveNativeSnapshotLegacy(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string, bslCACert string) ([]*volume.BackupVolumeInfo, error) {

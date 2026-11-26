@@ -18,7 +18,6 @@ package output
 
 import (
 	"bytes"
-	"encoding/json"
 	"testing"
 	"text/tabwriter"
 	"time"
@@ -36,7 +35,6 @@ import (
 	"github.com/velero-io/velero/pkg/builder"
 	"github.com/velero-io/velero/pkg/itemoperation"
 	velerotest "github.com/velero-io/velero/pkg/test"
-	retainedsnapshot "github.com/velero-io/velero/pkg/util/retainedsnapshot"
 )
 
 func TestDescribeUploaderConfig(t *testing.T) {
@@ -1028,63 +1026,6 @@ func TestDescribeDataMovementRetentionAndFallback(t *testing.T) {
 			assert.Equal(t, tc.expect, d.buf.String())
 		})
 	}
-}
-
-// TestDescribeOrphanSnapshotRecords proves describe names the orphan-snapshot
-// ConfigMap holding this backup's skipped or escalated records, and only this
-// backup's: the entries are keyed by backup UID.
-func TestDescribeOrphanSnapshotRecords(t *testing.T) {
-	backup := builder.ForBackup("velero", "bak").Result()
-	backup.UID = "bak-uid"
-	mine, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-1", Driver: "rbd.csi.ceph.com", Attempts: 5})
-	require.NoError(t, err)
-	theirs, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-2", Driver: "rbd.csi.ceph.com"})
-	require.NoError(t, err)
-	// The entry of an earlier instance of the backup -- its Backup object was
-	// gone, a BSL resync recreated it under bak-uid -- naming a snapshot the
-	// backup still retains.
-	stale, err := json.Marshal(&retainedsnapshot.Entry{CSISnapshotHandle: "h-3", Driver: "rbd.csi.ceph.com", Attempts: 5})
-	require.NoError(t, err)
-	orphans := &corev1api.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "orphan-snapshots-0", Labels: map[string]string{retainedsnapshot.OrphanLabel: "true"}},
-		Data:       map[string]string{"bak-uid.du-a": string(mine), "other-uid.du-b": string(theirs), "earlier-uid.du-c": string(stale), retainedsnapshot.CompletedKey: "[]"},
-	}
-	kbClient := velerotest.NewFakeControllerRuntimeClient(t, orphans)
-
-	d := &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
-	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
-	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, backup, nil)
-	d.out.Flush()
-	assert.Equal(t, `
-Orphan Snapshot Records: 1 retained snapshot(s) were skipped or escalated and need manual cleanup
-  ConfigMap velero/orphan-snapshots-0:
-    DataUpload du-a: driver rbd.csi.ceph.com, snapshot handle h-1, attempts 5
-`, d.buf.String())
-
-	// With the backup's retained handles known, the stale entry of the earlier
-	// instance is reported as such; h-2 belongs to another backup and stays out.
-	d = &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
-	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
-	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, backup, []string{"h-3", "h-9"})
-	d.out.Flush()
-	assert.Equal(t, `
-Orphan Snapshot Records: 1 retained snapshot(s) were skipped or escalated and need manual cleanup
-  ConfigMap velero/orphan-snapshots-0:
-    DataUpload du-a: driver rbd.csi.ceph.com, snapshot handle h-1, attempts 5
-
-Stale Orphan Snapshot Records: 1 entry(ies) of an earlier instance of this backup name snapshots this backup still retains; deleting this backup deletes the snapshots and removes the entries
-  ConfigMap velero/orphan-snapshots-0:
-    DataUpload du-c (backup UID earlier-uid): driver rbd.csi.ceph.com, snapshot handle h-3, attempts 5
-`, d.buf.String())
-
-	// A backup with no orphan records prints nothing.
-	none := builder.ForBackup("velero", "clean").Result()
-	none.UID = "clean-uid"
-	d = &Describer{Prefix: "", out: &tabwriter.Writer{}, buf: &bytes.Buffer{}}
-	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
-	DescribeOrphanSnapshotRecords(t.Context(), kbClient, d, none, nil)
-	d.out.Flush()
-	assert.Empty(t, d.buf.String())
 }
 
 // TestOverlayRetainedSnapshotRelease proves describe reports the rolling-base

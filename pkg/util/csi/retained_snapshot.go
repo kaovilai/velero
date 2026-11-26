@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -33,7 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
+	kwait "k8s.io/apimachinery/pkg/util/wait"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -54,76 +53,19 @@ const (
 	// no DeleteSnapshot call at all, so the temporary content rebuilt to delete a
 	// retained snapshot must carry it.
 	VSCBoundProtectionFinalizer = "snapshot.storage.kubernetes.io/volumesnapshotcontent-bound-protection"
-
-	// SnapshotDeleteErrorEventReason is the event reason the external-snapshotter
-	// sidecar uses when the deletion of a VolumeSnapshotContent's snapshot fails.
-	SnapshotDeleteErrorEventReason = "SnapshotDeleteError"
-)
-
-// The external-snapshotter sidecar emits SnapshotDeleteError events with three
-// distinct messages: before the DeleteSnapshot call (credentials), for the call
-// itself, and after a successful call (clearing the status). Only the call
-// itself is a stale-snapshot signal; the others are environment problems or
-// follow a successful delete and stay retryable.
-//
-// The message match is best effort: the strings come from external-snapshotter
-// and may change across versions. Nothing depends on a match succeeding. The
-// deletion timeout is the authoritative escalation signal -- an attempt that
-// reaches it counts toward the bound whether or not any message matched -- and
-// a matched call-failure message only shortens the time to escalate, by
-// counting the attempt as soon as the event appears. A matched credential
-// message likewise only shortens the time to the retryable failure. An unknown
-// message is treated as retryable and the wait runs on to the timeout; if the
-// message set changes in a later snapshotter release, nothing is lost except
-// that speed (design section 4).
-const (
-	snapshotDeleteCredentialFailureMessage = "Failed to get snapshot credentials" // #nosec G101
-	snapshotDeleteCallFailureMessage       = "Failed to delete snapshot"
-)
-
-// snapshotDeleteErrorKind classifies the latest SnapshotDeleteError event of a
-// temp content, best effort; see the message constants above.
-type snapshotDeleteErrorKind int
-
-const (
-	// snapshotDeleteErrorNone: no SnapshotDeleteError event was recorded.
-	snapshotDeleteErrorNone snapshotDeleteErrorKind = iota
-	// snapshotDeleteErrorCall: the DeleteSnapshot call itself failed.
-	snapshotDeleteErrorCall
-	// snapshotDeleteErrorCredential: the sidecar could not get the deletion
-	// credentials before the call.
-	snapshotDeleteErrorCredential
-	// snapshotDeleteErrorOther: a clear-status failure or a message this
-	// version does not know; retryable, the wait runs on to the timeout.
-	snapshotDeleteErrorOther
 )
 
 // RetainedSnapshotDeletionTimeout bounds the wait for the CSI snapshotter to
-// delete a retained snapshot and remove the temporary VolumeSnapshotContent.
-// On a live cluster a CSI snapshotter leader handover was observed to delay
-// DeleteSnapshot by roughly two and a half minutes, which a short fixed bound
-// would turn into a spurious failure.
-var RetainedSnapshotDeletionTimeout = 5 * time.Minute
+// delete a retained snapshot and remove the static VolumeSnapshotContent: the
+// CSI operation timeout, --resource-timeout, ten minutes by default; the
+// node-agent sets it from its flag. On a live cluster a CSI snapshotter leader
+// handover was observed to delay DeleteSnapshot by roughly two and a half
+// minutes, which a short fixed bound would turn into a spurious failure.
+var RetainedSnapshotDeletionTimeout = 10 * time.Minute
 
 // retainedSnapshotPollInterval is the fixed interval, without backoff, at which
 // the deletion of a temporary VolumeSnapshotContent is polled.
-const retainedSnapshotPollInterval = 2 * time.Second
-
-// SnapshotDeleteCallError reports a counted DeleteSnapshot failure of a
-// retained snapshot: the sidecar reported that the call itself failed, or the
-// deletion reached RetainedSnapshotDeletionTimeout without the content going
-// away, which is the authoritative signal and counts whatever the sidecar did
-// or did not report. A credential failure before the call is not one. A stale
-// record whose snapshot is already gone can fail the deletion on every retry,
-// so the caller escalates after a bounded number of these instead of relying
-// on driver compliance.
-type SnapshotDeleteCallError struct {
-	Message string
-}
-
-func (e *SnapshotDeleteCallError) Error() string {
-	return "CSI snapshotter failed to delete the snapshot: " + e.Message
-}
+var retainedSnapshotPollInterval = 2 * time.Second
 
 // GetRetainedSnapshotFromVSC builds the retained snapshot record of a backup
 // VolumeSnapshotContent. It returns nil when the content has no snapshot
@@ -174,9 +116,9 @@ func TempVSCName(driver, handle string) string {
 // VolumeSnapshotContent through which the CSI snapshotter deletes a retained
 // snapshot:
 //   - named vsc-<hash> of driver and handle, so a retry reuses the leftover;
-//   - labeled velero.io/backup-uid with the backup's UID, so the
-//     backup-deletion controller's content watch maps its delete event back
-//     to the pending DeleteBackupRequest;
+//   - labeled velero.io/backup-uid with the UID of the backup the snapshot
+//     belongs to, so an operator can tell a content left being deleted after
+//     a timeout apart from any other;
 //   - deletionPolicy Delete and the retained handle in spec.source.snapshotHandle;
 //   - no volumeSnapshotClassName, so the deletion is independent of the class;
 //   - the existing legacy action's synthetic volumeSnapshotRef, which the
@@ -197,11 +139,10 @@ func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorag
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       id,
 			Finalizers: []string{VSCBoundProtectionFinalizer},
-			// The backup UID is what the backup-deletion controller's
-			// VolumeSnapshotContent watch maps this content's delete event
-			// back to the pending DeleteBackupRequest with (design section
-			// 4). The UID, not the name: names can repeat, and the sanitized
-			// name label cannot carry a long name.
+			// The UID of the backup the snapshot belongs to, for the operator
+			// looking at a content left being deleted after a timeout. The
+			// UID, not the name: names can repeat, and the sanitized name label
+			// cannot carry a long name.
 			Labels: map[string]string{velerov1api.BackupUIDLabel: string(backupUID)},
 		},
 		Spec: snapshotv1api.VolumeSnapshotContentSpec{
@@ -231,42 +172,72 @@ func BuildTempVSCForRetainedSnapshot(record *velerov2alpha1api.RetainedCSIStorag
 	return vsc
 }
 
+// RetainedSnapshotDeletionPendingError reports a static content that is still
+// being deleted when the caller stops looking: the bound expired, or the
+// caller asked not to wait. The content is left in place, being deleted with
+// its finalizer, so the CSI snapshotter keeps retrying DeleteSnapshot, and a
+// later attempt finds it through the same name.
+type RetainedSnapshotDeletionPendingError struct {
+	Handle  string
+	Content string
+	Waited  time.Duration
+}
+
+func (e *RetainedSnapshotDeletionPendingError) Error() string {
+	if e.Waited <= 0 {
+		return fmt.Sprintf("snapshot %s is not deleted yet; static VolumeSnapshotContent %s is left being deleted and the CSI snapshotter keeps retrying, check its events and the CSI snapshotter logs",
+			e.Handle, e.Content)
+	}
+	return fmt.Sprintf("snapshot %s is not deleted within %v; static VolumeSnapshotContent %s is left being deleted and the CSI snapshotter keeps retrying, check its events and the CSI snapshotter logs",
+		e.Handle, e.Waited, e.Content)
+}
+
+// RetainedSnapshotDeletionOptions tunes how long DeleteRetainedSnapshot waits.
+type RetainedSnapshotDeletionOptions struct {
+	// Timeout bounds each wait; RetainedSnapshotDeletionTimeout when zero.
+	Timeout time.Duration
+	// NoWait creates, seeds and deletes the content but only checks once
+	// whether it is gone: a backup deletion request waits out the bound at
+	// most once, and the records after the first timeout are deleted in the
+	// background by the sidecar.
+	NoWait bool
+	// CheckInProgressOnce checks a content an earlier attempt already left
+	// being deleted once instead of waiting on it again, so a snapshot the
+	// driver cannot delete does not add the bound to every later release.
+	CheckInProgressOnce bool
+}
+
 // DeleteRetainedSnapshot has the CSI snapshotter delete the storage snapshot
-// identified by record, through a temporary statically provisioned
-// VolumeSnapshotContent labeled with the backup's UID, so the backup-deletion
-// controller's content watch can re-enter the pending DeleteBackupRequest when
-// the content goes away. All reads go through the given reader, which must be
-// uncached -- an API reader -- when the writing client is manager-cached:
-// the read-backs verify what the API server holds, and an informer-lagged
-// cache would fail the verification spuriously, or report a leftover content
-// the deletion just wrote. A nil reader falls back to the writing client.
+// identified by record, through a static VolumeSnapshotContent: named
+// vsc-<hash> of driver and handle, deletionPolicy Delete, the bound-protection
+// finalizer, the synthetic volumeSnapshotRef with an empty uid, and the
+// managed-by label and deletion-secret annotations of the record. It is the
+// one helper of the exposer's release and the backup deletion's delete item
+// action. All reads go through the given reader, which must be uncached when
+// the writing client is manager-cached; a nil reader falls back to the writing
+// client.
 //
 // In external-snapshotter v8.6.0, syncContent issues DeleteSnapshot only when
-// deletionPolicy is Delete and status.snapshotHandle is set, and its own
-// status update runs ListSnapshots first, which fails on any driver that
-// implements the capability for an already-gone snapshot. The controller
-// therefore initializes the content's status itself: before deleting the temp
-// content, it writes the retained handle from the record into
-// status.snapshotHandle through the content's status subresource, confirms
-// the write by the status response itself, and only then deletes the content,
-// with no readyToUse wait.
+// deletionPolicy is Delete and status.snapshotHandle is set, and the sidecar's
+// own status update runs ListSnapshots first, which fails for an already-gone
+// snapshot. So the handle is seeded from the record through the status
+// subresource, the seed is confirmed by a read showing a handle -- a conflict
+// means the sidecar wrote status concurrently, and any handle satisfies it --
+// and only then is the content deleted, with no readyToUse wait. The deletion
+// is polled every two seconds until the content is gone or the bound expires.
 //
-// After the deletion, it polls every two seconds without backoff until the
-// content disappears from the API, bounded by RetainedSnapshotDeletionTimeout.
-// On a failed DeleteSnapshot the sidecar emits a SnapshotDeleteError event and
-// does not write status.error, so each poll also reads the content's events as
-// the fast path: a call-failure message returns a *SnapshotDeleteCallError at
-// once, so the caller counts the attempt without waiting out the timeout, and
-// a credential message returns the retryable failure at once. The timeout is
-// the authoritative signal: reaching it returns a *SnapshotDeleteCallError
-// whether or not any event matched, because the message match is best effort
-// and nothing may depend on it succeeding (design section 4).
+// A create that finds the content already there is an earlier attempt: a
+// content not yet deleting is seeded and deleted as above; one already being
+// deleted is waited on again, or checked once with CheckInProgressOnce. At
+// the bound, or when not waiting, a content still present returns a
+// *RetainedSnapshotDeletionPendingError and is left being deleted.
 func DeleteRetainedSnapshot(
 	ctx context.Context,
 	crClient crclient.Client,
 	reader crclient.Reader,
 	record *velerov2alpha1api.RetainedCSIStorageSnapshot,
 	backupUID types.UID,
+	opts RetainedSnapshotDeletionOptions,
 	log logrus.FieldLogger,
 ) error {
 	if reader == nil {
@@ -275,228 +246,95 @@ func DeleteRetainedSnapshot(
 	if record == nil || record.CSISnapshotHandle == "" || record.Driver == "" {
 		return errors.New("invalid retained snapshot record, handle and driver are required")
 	}
-
-	tempVSC := BuildTempVSCForRetainedSnapshot(record, backupUID)
-
-	current := tempVSC
-	existing := &snapshotv1api.VolumeSnapshotContent{}
-	err := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, existing)
-	switch {
-	case err == nil:
-		// A retry of an interrupted deletion reuses the leftover.
-		current = existing
-		log.Infof("Temp VolumeSnapshotContent %s for snapshot %s already exists, reusing it", tempVSC.Name, record.CSISnapshotHandle)
-	case apierrors.IsNotFound(err):
-		// The Create populates the resourceVersion the status write below
-		// carries, as a real API server requires.
-		if err := crClient.Create(ctx, tempVSC); err != nil && !apierrors.IsAlreadyExists(err) {
-			return errors.Wrapf(err, "error creating temp VolumeSnapshotContent %s", tempVSC.Name)
-		}
-		current = tempVSC
-		log.Infof("Created temp VolumeSnapshotContent %s with DeletionPolicy=Delete for snapshot %s", tempVSC.Name, record.CSISnapshotHandle)
-	default:
-		return errors.Wrapf(err, "error getting temp VolumeSnapshotContent %s", tempVSC.Name)
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = RetainedSnapshotDeletionTimeout
 	}
 
-	// Initialize the status the sidecar needs to issue DeleteSnapshot. The
-	// write works whether or not the sidecar's own status check ever succeeds,
-	// because the handle is known from the record, and the status response
-	// itself is the confirmation of the write.
+	tempVSC := BuildTempVSCForRetainedSnapshot(record, backupUID)
+	key := crclient.ObjectKey{Name: tempVSC.Name}
+	pending := &RetainedSnapshotDeletionPendingError{Handle: record.CSISnapshotHandle, Content: tempVSC.Name}
+	wait := !opts.NoWait
+
+	current := tempVSC
+	if err := crClient.Create(ctx, tempVSC); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return errors.Wrapf(err, "error creating static VolumeSnapshotContent %s", tempVSC.Name)
+		}
+		existing := &snapshotv1api.VolumeSnapshotContent{}
+		if err := reader.Get(ctx, key, existing); err != nil {
+			if apierrors.IsNotFound(err) {
+				log.Infof("Static VolumeSnapshotContent %s of snapshot %s is gone, the snapshot is deleted", tempVSC.Name, record.CSISnapshotHandle)
+				return nil
+			}
+			return errors.Wrapf(err, "error getting static VolumeSnapshotContent %s", tempVSC.Name)
+		}
+		current = existing
+		if current.DeletionTimestamp != nil {
+			log.Infof("Static VolumeSnapshotContent %s of snapshot %s is already being deleted by an earlier attempt", tempVSC.Name, record.CSISnapshotHandle)
+			if opts.CheckInProgressOnce {
+				wait = false
+			}
+			return waitGone(ctx, reader, key, timeout, wait, pending, record, log)
+		}
+		log.Infof("Static VolumeSnapshotContent %s for snapshot %s already exists, reusing it", tempVSC.Name, record.CSISnapshotHandle)
+	} else {
+		log.Infof("Created static VolumeSnapshotContent %s with DeletionPolicy=Delete for snapshot %s", tempVSC.Name, record.CSISnapshotHandle)
+	}
+
+	// Seed status.snapshotHandle; a conflict means the sidecar wrote the status
+	// concurrently, and any handle in the fresh status satisfies it.
 	statusVSC := current.DeepCopy()
 	if statusVSC.Status == nil {
 		statusVSC.Status = &snapshotv1api.VolumeSnapshotContentStatus{}
 	}
-	statusVSC.Status.SnapshotHandle = &record.CSISnapshotHandle
-	if err := crClient.Status().Update(ctx, statusVSC); err != nil {
-		// A conflict means the sidecar wrote the status concurrently; a
-		// re-read showing any handle satisfies the requirement, as in the
-		// patch-back of section 3 (design section 4, step 2).
-		if !apierrors.IsConflict(err) {
-			return errors.Wrapf(err, "error writing the status of temp VolumeSnapshotContent %s", tempVSC.Name)
+	if statusVSC.Status.SnapshotHandle == nil || *statusVSC.Status.SnapshotHandle == "" {
+		statusVSC.Status.SnapshotHandle = &record.CSISnapshotHandle
+		if err := crClient.Status().Update(ctx, statusVSC); err != nil && !apierrors.IsConflict(err) {
+			return errors.Wrapf(err, "error writing the status of static VolumeSnapshotContent %s", tempVSC.Name)
 		}
-		fresh := &snapshotv1api.VolumeSnapshotContent{}
-		if getErr := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, fresh); getErr != nil {
-			return errors.Wrapf(getErr, "error re-reading the status of temp VolumeSnapshotContent %s after a conflict", tempVSC.Name)
-		}
-		if fresh.Status == nil || fresh.Status.SnapshotHandle == nil || *fresh.Status.SnapshotHandle == "" {
-			return errors.Wrapf(err, "error writing the status of temp VolumeSnapshotContent %s after a conflict", tempVSC.Name)
-		}
-		log.Infof("The status of temp VolumeSnapshotContent %s was written concurrently with handle %s, tolerating the conflict", tempVSC.Name, *fresh.Status.SnapshotHandle)
 	}
-	// The write is confirmed by reading the status back, not merely ordered:
+	// The seed is confirmed by a read showing a handle, not merely ordered:
 	// deleting the content before the sidecar sees status.snapshotHandle would
-	// remove it with no DeleteSnapshot call. Any handle satisfies the check:
-	// a sidecar that wrote its own status concurrently reports the same
-	// storage snapshot the record names.
+	// remove it with no DeleteSnapshot call.
 	confirmed := &snapshotv1api.VolumeSnapshotContent{}
-	if err := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, confirmed); err != nil {
-		return errors.Wrapf(err, "error reading back the status of temp VolumeSnapshotContent %s", tempVSC.Name)
+	if err := reader.Get(ctx, key, confirmed); err != nil {
+		return errors.Wrapf(err, "error reading back the status of static VolumeSnapshotContent %s", tempVSC.Name)
 	}
 	if confirmed.Status == nil || confirmed.Status.SnapshotHandle == nil || *confirmed.Status.SnapshotHandle == "" {
-		return errors.Errorf("the status of temp VolumeSnapshotContent %s does not carry the snapshot handle", tempVSC.Name)
+		return errors.Errorf("the status of static VolumeSnapshotContent %s does not carry the snapshot handle", tempVSC.Name)
 	}
 
-	// The status response itself is the confirmation: deleting the content
-	// before the sidecar sees status.snapshotHandle would remove it with no
-	// DeleteSnapshot call.
-	if err := crClient.Delete(ctx, tempVSC); err != nil && !apierrors.IsNotFound(err) {
-		return errors.Wrapf(err, "error deleting temp VolumeSnapshotContent %s", tempVSC.Name)
+	if err := crClient.Delete(ctx, confirmed); err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "error deleting static VolumeSnapshotContent %s", tempVSC.Name)
 	}
+	return waitGone(ctx, reader, key, timeout, wait, pending, record, log)
+}
 
-	// The fast path, best effort: the sidecar's latest SnapshotDeleteError
-	// event, when its message is one this version knows, ends the wait early.
-	// The result is only ever a shortcut to a verdict the timeout below would
-	// reach anyway, so a message set that changes in a later snapshotter
-	// release costs speed, never correctness.
-	var fastErr error
-	err = wait.PollUntilContextTimeout(ctx, retainedSnapshotPollInterval, RetainedSnapshotDeletionTimeout, true, func(ctx context.Context) (bool, error) {
-		err := reader.Get(ctx, crclient.ObjectKey{Name: tempVSC.Name}, &snapshotv1api.VolumeSnapshotContent{})
+// waitGone polls the static content every two seconds until it is gone or the
+// bound expires; without wait it checks once.
+func waitGone(ctx context.Context, reader crclient.Reader, key crclient.ObjectKey, timeout time.Duration, wait bool,
+	pending *RetainedSnapshotDeletionPendingError, record *velerov2alpha1api.RetainedCSIStorageSnapshot, log logrus.FieldLogger) error {
+	gone := func(ctx context.Context) (bool, error) {
+		err := reader.Get(ctx, key, &snapshotv1api.VolumeSnapshotContent{})
 		if apierrors.IsNotFound(err) {
-			return true, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		message, kind := latestSnapshotDeleteErrorMessage(ctx, reader, tempVSC.Name, log)
-		switch kind {
-		case snapshotDeleteErrorCall:
-			fastErr = &SnapshotDeleteCallError{Message: message}
-			return true, nil
-		case snapshotDeleteErrorCredential:
-			fastErr = errors.Errorf("CSI snapshotter failed on temp VolumeSnapshotContent %s: %s", tempVSC.Name, message)
 			return true, nil
 		}
 		return false, nil
-	})
-	if err == nil {
-		if fastErr != nil {
-			return fastErr
-		}
-		log.Infof("Deleted temp VolumeSnapshotContent %s, the CSI driver deleted snapshot %s", tempVSC.Name, record.CSISnapshotHandle)
-		return nil
 	}
-	if !wait.Interrupted(err) {
-		return errors.Wrapf(err, "error waiting for temp VolumeSnapshotContent %s to be deleted", tempVSC.Name)
-	}
-
-	// A missing deletion secret is an environment problem the sidecar can only
-	// report as a credential failure, a message the best-effort match may not
-	// recognize: it is retryable and never counts, so a restored secret lets
-	// the deletion succeed instead of escalating the record after the bound.
-	if ref := record.DeletionSecretRef; ref != nil && ref.Name != "" {
-		secret := &corev1api.Secret{}
-		if err := reader.Get(ctx, crclient.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
-			if apierrors.IsNotFound(err) {
-				return errors.Errorf("snapshot %s is not deleted within %v: its deletion secret %s/%s is missing; restore the secret and retry the backup deletion",
-					record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, ref.Namespace, ref.Name)
-			}
-			return errors.Wrapf(err, "snapshot %s is not deleted within %v, and its deletion secret %s/%s could not be read", record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, ref.Namespace, ref.Name)
-		}
-	}
-
-	// The timeout is the authoritative signal and counts toward the
-	// escalation bound whether or not the sidecar recorded a message this
-	// version recognizes. The latest event, when there is one, only adds
-	// detail to the error.
-	detail := fmt.Sprintf("snapshot %s is not deleted within %v, temp VolumeSnapshotContent %s is still pending; check the events of the VolumeSnapshotContent and the CSI snapshotter logs",
-		record.CSISnapshotHandle, RetainedSnapshotDeletionTimeout, tempVSC.Name)
-	if message, _ := latestSnapshotDeleteErrorMessage(ctx, reader, tempVSC.Name, log); message != "" {
-		detail += "; latest SnapshotDeleteError: " + message
-	}
-	return &SnapshotDeleteCallError{Message: detail}
-}
-
-// ReleaseTempVSC removes the bound-protection finalizer from the temp
-// VolumeSnapshotContent of a record whose deletion escalated, and deletes the
-// content if nothing deleted it yet. The content was left deleting while the
-// sidecar retried the failing DeleteSnapshot call; once the entry has moved to
-// the orphan-snapshot ConfigMap nothing retries it, and without this step the
-// content would sit with a deletionTimestamp forever (design section 4).
-// Releasing the finalizer lets the content disappear with no further CSI call:
-// the storage snapshot it names is the orphan record's business from here on.
-// A content that is already gone is not an error.
-func ReleaseTempVSC(
-	ctx context.Context,
-	crClient crclient.Client,
-	reader crclient.Reader,
-	record *velerov2alpha1api.RetainedCSIStorageSnapshot,
-	log logrus.FieldLogger,
-) error {
-	if reader == nil {
-		reader = crClient
-	}
-	if record == nil || record.CSISnapshotHandle == "" || record.Driver == "" {
-		return errors.New("invalid retained snapshot record, handle and driver are required")
-	}
-	name := TempVSCName(record.Driver, record.CSISnapshotHandle)
-	vsc := &snapshotv1api.VolumeSnapshotContent{}
-	if err := reader.Get(ctx, crclient.ObjectKey{Name: name}, vsc); err != nil {
-		if apierrors.IsNotFound(err) {
+	if !wait {
+		if done, _ := gone(ctx); done {
+			log.Infof("Static VolumeSnapshotContent %s is gone, the CSI driver deleted snapshot %s", key.Name, record.CSISnapshotHandle)
 			return nil
 		}
-		return errors.Wrapf(err, "error getting temp VolumeSnapshotContent %s", name)
+		return pending
 	}
-	original := vsc.DeepCopy()
-	kept := vsc.Finalizers[:0:0]
-	for _, f := range vsc.Finalizers {
-		if f != VSCBoundProtectionFinalizer {
-			kept = append(kept, f)
-		}
+	if err := kwait.PollUntilContextTimeout(ctx, retainedSnapshotPollInterval, timeout, true, gone); err != nil {
+		pending.Waited = timeout
+		return pending
 	}
-	if len(kept) != len(vsc.Finalizers) {
-		vsc.Finalizers = kept
-		if err := crClient.Patch(ctx, vsc, crclient.MergeFrom(original)); err != nil && !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "error removing the finalizer of temp VolumeSnapshotContent %s", name)
-		}
-	}
-	if vsc.DeletionTimestamp == nil {
-		if err := crClient.Delete(ctx, vsc); err != nil && !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "error deleting temp VolumeSnapshotContent %s", name)
-		}
-	}
-	log.Infof("Released temp VolumeSnapshotContent %s of the escalated snapshot %s", name, record.CSISnapshotHandle)
+	log.Infof("Deleted static VolumeSnapshotContent %s, the CSI driver deleted snapshot %s", key.Name, record.CSISnapshotHandle)
 	return nil
-}
-
-// latestSnapshotDeleteErrorMessage returns the message of the latest
-// SnapshotDeleteError event recorded for the named VolumeSnapshotContent, and
-// its best-effort classification. Events of a cluster-scoped object are
-// recorded in the default namespace, which the Velero manager's cache does not
-// cover, so reads go through the API reader when one is given. A failure to
-// list the events only removes the fast path and detail from a pending
-// deletion and is not an error: the timeout decides without it.
-func latestSnapshotDeleteErrorMessage(ctx context.Context, reader crclient.Reader, vscName string, log logrus.FieldLogger) (message string, kind snapshotDeleteErrorKind) {
-	events := &corev1api.EventList{}
-	if err := reader.List(ctx, events, crclient.InNamespace(metav1.NamespaceDefault)); err != nil {
-		log.WithError(err).Warnf("Failed to list the events of VolumeSnapshotContent %s", vscName)
-		return "", snapshotDeleteErrorNone
-	}
-
-	var latest *corev1api.Event
-	for i := range events.Items {
-		event := &events.Items[i]
-		if event.InvolvedObject.Kind != "VolumeSnapshotContent" || event.InvolvedObject.Name != vscName ||
-			event.Reason != SnapshotDeleteErrorEventReason {
-			continue
-		}
-		if latest == nil || event.LastTimestamp.After(latest.LastTimestamp.Time) {
-			latest = event
-		}
-	}
-	if latest == nil {
-		return "", snapshotDeleteErrorNone
-	}
-
-	// The matching is message-based and therefore snapshotter-version-sensitive;
-	// an unknown message is treated as retryable rather than a call failure,
-	// and the timeout, not this match, is what finally counts the attempt.
-	switch {
-	case strings.Contains(latest.Message, snapshotDeleteCallFailureMessage):
-		return latest.Message, snapshotDeleteErrorCall
-	case strings.Contains(latest.Message, snapshotDeleteCredentialFailureMessage):
-		return latest.Message, snapshotDeleteErrorCredential
-	}
-	return latest.Message, snapshotDeleteErrorOther
 }
 
 // PatchVSCDeletionPolicy patches the deletion policy of the named

@@ -61,22 +61,6 @@ const (
 	// normally the value of the label should the "true" or "false"
 	DataUploadSnapshotInfoLabel = "velero.io/data-upload-snapshot-info"
 
-	// RetainedSnapshotsPendingAnnotation marks a DeleteBackupRequest whose
-	// backup has retained snapshots being deleted by the retained-snapshot
-	// controller. Only a request carrying the annotation is let back in to
-	// evaluate completion, and it is exempt from the max-age deletion of
-	// in-progress requests, so a slow snapshot controller cannot have its
-	// request deleted mid-deletion. The request clears its own annotation only
-	// when it observes the completed family and runs the tail.
-	RetainedSnapshotsPendingAnnotation = "velero.io/retained-snapshots-pending"
-
-	// RetainedSnapshotsBackupNameAnnotation carries the full, unmodified name
-	// of the backup a retained snapshot record shard belongs to. The
-	// backup-name label stores a sanitized value that hashes names longer
-	// than 63 characters, which cannot be turned back into the Backup's name,
-	// while an annotation value has no such limit.
-	RetainedSnapshotsBackupNameAnnotation = "velero.io/retained-snapshots-backup-name"
-
 	// DataDownloadLabel is the label key used to identify the datadownload for snapshot restore pod
 	DataDownloadLabel = "velero.io/data-download"
 
