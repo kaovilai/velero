@@ -543,9 +543,11 @@ var (
 // a bare CSI handle -- so a static content is created here purely as the
 // deletion vehicle (csi.DeleteRetainedSnapshot). A failed attempt is retried a
 // few times within the timeout; a content an earlier release left being
-// deleted is checked once and not waited on again. An error means the
-// snapshot stays until the deletion of the backup that recorded it.
-func ReleaseRetainedSnapshot(ctx context.Context, crClient client.Client, base *velerov2alpha1api.RetainedCSIStorageSnapshot,
+// deleted is checked once and not waited on again. reader must read from the
+// API server, not a cache: a cache that has not seen the static content yet
+// would answer NotFound for it. An error means the snapshot stays until the
+// deletion of the backup that recorded it.
+func ReleaseRetainedSnapshot(ctx context.Context, crClient client.Client, reader client.Reader, base *velerov2alpha1api.RetainedCSIStorageSnapshot,
 	ownerBackupUID types.UID, timeout time.Duration, log logrus.FieldLogger) error {
 	deadline := time.Now().Add(timeout)
 	var err error
@@ -554,7 +556,7 @@ func ReleaseRetainedSnapshot(ctx context.Context, crClient client.Client, base *
 		if remaining <= 0 {
 			break
 		}
-		err = csi.DeleteRetainedSnapshot(ctx, crClient, crClient, base, ownerBackupUID,
+		err = csi.DeleteRetainedSnapshot(ctx, crClient, reader, base, ownerBackupUID,
 			csi.RetainedSnapshotDeletionOptions{Timeout: remaining, CheckInProgressOnce: true}, log)
 		var pending *csi.RetainedSnapshotDeletionPendingError
 		if err == nil || errors.As(err, &pending) {

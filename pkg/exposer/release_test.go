@@ -83,7 +83,7 @@ func TestReleaseRetainedSnapshotRetries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			creates := 0
 			c := releaseClient(t, tc.createErrs, tc.stuck, &creates)
-			err := ReleaseRetainedSnapshot(t.Context(), c, base, "backup-uid", 500*time.Millisecond, velerotest.NewLogger())
+			err := ReleaseRetainedSnapshot(t.Context(), c, c, base, "backup-uid", 500*time.Millisecond, velerotest.NewLogger())
 			if tc.wantErr {
 				require.Error(t, err)
 			} else {
@@ -103,10 +103,10 @@ func TestReleaseRetainedSnapshotChecksContentInDeletionOnce(t *testing.T) {
 	creates := 0
 	c := releaseClient(t, 0, true, &creates)
 	// An earlier release left the content being deleted.
-	require.Error(t, ReleaseRetainedSnapshot(t.Context(), c, base, "backup-uid", 200*time.Millisecond, velerotest.NewLogger()))
+	require.Error(t, ReleaseRetainedSnapshot(t.Context(), c, c, base, "backup-uid", 200*time.Millisecond, velerotest.NewLogger()))
 
 	start := time.Now()
-	err := ReleaseRetainedSnapshot(t.Context(), c, base, "backup-uid", time.Hour, velerotest.NewLogger())
+	err := ReleaseRetainedSnapshot(t.Context(), c, c, base, "backup-uid", time.Hour, velerotest.NewLogger())
 	var pending *csi.RetainedSnapshotDeletionPendingError
 	require.ErrorAs(t, err, &pending)
 	assert.Zero(t, pending.Waited, "checked once, not waited on")

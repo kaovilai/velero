@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -152,7 +153,7 @@ func (r *DataUploadReconciler) releaseBase(ctx context.Context, du *velerov2alph
 		ManagedByLabelValue: record.ManagedByLabelValue,
 	}
 	baseLog := log.WithField("baseSnapshot", baseHandle)
-	if err := exposer.ReleaseRetainedSnapshot(ctx, r.client, base, types.UID(du.Labels[velerov1api.BackupUIDLabel]), csi.RetainedSnapshotDeletionTimeout, baseLog); err != nil {
+	if err := exposer.ReleaseRetainedSnapshot(ctx, r.client, r.apiReader(), base, types.UID(du.Labels[velerov1api.BackupUIDLabel]), csi.RetainedSnapshotDeletionTimeout, baseLog); err != nil {
 		baseLog.WithError(err).Warn("Failed to release the base snapshot, the deletion of the backup that recorded it deletes it")
 		r.events().Event(du, true, "RetainedSnapshotReleaseFailed",
 			"the base snapshot %s was not released: %v; the deletion of the backup that recorded it deletes it", baseHandle, err)
@@ -160,6 +161,15 @@ func (r *DataUploadReconciler) releaseBase(ctx context.Context, du *velerov2alph
 	}
 	baseLog.Info("Released the base snapshot")
 	r.events().Event(du, false, "RetainedSnapshotReleased", "the base snapshot %s was released", baseHandle)
+}
+
+// apiReader returns a reader of the API server: the manager's client reads
+// from its cache. Without a manager, as in tests, the client itself.
+func (r *DataUploadReconciler) apiReader() client.Reader {
+	if r.mgr != nil {
+		return r.mgr.GetAPIReader()
+	}
+	return r.client
 }
 
 // warnNotRetained records why a completed DataUpload's snapshot was not

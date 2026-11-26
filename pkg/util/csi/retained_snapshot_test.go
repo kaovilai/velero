@@ -488,3 +488,47 @@ func TestDeleteRetainedSnapshotWaitsAgainWithoutCheckOnce(t *testing.T) {
 	require.ErrorAs(t, err, &pending)
 	assert.Equal(t, timeout, pending.Waited, "the content in deletion is waited on again")
 }
+
+// notFoundReader answers every read of a VolumeSnapshotContent with NotFound,
+// as a cache that has not seen the content yet would.
+type notFoundReader struct {
+	crclient.Reader
+}
+
+func (n notFoundReader) Get(ctx context.Context, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
+	if _, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
+		return apierrors.NewNotFound(snapshotv1api.Resource("volumesnapshotcontents"), key.Name)
+	}
+	return n.Reader.Get(ctx, key, obj, opts...)
+}
+
+// TestDeleteRetainedSnapshotStaleReaderNeverReportsGone proves a reader that
+// answers NotFound for a content that exists cannot make the helper report the
+// snapshot deleted: neither while waiting for a content the driver does not
+// delete, nor for a content an earlier attempt left, which the create finds.
+func TestDeleteRetainedSnapshotStaleReaderNeverReportsGone(t *testing.T) {
+	timeout := shortenRetainedSnapshotWaits(t)
+	record := retainedTestRecord()
+
+	t.Run("waiting for the content to go", func(t *testing.T) {
+		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}, driverFails: true}
+		c := backend.client(t)
+		err := DeleteRetainedSnapshot(t.Context(), c, notFoundReader{Reader: c}, record, retainedTestBackupUID, RetainedSnapshotDeletionOptions{Timeout: timeout}, velerotest.NewLogger())
+		var pending *RetainedSnapshotDeletionPendingError
+		require.ErrorAs(t, err, &pending, "the content still exists, so the snapshot is not deleted")
+		left, getErr := getTempVSC(t, c, record)
+		require.NoError(t, getErr)
+		assert.NotNil(t, left.DeletionTimestamp)
+		assert.True(t, backend.snapshots[retainedTestHandle])
+	})
+
+	t.Run("a content an earlier attempt left", func(t *testing.T) {
+		leftover := BuildTempVSCForRetainedSnapshot(record, retainedTestBackupUID)
+		backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
+		c := backend.client(t, leftover)
+		require.Error(t, DeleteRetainedSnapshot(t.Context(), c, notFoundReader{Reader: c}, record, retainedTestBackupUID, RetainedSnapshotDeletionOptions{Timeout: timeout}, velerotest.NewLogger()))
+		assert.True(t, backend.snapshots[retainedTestHandle], "nothing was deleted")
+		_, getErr := getTempVSC(t, c, record)
+		require.NoError(t, getErr)
+	})
+}

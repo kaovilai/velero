@@ -142,6 +142,8 @@ func (d *DataUploadDeleteAction) deleteRetainedSnapshot(bak *velerov1.Backup, du
 	noWait := d.timedOut[bak.UID]
 	d.mu.Unlock()
 	log.Infof("Deleting the retained snapshot %s of driver %s", record.CSISnapshotHandle, record.Driver)
+	// The plugin process's client (client.Factory.KubebuilderClient) is a
+	// direct client, so the helper's existence reads go to the API server.
 	err := csi.DeleteRetainedSnapshot(ctx, d.client, d.client, record, bak.UID, csi.RetainedSnapshotDeletionOptions{Timeout: d.resourceTimeout, NoWait: noWait}, log)
 	var pending *csi.RetainedSnapshotDeletionPendingError
 	if errors.As(err, &pending) && !noWait {
