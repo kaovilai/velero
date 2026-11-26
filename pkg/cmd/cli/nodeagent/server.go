@@ -62,6 +62,7 @@ import (
 	"github.com/velero-io/velero/pkg/nodeagent"
 	repository "github.com/velero-io/velero/pkg/repository/manager"
 	velerotypes "github.com/velero-io/velero/pkg/types"
+	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/filesystem"
 	"github.com/velero-io/velero/pkg/util/kube"
 	"github.com/velero-io/velero/pkg/util/logging"
@@ -442,6 +443,11 @@ func (s *nodeAgentServer) run() {
 		s.logger.WithError(err).Fatal("Unable to create the pod volume restore controller")
 	}
 
+	// The release of a retained base snapshot and the patch-back are bounded
+	// by the CSI operation timeout.
+	if s.config.resourceTimeout > 0 {
+		csi.RetainedSnapshotDeletionTimeout = s.config.resourceTimeout
+	}
 	dataUploadReconciler := controller.NewDataUploadReconciler(
 		s.mgr.GetClient(),
 		s.mgr,

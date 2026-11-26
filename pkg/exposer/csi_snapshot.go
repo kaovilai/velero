@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/nodeagent"
 	velerotypes "github.com/velero-io/velero/pkg/types"
 	"github.com/velero-io/velero/pkg/util"
@@ -526,6 +527,26 @@ func getVolumeModeByAccessMode(accessMode string, dataMover string) (corev1api.P
 	default:
 		return "", errors.Errorf("unsupported access mode %s", accessMode)
 	}
+}
+
+// ReleaseRetainedSnapshot releases a retained base snapshot that a newer
+// backup of the same volume no longer needs: the delta of the newer backup is
+// in the repository, and restores read from the repository, never from a
+// storage snapshot. No parent VolumeSnapshot or content exists during the
+// backup -- the changed-block call takes the base as a bare CSI handle -- so
+// the static content is created here, at cleanup, purely as the deletion
+// vehicle: vsc-<hash> of driver and handle with deletionPolicy Delete, status
+// seeded, deleted, and waited on up to the timeout. A content an earlier
+// release left being deleted is checked once and not waited on again, so a
+// snapshot the driver cannot delete does not add the bound to every later
+// backup of the chain. A release that does not finish leaves the content
+// being deleted -- the CSI snapshotter keeps retrying DeleteSnapshot -- and
+// returns an error; the caller keeps the record unreleased so a later backup
+// retries through the same content name.
+func ReleaseRetainedSnapshot(ctx context.Context, crClient client.Client, reader client.Reader, record *velerov2alpha1api.RetainedCSIStorageSnapshot,
+	ownerBackupUID types.UID, timeout time.Duration, log logrus.FieldLogger) error {
+	return csi.DeleteRetainedSnapshot(ctx, crClient, reader, record, ownerBackupUID,
+		csi.RetainedSnapshotDeletionOptions{Timeout: timeout, CheckInProgressOnce: true}, log)
 }
 
 func (e *csiSnapshotExposer) createBackupVS(ctx context.Context, ownerObject corev1api.ObjectReference, snapshotVS *snapshotv1api.VolumeSnapshot) (*snapshotv1api.VolumeSnapshot, error) {

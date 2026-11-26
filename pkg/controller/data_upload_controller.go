@@ -91,6 +91,9 @@ type DataUploadReconciler struct {
 	podAnnotations                 map[string]string
 	snapshotMetadataServiceConfigs *velerotypes.CSISnapshotMetadataService
 	tolerations                    []corev1api.Toleration
+
+	eventRecorderOnce sync.Once
+	eventRecorder     kube.EventRecorder
 }
 
 func NewDataUploadReconciler(
@@ -221,6 +224,34 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// remove finalizer no matter whether the cr is being deleted or not for it is no longer needed when internal resources are all cleaned up
 		// also in final status cr won't block the direct delete of the velero namespace
 		if controllerutil.ContainsFinalizer(du, DataUploadDownloadFinalizer) {
+			// A DataUpload deleted through the API -- a common support action
+			// for a stuck one -- runs the patch-back before its finalizer goes,
+			// unless it completed: the finalizer is dropped only after the
+			// snapshot was released or the patch-back reached its bound.
+			if !du.DeletionTimestamp.IsZero() && du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI &&
+				du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted &&
+				du.Status.RetainedCSIStorageSnapshot != nil && !du.Status.RetainedCSIStorageSnapshot.Released {
+				if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
+					var refused *leaseRefusedError
+					var bound *retainedSnapshotReleaseTimeoutError
+					switch {
+					case errors.As(releaseErr, &refused):
+						requeueAfter := refused.retryAfter
+						if requeueAfter <= 0 {
+							requeueAfter = dataUploadLeaseDuration
+						}
+						return ctrl.Result{RequeueAfter: requeueAfter + time.Second}, nil
+					case errors.As(releaseErr, &bound):
+						log.WithError(releaseErr).Error("The snapshot of the deleted DataUpload was not released within the bound; its content is left being deleted")
+						r.events().Event(du, true, "RetainedSnapshotReleaseTimedOut",
+							"the snapshot of the deleted DataUpload was not released within the bound; its content is left being deleted: %v", releaseErr)
+					default:
+						log.WithError(releaseErr).Warn("Failed to release the snapshot of the deleted DataUpload, will retry")
+						return ctrl.Result{}, releaseErr
+					}
+				}
+			}
+
 			if err := UpdateDataUploadWithRetry(ctx, r.client, req.NamespacedName, log, func(du *velerov2alpha1api.DataUpload) bool {
 				if !controllerutil.ContainsFinalizer(du, DataUploadDownloadFinalizer) {
 					return false
@@ -278,7 +309,12 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// to release -- its content was never switched to Retain -- so it skips
 	// the release and its uncached reads entirely, progress-update-driven
 	// reconciles and file system data mover DataUploads included.
-	if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI && du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted &&
+	// A DataUpload in a final phase is not retried here: the cancel, error
+	// and prepare-timeout paths run the patch-back themselves when they mark
+	// it Canceled or Failed, a Failed one at the bound keeps its record for
+	// the backup deletion, and one deleted through the API is handled by the
+	// finalizer branch above.
+	if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI && !isDataUploadInFinalState(du) &&
 		du.Status.RetainedCSIStorageSnapshot != nil && !du.Status.RetainedCSIStorageSnapshot.Released {
 		if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
 			var refused *leaseRefusedError
@@ -304,6 +340,8 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				// the snapshot (design section 3): the bound is terminal, the
 				// hook must not requeue forever.
 				log.WithError(releaseErr).Error("The retained snapshot of the unfinished DataUpload was not released in time, failing the DataUpload; its record is kept and the backup deletion owns the snapshot")
+				r.events().Event(du, true, "RetainedSnapshotReleaseTimedOut",
+					"the snapshot of the unfinished DataUpload was not released within the bound; its content is left being deleted and the record is kept for the backup deletion: %v", releaseErr)
 				_ = r.updateStatusToFailed(ctx, du, releaseErr, "timeout releasing the retained snapshot of the unfinished data upload", log)
 				return ctrl.Result{}, nil
 			}
@@ -629,6 +667,12 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 	} else {
 		log.Info("Data upload completed")
 		r.metrics.RegisterDataUploadSuccess(r.nodeName)
+
+		// The completed DataUpload holds the newer base of its volume, so the
+		// older retained snapshots of the chain are released now, by the
+		// exposer, synchronously. A failed or canceled DataUpload never gets
+		// here, so its parent stays untouched.
+		r.releaseOlderRetainedSnapshots(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log)
 	}
 }
 

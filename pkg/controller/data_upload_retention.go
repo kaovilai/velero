@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ import (
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	"github.com/velero-io/velero/pkg/datapath"
+	"github.com/velero-io/velero/pkg/exposer"
 	"github.com/velero-io/velero/pkg/uploader/block"
 	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/datamover"
@@ -676,6 +678,112 @@ func (r *DataUploadReconciler) releaseRetainedSnapshot(ctx context.Context, du *
 		log.Infof("Released the retained snapshot %s of DataUpload %s, the record is cleared", record.CSISnapshotHandle, du.Name)
 	}
 	return nil
+}
+
+// releaseOlderRetainedSnapshots releases, through the exposer, every retained
+// snapshot of the completed DataUpload's chain -- the same driver and CSI
+// volume handle -- that an older DataUpload recorded and no backup released
+// yet, oldest first. That is the direct parent, and any older snapshot an
+// earlier release missed: the catch-up. Each release marks the owning
+// DataUpload's record released by the completed DataUpload's backup and emits
+// RetainedSnapshotReleased.
+//
+// It runs after the Completed write, never before: a crash in between leaves a
+// Completed DataUpload with an unreleased parent, which the next backup of the
+// chain catches up. A release never fails the backup. One that times out or
+// errors leaves its static content being deleted, emits
+// RetainedSnapshotReleaseTimedOut and keeps the record unreleased, so the next
+// backup of the volume retries it; that retry checks a content still being
+// deleted once instead of waiting on it again.
+func (r *DataUploadReconciler) releaseOlderRetainedSnapshots(ctx context.Context, key types.NamespacedName, log logrus.FieldLogger) {
+	holder := &velerov2alpha1api.DataUpload{}
+	if err := r.uncachedReader().Get(ctx, key, holder); err != nil {
+		log.WithError(err).Warn("Failed to read the completed DataUpload, not releasing the older retained snapshots of its volume")
+		return
+	}
+	chain := holder.Status.RetainedCSIStorageSnapshot
+	if holder.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted || chain == nil || chain.Released ||
+		chain.CSIVolumeHandle == "" || chain.Driver == "" {
+		return
+	}
+
+	all := &velerov2alpha1api.DataUploadList{}
+	if err := r.client.List(ctx, all, crclient.InNamespace(holder.Namespace)); err != nil {
+		log.WithError(err).Warn("Failed to list the DataUploads, not releasing the older retained snapshots of the volume")
+		return
+	}
+	timeout := csi.RetainedSnapshotDeletionTimeout
+	releasedBy := holder.Labels[velerov1api.BackupUIDLabel]
+	for _, candidate := range releaseCandidates(holder, all.Items) {
+		record := candidate.Status.RetainedCSIStorageSnapshot
+		candidateLog := log.WithFields(logrus.Fields{"releasedDataUpload": candidate.Name, "snapshot": record.CSISnapshotHandle})
+		if err := exposer.ReleaseRetainedSnapshot(ctx, r.client, r.uncachedReader(), record, types.UID(candidate.Labels[velerov1api.BackupUIDLabel]), timeout, candidateLog); err != nil {
+			candidateLog.WithError(err).Warn("Failed to release the retained snapshot, a later backup of the volume retries it")
+			r.events().Event(holder, true, "RetainedSnapshotReleaseTimedOut",
+				"the retained snapshot %s of DataUpload %s was not released: %v; a later backup of the volume retries it", record.CSISnapshotHandle, candidate.Name, err)
+			continue
+		}
+		if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: candidate.Namespace, Name: candidate.Name}, candidateLog, func(current *velerov2alpha1api.DataUpload) bool {
+			if current.Status.RetainedCSIStorageSnapshot == nil || current.Status.RetainedCSIStorageSnapshot.Released {
+				return false
+			}
+			current.Status.RetainedCSIStorageSnapshot.Released = true
+			current.Status.RetainedCSIStorageSnapshot.ReleasedBy = releasedBy
+			return true
+		}); err != nil && !apierrors.IsNotFound(err) {
+			// The snapshot is gone; a record left unreleased is deleted again
+			// by its backup deletion, which finds nothing to delete.
+			candidateLog.WithError(err).Warn("Failed to mark the retained snapshot record released")
+			continue
+		}
+		candidateLog.Infof("Released the retained snapshot %s of DataUpload %s, DataUpload %s holds the newer base of the volume", record.CSISnapshotHandle, candidate.Name, holder.Name)
+		r.events().Event(holder, false, "RetainedSnapshotReleased",
+			"the retained snapshot %s of DataUpload %s was released: DataUpload %s of backup %s holds the newer base of the volume", record.CSISnapshotHandle, candidate.Name, holder.Name, releasedBy)
+	}
+}
+
+// releaseCandidates returns the DataUploads whose unreleased retained snapshot
+// belongs to the holder's chain and completed before the holder, oldest first.
+func releaseCandidates(holder *velerov2alpha1api.DataUpload, all []velerov2alpha1api.DataUpload) []*velerov2alpha1api.DataUpload {
+	chain := holder.Status.RetainedCSIStorageSnapshot
+	holderDone := dataUploadCompletion(holder)
+	var out []*velerov2alpha1api.DataUpload
+	for i := range all {
+		du := &all[i]
+		record := du.Status.RetainedCSIStorageSnapshot
+		if du.Name == holder.Name || record == nil || record.Released || !du.DeletionTimestamp.IsZero() ||
+			record.Driver != chain.Driver || record.CSIVolumeHandle != chain.CSIVolumeHandle ||
+			record.CSISnapshotHandle == "" || record.CSISnapshotHandle == chain.CSISnapshotHandle {
+			continue
+		}
+		if !dataUploadCompletion(du).Before(holderDone) {
+			continue
+		}
+		out = append(out, du)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return dataUploadCompletion(out[i]).Before(dataUploadCompletion(out[j]))
+	})
+	return out
+}
+
+// dataUploadCompletion returns when the DataUpload completed, falling back to
+// its creation for an object without a completion timestamp.
+func dataUploadCompletion(du *velerov2alpha1api.DataUpload) time.Time {
+	if du.Status.CompletionTimestamp != nil {
+		return du.Status.CompletionTimestamp.Time
+	}
+	return du.CreationTimestamp.Time
+}
+
+// events returns the reconciler's event recorder, built on first use.
+func (r *DataUploadReconciler) events() kube.EventRecorder {
+	r.eventRecorderOnce.Do(func() {
+		if r.eventRecorder == nil {
+			r.eventRecorder = kube.NewEventRecorder(r.kubeClient, r.client.Scheme(), "velero-data-upload", r.nodeName, r.logger)
+		}
+	})
+	return r.eventRecorder
 }
 
 // fallbackReasonOf returns the reason a velero-block incremental fell back to

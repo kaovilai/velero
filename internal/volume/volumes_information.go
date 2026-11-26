@@ -217,7 +217,7 @@ type BackupSnapshotDataMovementInfo struct {
 
 	// RetainedCSIVolumeHandle is the CSI volume handle that keys the retained
 	// snapshot's chain with the driver.
-	RetainedCSIVolumeHandle string `json:"retainedCSIVolumeHandle,omitempty"`
+	RetainedCSIVolumeHandle string `json:"csiVolumeHandle,omitempty"`
 
 	// BaseCSISnapshotHandle is the retained snapshot this backup's changed blocks were
 	// computed against; empty on a full read.
@@ -227,8 +227,8 @@ type BackupSnapshotDataMovementInfo struct {
 	// release of the retained snapshot. They are not part of the backup metadata:
 	// `velero backup describe` fills them from the local DataUpload, which a later
 	// backup of the same chain updates after this backup's metadata was written.
-	RetainedSnapshotReleased   bool   `json:"retainedSnapshotReleased,omitempty"`
-	RetainedSnapshotReleasedBy string `json:"retainedSnapshotReleasedBy,omitempty"`
+	RetainedSnapshotReleased   bool   `json:"released,omitempty"`
+	RetainedSnapshotReleasedBy string `json:"releasedBy,omitempty"`
 }
 
 // RestoreSnapshotDataMovementInfo is used for displaying the restore snapshot data mover status.
