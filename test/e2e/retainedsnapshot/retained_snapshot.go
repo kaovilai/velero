@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1api "k8s.io/api/core/v1"
@@ -462,18 +463,15 @@ func (r *retainedSnapshotCase) expectReleased(backupName, handle, releasedByBack
 
 // deletionObservation is what the watcher saw while a backup was deleted.
 type deletionObservation struct {
-	familySeen  bool
 	tempVSCSeen bool
 }
 
 // deleteBackup deletes the backup through the Velero CLI, waits for the Backup
 // to be gone, and asserts that the retained snapshots named by handles were
-// deleted from the storage through the record family and a temp content, and
-// that nothing of that machinery is left behind.
+// deleted from the storage, synchronously, through the static vsc-<hash>
+// content, and that nothing is left behind.
 func (r *retainedSnapshotCase) deleteBackup(backupName string, handles ...string) {
 	By(fmt.Sprintf("Delete backup %s through the CLI and wait for it to be gone", backupName))
-	uid, err := r.backupUID(backupName)
-	Expect(err).NotTo(HaveOccurred())
 	_, snapshotClient, err := csi.GetClients()
 	Expect(err).NotTo(HaveOccurred())
 
@@ -481,32 +479,25 @@ func (r *retainedSnapshotCase) deleteBackup(backupName string, handles ...string
 	for _, handle := range handles {
 		tempVSCs = append(tempVSCs, velerocsi.TempVSCName(hostpathDriver, handle))
 	}
-	familyPrefix := "retained-snapshots-" + uid + "-"
 
-	ctx, cancel := context.WithCancel(r.Ctx)
+	// The static content of a synchronous deletion can live for milliseconds,
+	// so it is observed through a watch started before the deletion, not by
+	// polling.
+	listed, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().List(r.Ctx, metav1.ListOptions{Limit: 1})
+	Expect(err).NotTo(HaveOccurred())
+	watcher, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Watch(r.Ctx, metav1.ListOptions{ResourceVersion: listed.ResourceVersion})
+	Expect(err).NotTo(HaveOccurred())
+	wanted := map[string]bool{}
+	for _, name := range tempVSCs {
+		wanted[name] = true
+	}
 	done := make(chan struct{})
 	var obs deletionObservation
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(watchInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			if !obs.familySeen {
-				if shards, err := r.familyShards(ctx, familyPrefix); err == nil && len(shards) > 0 {
-					obs.familySeen = true
-				}
-			}
-			if !obs.tempVSCSeen {
-				for _, name := range tempVSCs {
-					if _, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, name, metav1.GetOptions{}); err == nil {
-						obs.tempVSCSeen = true
-					}
-				}
+		for event := range watcher.ResultChan() {
+			if vsc, ok := event.Object.(*snapshotv1api.VolumeSnapshotContent); ok && wanted[vsc.Name] {
+				obs.tempVSCSeen = true
 			}
 		}
 	}()
@@ -522,24 +513,20 @@ func (r *retainedSnapshotCase) deleteBackup(backupName string, handles ...string
 		r.dumpDeletionState(backupName)
 		return fmt.Sprintf("backup %s was not deleted within %s", backupName, deletionTimeout)
 	})
-	cancel()
+	watcher.Stop()
 	<-done
 
 	if len(handles) > 0 {
-		By("The record was copied into the retained-snapshots ConfigMap family and deleted through a temp VolumeSnapshotContent")
-		Expect(obs.familySeen).To(BeTrue(), "no %s* ConfigMap was observed during the deletion", familyPrefix)
-		Expect(obs.tempVSCSeen).To(BeTrue(), "no temp VolumeSnapshotContent %v was observed during the deletion", tempVSCs)
+		By("The retained snapshot was deleted through the static VolumeSnapshotContent")
+		Expect(obs.tempVSCSeen).To(BeTrue(), "no static VolumeSnapshotContent %v was observed during the deletion", tempVSCs)
 	}
 
 	By("Nothing of the deletion is left behind and the storage snapshots are gone")
 	for i, handle := range handles {
 		r.expectStorageSnapshot(handle, false)
 		_, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(r.Ctx, tempVSCs[i], metav1.GetOptions{})
-		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "temp VolumeSnapshotContent %s is still there (err=%v)", tempVSCs[i], err)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "static VolumeSnapshotContent %s is still there (err=%v)", tempVSCs[i], err)
 	}
-	shards, err := r.familyShards(r.Ctx, familyPrefix)
-	Expect(err).NotTo(HaveOccurred())
-	Expect(shards).To(BeEmpty(), "record family %s* was not removed", familyPrefix)
 	vscs, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().List(r.Ctx, metav1.ListOptions{
 		LabelSelector: velerov1api.BackupNameLabel + "=" + label.GetValidName(backupName)})
 	Expect(err).NotTo(HaveOccurred())
@@ -548,48 +535,15 @@ func (r *retainedSnapshotCase) deleteBackup(backupName string, handles ...string
 	Expect(r.Client.Kubebuilder.List(r.Ctx, dus, kbclient.InNamespace(r.VeleroCfg.VeleroNamespace),
 		kbclient.MatchingLabels{velerov1api.BackupNameLabel: label.GetValidName(backupName)})).To(Succeed())
 	Expect(dus.Items).To(BeEmpty(), "DataUploads of backup %s remain", backupName)
-	for _, handle := range handles {
-		r.expectNoOrphanEntry(handle)
-	}
-}
-
-// familyShards lists every shard of the backup's record family: shard 0, the
-// manifest, which carries the family label, and the entry shards, which carry
-// only the backup labels. Both carry the backup UID label and the name prefix.
-func (r *retainedSnapshotCase) familyShards(ctx context.Context, prefix string) ([]string, error) {
-	uid := strings.TrimSuffix(strings.TrimPrefix(prefix, "retained-snapshots-"), "-")
-	list, err := r.Client.ClientGo.CoreV1().ConfigMaps(r.VeleroCfg.VeleroNamespace).List(ctx, metav1.ListOptions{LabelSelector: velerov1api.BackupUIDLabel + "=" + uid})
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, cm := range list.Items {
-		if strings.HasPrefix(cm.Name, prefix) {
-			names = append(names, cm.Name)
-		}
-	}
-	return names, nil
-}
-
-// expectNoOrphanEntry asserts that no orphan-snapshot ConfigMap names the
-// handle: an entry there would mean the deletion gave up on the snapshot.
-func (r *retainedSnapshotCase) expectNoOrphanEntry(handle string) {
-	list, err := r.Client.ClientGo.CoreV1().ConfigMaps(r.VeleroCfg.VeleroNamespace).List(r.Ctx, metav1.ListOptions{LabelSelector: "velero.io/orphan-snapshots"})
-	Expect(err).NotTo(HaveOccurred())
-	for _, cm := range list.Items {
-		for key, value := range cm.Data {
-			Expect(value).NotTo(ContainSubstring(handle), "orphan-snapshot ConfigMap %s entry %s names snapshot %s", cm.Name, key, handle)
-		}
-	}
 }
 
 func (r *retainedSnapshotCase) dumpDeletionState(backupName string) {
 	fmt.Fprintf(GinkgoWriter, "--- deletion state of backup %s ---\n", backupName)
 	for _, args := range [][]string{
 		{"get", "deletebackuprequests", "-n", r.VeleroCfg.VeleroNamespace, "-o", "yaml"},
-		{"get", "configmaps", "-n", r.VeleroCfg.VeleroNamespace, "-l", velerov1api.BackupUIDLabel, "-o", "yaml"},
 		{"get", "volumesnapshotcontents", "-o", "yaml"},
-		{"get", "events", "-n", hostpathNamespace, "--field-selector", "reason=SnapshotDeleteError"},
+		{"get", "events", "-A", "--field-selector", "reason=SnapshotDeleteError"},
+		{"get", "events", "-n", r.VeleroCfg.VeleroNamespace, "--field-selector", "involvedObject.kind=Backup"},
 	} {
 		_, _, _ = KubectlExec(r.Ctx, args...)
 	}
@@ -726,8 +680,11 @@ func (c *lifecycleCase) Verify() error {
 }
 
 // chainCase: three backups of the same volume. The rolling base keeps one
-// retained snapshot per volume: backup 2 releases backup 1's snapshot, backup 3
-// releases backup 2's. All three backups restore their data, deleting the
+// retained snapshot per volume. Backup 2's release of backup 1's snapshot is
+// made to miss -- a static content for that handle is left in deletion behind
+// a test finalizer, so the release finds it in progress, checks it once and
+// keeps the record unreleased -- and backup 3's catch-up then releases both
+// backup 1 and backup 2. All three backups restore their data, deleting the
 // released backups 1 and 2 changes nothing on the storage, and deleting backup
 // 3 removes the last snapshot.
 type chainCase struct {
@@ -746,7 +703,7 @@ func (c *chainCase) Init() error {
 	}
 	c.TestMsg = &TestMSG{
 		Desc:      "chain of three velero-block backups with the rolling base",
-		Text:      "Each completed backup releases the older retained snapshot of the volume; every backup still restores, and deleting the released backups changes nothing on the storage",
+		Text:      "Each completed backup releases the older retained snapshots of the volume, catching up a missed release; every backup still restores, and deleting the released backups changes nothing on the storage",
 		FailedMSG: "The rolling base kept or released the wrong snapshot, or a backup of the chain did not restore",
 	}
 	return nil
@@ -776,8 +733,17 @@ func (c *chainCase) Backup() error {
 			volumeHandle = du.Status.RetainedCSIStorageSnapshot.CSIVolumeHandle
 		}
 		Expect(du.Status.RetainedCSIStorageSnapshot.CSIVolumeHandle).To(Equal(volumeHandle), "every backup of the volume belongs to one chain")
-		if i > 0 {
-			c.expectReleased(c.backups[i-1], c.handles[i-1], c.backups[i])
+		switch i {
+		case 0:
+			c.blockRelease(c.handles[0])
+		case 1:
+			By("Backup 2's release of backup 1 missed: the record stays unreleased and the snapshot stays")
+			c.expectReleaseMissed(c.backups[0], c.handles[0])
+			c.unblockRelease(c.handles[0])
+		case 2:
+			By("Backup 3 catches up: both older snapshots are released by it")
+			c.expectReleased(c.backups[0], c.handles[0], c.backups[2])
+			c.expectReleased(c.backups[1], c.handles[1], c.backups[2])
 		}
 	}
 	Expect(c.handles[0]).NotTo(Equal(c.handles[1]))
@@ -787,6 +753,84 @@ func (c *chainCase) Backup() error {
 	c.expectStorageSnapshot(c.handles[1], false)
 	c.expectStorageSnapshot(c.handles[2], true)
 	return nil
+}
+
+// blockReleaseFinalizer keeps the static content of the blocked release in
+// deletion.
+const blockReleaseFinalizer = "e2e.velero.io/block-release"
+
+// blockRelease leaves a static content for the handle in deletion, as an
+// earlier release that timed out would: deletionPolicy Retain, so the sidecar
+// never deletes the snapshot through it, and a test finalizer that keeps it
+// present. The next release finds it in progress, checks it once and leaves
+// the record unreleased.
+func (c *chainCase) blockRelease(handle string) {
+	By(fmt.Sprintf("Leave a static content for snapshot %s in deletion so the next release misses", handle))
+	_, snapshotClient, err := csi.GetClients()
+	Expect(err).NotTo(HaveOccurred())
+	name := velerocsi.TempVSCName(hostpathDriver, handle)
+	h := handle
+	blocking := &snapshotv1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Finalizers: []string{blockReleaseFinalizer}},
+		Spec: snapshotv1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1api.VolumeSnapshotContentRetain,
+			Driver:         hostpathDriver,
+			Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &h},
+			VolumeSnapshotRef: corev1api.ObjectReference{
+				APIVersion: snapshotv1api.SchemeGroupVersion.String(),
+				Kind:       "VolumeSnapshot",
+				Namespace:  "ns-" + name,
+				Name:       "name-" + name,
+			},
+		},
+	}
+	_, err = snapshotClient.SnapshotV1().VolumeSnapshotContents().Create(c.Ctx, blocking, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(c.Ctx, name, metav1.DeleteOptions{})).To(Succeed())
+}
+
+// unblockRelease drops the test finalizer, so the blocking content goes with
+// no DeleteSnapshot call: its policy is Retain.
+func (c *chainCase) unblockRelease(handle string) {
+	_, snapshotClient, err := csi.GetClients()
+	Expect(err).NotTo(HaveOccurred())
+	name := velerocsi.TempVSCName(hostpathDriver, handle)
+	Expect(wait.PollUntilContextTimeout(c.Ctx, pollInterval, cleanupTimeout, true, func(ctx context.Context) (bool, error) {
+		vsc, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, nil
+		}
+		var kept []string
+		for _, f := range vsc.Finalizers {
+			if f != blockReleaseFinalizer {
+				kept = append(kept, f)
+			}
+		}
+		vsc.Finalizers = kept
+		// A conflict or a transient error is retried on the next poll.
+		_, _ = snapshotClient.SnapshotV1().VolumeSnapshotContents().Update(ctx, vsc, metav1.UpdateOptions{})
+		return false, nil
+	})).To(Succeed(), "the blocking content %s did not go", name)
+}
+
+// expectReleaseMissed asserts the release of the backup's snapshot missed:
+// after the newer backup completed, its record stays unreleased and the
+// snapshot stays in the storage, while the RetainedSnapshotReleaseTimedOut
+// event names it.
+func (c *chainCase) expectReleaseMissed(backupName, handle string) {
+	Expect(wait.PollUntilContextTimeout(c.Ctx, pollInterval, cleanupTimeout, true, func(context.Context) (bool, error) {
+		stdout, _, err := KubectlExec(c.Ctx, "get", "events", "-n", c.VeleroCfg.VeleroNamespace,
+			"--field-selector", "reason=RetainedSnapshotReleaseTimedOut", "-o", "jsonpath={.items[*].message}")
+		return err == nil && strings.Contains(stdout, handle), nil
+	})).To(Succeed(), "no RetainedSnapshotReleaseTimedOut event names snapshot %s", handle)
+	du, err := c.dataUploadOf(backupName)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(du.Status.RetainedCSIStorageSnapshot).NotTo(BeNil())
+	Expect(du.Status.RetainedCSIStorageSnapshot.Released).To(BeFalse(), "the missed release keeps the record unreleased")
+	c.expectStorageSnapshot(handle, true)
 }
 
 // Destroy is a no-op: restoreAndVerify deletes the namespace before each restore.
@@ -898,25 +942,33 @@ func (c *holderCase) Verify() error {
 	return nil
 }
 
-// releaseCase: a DataUpload canceled mid-flight releases its snapshot instead
-// of retaining it, and a DataUpload backed up without the policy never writes
-// a record and never leaves a snapshot behind.
+// releaseCase: a completed retained parent survives the backups of its volume
+// that do not complete or do not retain, and only the next completed retaining
+// backup releases it. A DataUpload canceled mid-flight releases its own
+// snapshot instead of retaining it, and a DataUpload backed up without the
+// policy never writes a record and never leaves a snapshot behind.
 type releaseCase struct {
 	retainedSnapshotCase
+	parentBackup   string
 	canceledBackup string
 	plainBackup    string
+	nextBackup     string
+	parentHandle   string
+	nextHandle     string
 }
 
 func (c *releaseCase) Init() error {
 	if err := c.init("retain-release"); err != nil {
 		return err
 	}
+	c.parentBackup = "backup-parent-" + c.CaseBaseName
 	c.canceledBackup = "backup-cancel-" + c.CaseBaseName
 	c.plainBackup = "backup-plain-" + c.CaseBaseName
+	c.nextBackup = "backup-next-" + c.CaseBaseName
 	c.TestMsg = &TestMSG{
-		Desc:      "canceled velero-block DataUpload under the retention policy, and a DataUpload without it",
-		Text:      "A DataUpload that does not complete releases its snapshot and keeps no record; without the policy nothing is retained",
-		FailedMSG: "An unfinished or non-retaining DataUpload left a snapshot or a record behind",
+		Desc:      "canceled velero-block DataUpload under the retention policy, and a DataUpload without it, after a retained parent",
+		Text:      "A DataUpload that does not complete releases its snapshot, keeps no record and leaves the parent retained; without the policy nothing is retained; the next completed retaining backup releases the parent",
+		FailedMSG: "An unfinished or non-retaining DataUpload left a snapshot or a record behind, or released the parent",
 	}
 	return nil
 }
@@ -935,10 +987,45 @@ func (c *releaseCase) CreateResources() error {
 }
 
 func (c *releaseCase) Backup() error {
+	du, obs, err := c.backup(c.parentBackup, true)
+	if err != nil {
+		return err
+	}
+	c.parentHandle = c.expectRetained(du, obs)
+
 	if err := c.cancelDataUpload(); err != nil {
 		return err
 	}
-	return c.backupWithoutPolicy()
+	By("The canceled backup did not release the retained parent")
+	c.expectParentRetained()
+
+	if err := c.backupWithoutPolicy(); err != nil {
+		return err
+	}
+	By("The backup without the policy did not release the retained parent")
+	c.expectParentRetained()
+
+	if _, err := c.writeData(8); err != nil {
+		return err
+	}
+	du, obs, err = c.backup(c.nextBackup, true)
+	if err != nil {
+		return err
+	}
+	c.nextHandle = c.expectRetained(du, obs)
+	By("The next completed retaining backup releases the parent")
+	c.expectReleased(c.parentBackup, c.parentHandle, c.nextBackup)
+	return nil
+}
+
+// expectParentRetained asserts the parent's record is still unreleased and its
+// snapshot is still in the storage.
+func (c *releaseCase) expectParentRetained() {
+	du, err := c.dataUploadOf(c.parentBackup)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(du.Status.RetainedCSIStorageSnapshot).NotTo(BeNil())
+	Expect(du.Status.RetainedCSIStorageSnapshot.Released).To(BeFalse(), "the parent of backup %s was released", c.parentBackup)
+	c.expectStorageSnapshot(c.parentHandle, true)
 }
 
 func (c *releaseCase) cancelDataUpload() error {
@@ -1054,8 +1141,11 @@ func (c *releaseCase) waitBackupFinal(backupName string) error {
 }
 
 func (c *releaseCase) Verify() error {
-	By("Both backups delete cleanly: no record family, no orphan entry, no leftover content")
+	By("Every backup deletes cleanly and only the holder's deletion removes a snapshot")
 	c.deleteBackup(c.canceledBackup)
 	c.deleteBackup(c.plainBackup)
+	c.deleteBackup(c.parentBackup)
+	c.expectStorageSnapshot(c.nextHandle, true)
+	c.deleteBackup(c.nextBackup, c.nextHandle)
 	return nil
 }
