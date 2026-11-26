@@ -26,6 +26,7 @@ import (
 
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapshotv1fake "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned/typed/volumesnapshot/v1/fake"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
@@ -33,9 +34,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	clientTesting "k8s.io/client-go/testing"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -118,6 +121,8 @@ type retentionHarness struct {
 	failing     map[string]bool
 	deleteCalls []string
 	pruneRecord bool
+	// onRelease runs when the release creates its static content.
+	onRelease func()
 }
 
 func (h *retentionHarness) client(t *testing.T, objs ...runtime.Object) kbclient.Client {
@@ -141,6 +146,9 @@ func (h *retentionHarness) client(t *testing.T, objs ...runtime.Object) kbclient
 		Create: func(ctx context.Context, c kbclient.WithWatch, obj kbclient.Object, opts ...kbclient.CreateOption) error {
 			if vsc, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
 				h.steps = append(h.steps, "release:"+*vsc.Spec.Source.SnapshotHandle)
+				if h.onRelease != nil {
+					h.onRelease()
+				}
 			}
 			return c.Create(ctx, obj, opts...)
 		},
@@ -453,4 +461,39 @@ func TestFallbackReasonOf(t *testing.T) {
 	assert.Empty(t, fallbackReasonOf(datapath.BackupResult{}))
 	assert.Equal(t, "base snapshot gone: not found", fallbackReasonOf(datapath.BackupResult{FallbackFull: true, FallbackReason: "base snapshot gone: not found"}))
 	assert.Equal(t, "fallen back to a full read", fallbackReasonOf(datapath.BackupResult{FallbackFull: true}))
+}
+
+// TestReleaseRunsAfterTheDataPathSlotIsFreed proves the release runs after the
+// node's data path slot is given back: with a concurrency of one, a second
+// DataUpload acquires the slot while the release of the first one's base is
+// still waiting on the CSI snapshotter.
+func TestReleaseRunsAfterTheDataPathSlotIsFreed(t *testing.T) {
+	shortRelease(t)
+	origCreator := datapath.MicroServiceBRWatcherCreator
+	datapath.MicroServiceBRWatcherCreator = func(kbclient.Client, kubernetes.Interface, manager.Manager, string, string, string, string, string, string, datapath.Callbacks, logrus.FieldLogger) datapath.AsyncBR {
+		return nil
+	}
+	t.Cleanup(func() { datapath.MicroServiceBRWatcherCreator = origCreator })
+
+	// The base never goes, so the release waits for its whole bound.
+	h := &retentionHarness{failing: map[string]bool{baseHandle: true}}
+	du := retentionDataUploadBuilder().Result()
+	r, events := newRetentionReconciler(t, h, du, retentionBackupVSC(), nil)
+	r.dataPathMgr = datapath.NewManager(1)
+	_, err := r.dataPathMgr.CreateMicroServiceBRWatcher(t.Context(), r.client, nil, nil, datapath.TaskTypeBackup, du.Name, du.Namespace, "", "", "", datapath.Callbacks{}, false, velerotest.NewLogger())
+	require.NoError(t, err)
+	_, err = r.dataPathMgr.CreateMicroServiceBRWatcher(t.Context(), r.client, nil, nil, datapath.TaskTypeBackup, "other-du", du.Namespace, "", "", "", datapath.Callbacks{}, false, velerotest.NewLogger())
+	require.ErrorIs(t, err, datapath.ConcurrentLimitExceed, "the data path holds the only slot")
+
+	var acquired []error
+	h.onRelease = func() {
+		_, err := r.dataPathMgr.CreateMicroServiceBRWatcher(t.Context(), r.client, nil, nil, datapath.TaskTypeBackup, "other-du", du.Namespace, "", "", "", datapath.Callbacks{}, false, velerotest.NewLogger())
+		acquired = append(acquired, err)
+	}
+
+	r.OnDataUploadCompleted(t.Context(), du.Namespace, du.Name, datapath.Result{Backup: datapath.BackupResult{ParentChangeID: baseHandle}})
+
+	require.Len(t, acquired, 1, "the release ran")
+	require.NoError(t, acquired[0], "another DataUpload acquires the slot while the release waits")
+	assert.Equal(t, []string{"RetainedSnapshotReleaseFailed"}, events.reasons)
 }

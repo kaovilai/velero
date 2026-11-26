@@ -117,6 +117,11 @@ func (r *DataUploadReconciler) completeWithRetention(ctx context.Context, du *ve
 	r.metrics.RegisterDataUploadSuccess(r.nodeName)
 
 	if retained && !result.Backup.FallbackFull && result.Backup.ParentChangeID != "" && result.Backup.ParentChangeID != record.CSISnapshotHandle {
+		// The data movement is over: the node's data path slot is given back
+		// before the release, which can wait up to the CSI operation timeout,
+		// so the next DataUpload of the node does not wait on it. The
+		// callback's deferred removal is then a no-op.
+		r.dataPathMgr.RemoveAsyncBR(du.Name)
 		r.releaseBase(ctx, completed, record, result.Backup.ParentChangeID, log)
 	}
 }
