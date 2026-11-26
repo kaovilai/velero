@@ -223,6 +223,7 @@ func TestSnapshotSource(t *testing.T) {
 		expectedSize         int64
 		expectedSnapshotSize int64
 		expectedFallback     bool
+		expectedBase         string
 		cbtService           func(t *testing.T) cbtservice.Service
 	}{
 		{
@@ -348,6 +349,41 @@ func TestSnapshotSource(t *testing.T) {
 			expectedSnapshotSize: 1024,
 			expectedFallback:     true,
 		},
+		{
+			// The delta was computed against the parent's change ID, which
+			// the uploader reports as the base the node-agent releases.
+			name:           "incremental backup reports the parent's change ID as its base",
+			forceFull:      ptr.To(false),
+			parentSnapshot: "snap-parent",
+			cbtService: func(t *testing.T) cbtservice.Service {
+				t.Helper()
+				m := cbtservicemocks.NewService(t)
+				m.On("GetChangedBlocks", mock.Anything, "snap-1", "cid-parent", mock.Anything).
+					Run(func(args mock.Arguments) {
+						record := args.Get(3).(func([]cbtservice.Range) error)
+						record([]cbtservice.Range{{Offset: 0, Length: 512}})
+					}).Return(nil)
+				return m
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-parent")).
+					Return(udmrepo.Snapshot{
+						ID:         "snap-parent",
+						RootObject: udmrepo.ObjectMetadata{ID: "root-parent"},
+						Tags:       map[string]string{uploader.CBTChangeIDTag: "cid-parent", uploader.CBTVolumeIDTag: "vid-1"},
+					}, nil)
+				repo.On("ReadMetadata", mock.Anything, udmrepo.ID("root-parent")).
+					Return(&udmrepo.Metadata{SubObjects: []udmrepo.ObjectMetadata{{ID: "bdev-parent"}}}, nil)
+				blkup.On("Backup", mock.Anything, udmrepo.ID("bdev-parent"), mock.Anything, mock.Anything).
+					Return(udmrepo.Snapshot{TotalSize: 1024}, int64(512), nil)
+				repo.On("SaveSnapshot", mock.Anything, mock.Anything).Return(udmrepo.ID("snap-inc"), nil)
+				repo.On("Flush", mock.Anything).Return(nil)
+			},
+			expectedSnapID:       "snap-inc",
+			expectedSize:         512,
+			expectedSnapshotSize: 1024,
+			expectedBase:         "cid-parent",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -371,7 +407,7 @@ func TestSnapshotSource(t *testing.T) {
 				forceFull = *tc.forceFull
 			}
 
-			snapID, size, snapshotSize, fallback, _, err := snapshotSource(
+			snapID, size, snapshotSize, fallback, _, base, err := snapshotSource(
 				ctx, mockRepo, mockBlkup,
 				baseSource,
 				forceFull, tc.parentSnapshot,
@@ -389,6 +425,7 @@ func TestSnapshotSource(t *testing.T) {
 				assert.Equal(t, tc.expectedSize, size)
 				assert.Equal(t, tc.expectedSnapshotSize, snapshotSize)
 				assert.Equal(t, tc.expectedFallback, fallback)
+				assert.Equal(t, tc.expectedBase, base, "only a delta reports its base")
 			}
 
 			mockBlkup.AssertExpectations(t)

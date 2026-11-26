@@ -121,13 +121,13 @@ func (kp *kopiaProvider) RunBackup(
 	volMode uploader.PersistentVolumeMode,
 	uploaderCfg map[string]string,
 	updater uploader.ProgressUpdater,
-) (string, bool, int64, int64, int64, bool, string, error) {
+) (string, bool, int64, int64, int64, bool, string, string, error) {
 	if updater == nil {
-		return "", false, 0, 0, 0, false, "", errors.New("Need to initial backup progress updater first")
+		return "", false, 0, 0, 0, false, "", "", errors.New("Need to initial backup progress updater first")
 	}
 
 	if path == "" {
-		return "", false, 0, 0, 0, false, "", errors.New("path is empty")
+		return "", false, 0, 0, 0, false, "", "", errors.New("path is empty")
 	}
 
 	log := kp.log.WithFields(logrus.Fields{
@@ -176,10 +176,10 @@ func (kp *kopiaProvider) RunBackup(
 		}
 
 		if ctx.Err() != nil {
-			return snapshotID, false, 0, 0, 0, snapshotInfo.Fallback, snapshotInfo.FallbackReason, ErrorCanceled
+			return snapshotID, false, 0, 0, 0, snapshotInfo.Fallback, snapshotInfo.FallbackReason, "", ErrorCanceled
 		}
 
-		return snapshotID, false, 0, 0, 0, snapshotInfo.Fallback, snapshotInfo.FallbackReason, errors.Wrapf(err, "Failed to run kopia backup")
+		return snapshotID, false, 0, 0, 0, snapshotInfo.Fallback, snapshotInfo.FallbackReason, "", errors.Wrapf(err, "Failed to run kopia backup")
 	}
 
 	// which ensure that the statistic data of TotalBytes equal to BytesDone when finished
@@ -191,7 +191,7 @@ func (kp *kopiaProvider) RunBackup(
 	)
 
 	log.Debugf("Kopia backup finished, snapshot ID %s, backup size %d, fallback %v", snapshotInfo.ID, snapshotInfo.SnapshotSize, snapshotInfo.Fallback)
-	return snapshotInfo.ID, false, snapshotInfo.SnapshotSize, progress.GetIncrementalSize(), snapshotInfo.SourceSize, snapshotInfo.Fallback, snapshotInfo.FallbackReason, nil
+	return snapshotInfo.ID, false, snapshotInfo.SnapshotSize, progress.GetIncrementalSize(), snapshotInfo.SourceSize, snapshotInfo.Fallback, snapshotInfo.FallbackReason, "", nil
 }
 
 func (kp *kopiaProvider) GetPassword(param any) (string, error) {

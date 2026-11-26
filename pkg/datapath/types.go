@@ -43,6 +43,10 @@ type BackupResult struct {
 	FallbackFull     bool   `json:"fallbackFull,omitempty"`
 	// FallbackReason says why the incremental backup fell back to a full read.
 	FallbackReason string `json:"fallbackReason,omitempty"`
+	// ParentChangeID is the CSI snapshot handle the changed blocks were
+	// computed against, the change ID of the parent repository snapshot; empty
+	// for a full read.
+	ParentChangeID string `json:"parentChangeID,omitempty"`
 }
 
 // RestoreResult represents the result of a restore

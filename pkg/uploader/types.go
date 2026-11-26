@@ -59,6 +59,10 @@ type SnapshotInfo struct {
 	// FallbackReason says why the incremental backup fell back to a full
 	// read; empty when Fallback is false.
 	FallbackReason string
+	// ParentChangeID is the change ID, a CSI snapshot handle, of the parent
+	// repository snapshot the changed blocks were computed against; empty for a
+	// full read.
+	ParentChangeID string
 }
 
 // Progress which defined two variables to record progress

@@ -87,7 +87,7 @@ func Backup(ctx context.Context, blkUp Uploader, repoWriter udmrepo.BackupRepo, 
 		return uploader.SnapshotInfo{}, false, errors.Wrapf(err, "error reset pos of block device %s", source)
 	}
 
-	snapID, backupSize, snapshotSize, fallback, fallbackReason, err := snapshotSource(ctx, repoWriter, blkUp, sourceInfo, forceFull, parentSnapshot, cbtSource, cbtService, tags, uploaderCfg, log, "Block Uploader")
+	snapID, backupSize, snapshotSize, fallback, fallbackReason, parentChangeID, err := snapshotSource(ctx, repoWriter, blkUp, sourceInfo, forceFull, parentSnapshot, cbtSource, cbtService, tags, uploaderCfg, log, "Block Uploader")
 	snapshotInfo := uploader.SnapshotInfo{
 		ID:              snapID,
 		SnapshotSize:    snapshotSize,
@@ -95,6 +95,7 @@ func Backup(ctx context.Context, blkUp Uploader, repoWriter udmrepo.BackupRepo, 
 		SourceSize:      sourceInfo.size,
 		Fallback:        fallback,
 		FallbackReason:  fallbackReason,
+		ParentChangeID:  parentChangeID,
 	}
 
 	return snapshotInfo, false, err
@@ -113,7 +114,7 @@ func snapshotSource(
 	uploaderCfg map[string]string,
 	log logrus.FieldLogger,
 	description string,
-) (string, int64, int64, bool, string, error) {
+) (string, int64, int64, bool, string, string, error) {
 	log.Info("Start to snapshot...")
 	snapshotStartTime := time.Now()
 
@@ -145,7 +146,7 @@ func snapshotSource(
 
 	snap, backupSize, err := u.Backup(source, parentBackup.parentObject, bitmap.Iterator(), uploaderCfg)
 	if err != nil {
-		return "", 0, 0, fallback, fallbackReason, errors.Wrapf(err, "failed to run uploader backup for si %v", source)
+		return "", 0, 0, fallback, fallbackReason, "", errors.Wrapf(err, "failed to run uploader backup for si %v", source)
 	}
 
 	if snap.Tags == nil {
@@ -162,16 +163,23 @@ func snapshotSource(
 
 	snapID, err := rep.SaveSnapshot(ctx, snap)
 	if err != nil {
-		return "", 0, 0, fallback, fallbackReason, errors.Wrapf(err, "failed to save snapshot %v", snap)
+		return "", 0, 0, fallback, fallbackReason, "", errors.Wrapf(err, "failed to save snapshot %v", snap)
 	}
 
 	if err = rep.Flush(ctx); err != nil {
-		return "", 0, 0, fallback, fallbackReason, errors.Wrapf(err, "failed to flush repository")
+		return "", 0, 0, fallback, fallbackReason, "", errors.Wrapf(err, "failed to flush repository")
 	}
 
 	log.Infof("Created snapshot with root %v and ID %v in %v", snap.RootObject, snapID, time.Since(snapshotStartTime).Truncate(time.Second))
 
-	return string(snapID), backupSize, snap.TotalSize, fallback, fallbackReason, nil
+	// The changed blocks were computed against the parent's change ID only
+	// when the backup did not read in full.
+	parentChangeID := ""
+	if !forceFull && !fallback && parentErr == nil {
+		parentChangeID = parentBackup.changeID
+	}
+
+	return string(snapID), backupSize, snap.TotalSize, fallback, fallbackReason, parentChangeID, nil
 }
 
 // Fallback reasons recorded on the DataUpload when an incremental backup falls

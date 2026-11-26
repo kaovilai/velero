@@ -197,7 +197,7 @@ func (dp *generalDataPath) StartBackup(source AccessPoint, uploaderConfig map[st
 			dp.wgDataPath.Done()
 		}()
 
-		snapshotID, emptySnapshot, totalBytes, incrementalBytes, sourceSize, fallback, fallbackReason, err := dp.uploaderProv.RunBackup(
+		snapshotID, emptySnapshot, totalBytes, incrementalBytes, sourceSize, fallback, fallbackReason, parentChangeID, err := dp.uploaderProv.RunBackup(
 			dp.ctx,
 			source.ByPath,
 			backupParam.RealSource,
@@ -235,6 +235,7 @@ func (dp *generalDataPath) StartBackup(source AccessPoint, uploaderConfig map[st
 				SourceSize:       sourceSize,
 				FallbackFull:     fallback,
 				FallbackReason:   fallbackReason,
+				ParentChangeID:   parentChangeID,
 			}})
 		}
 	}()
