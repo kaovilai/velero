@@ -471,3 +471,20 @@ func TestDeleteRetainedSnapshotConfirmsSeedFromTheWrite(t *testing.T) {
 	assert.Zero(t, backend.silentDrops, "the content is never deleted without a seeded handle")
 	assert.False(t, backend.snapshots[retainedTestHandle])
 }
+
+// TestDeleteRetainedSnapshotWaitsAgainWithoutCheckOnce proves the backup
+// deletion's rule: without CheckInProgressOnce a content an earlier attempt
+// left being deleted is waited on again for the whole bound, because a
+// user-issued retry must confirm the snapshot is gone.
+func TestDeleteRetainedSnapshotWaitsAgainWithoutCheckOnce(t *testing.T) {
+	timeout := shortenRetainedSnapshotWaits(t)
+	record := retainedTestRecord()
+	backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
+	c := backend.client(t)
+	leaveDeleting(t, backend, c, record, timeout)
+
+	err := DeleteRetainedSnapshot(t.Context(), c, c, record, retainedTestBackupUID, RetainedSnapshotDeletionOptions{Timeout: timeout}, velerotest.NewLogger())
+	var pending *RetainedSnapshotDeletionPendingError
+	require.ErrorAs(t, err, &pending)
+	assert.Equal(t, timeout, pending.Waited, "the content in deletion is waited on again")
+}

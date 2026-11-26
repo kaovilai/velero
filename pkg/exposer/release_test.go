@@ -78,7 +78,7 @@ func TestReleaseRetainedSnapshotRetries(t *testing.T) {
 		{name: "released on the first attempt", wantCreates: 1},
 		{name: "a transient failure is retried", createErrs: 2, wantCreates: 3},
 		{name: "every attempt fails", createErrs: 5, wantErr: true, wantCreates: releaseAttempts},
-		{name: "a content left being deleted is not retried", stuck: true, wantErr: true, wantCreates: 1},
+		{name: "a release that times out is not retried", stuck: true, wantErr: true, wantCreates: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			creates := 0
@@ -92,4 +92,23 @@ func TestReleaseRetainedSnapshotRetries(t *testing.T) {
 			assert.Equal(t, tc.wantCreates, creates)
 		})
 	}
+}
+
+// TestReleaseRetainedSnapshotChecksContentInDeletionOnce proves the release's
+// rule: a static content an earlier attempt left being deleted is checked once
+// and not waited on again, so an undeletable base does not hold every later
+// completion for the bound.
+func TestReleaseRetainedSnapshotChecksContentInDeletionOnce(t *testing.T) {
+	base := &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "base-snap", Driver: "hostpath.csi.k8s.io"}
+	creates := 0
+	c := releaseClient(t, 0, true, &creates)
+	// An earlier release left the content being deleted.
+	require.Error(t, ReleaseRetainedSnapshot(t.Context(), c, base, "backup-uid", 200*time.Millisecond, velerotest.NewLogger()))
+
+	start := time.Now()
+	err := ReleaseRetainedSnapshot(t.Context(), c, base, "backup-uid", time.Hour, velerotest.NewLogger())
+	var pending *csi.RetainedSnapshotDeletionPendingError
+	require.ErrorAs(t, err, &pending)
+	assert.Zero(t, pending.Waited, "checked once, not waited on")
+	assert.Less(t, time.Since(start), 10*time.Second)
 }

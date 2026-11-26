@@ -407,3 +407,32 @@ func TestDataUploadDeleteActionBoundIsTheResourceTimeout(t *testing.T) {
 	assert.Less(t, time.Since(start), 30*time.Second)
 	assert.Contains(t, err.Error(), "300ms")
 }
+
+// TestDataUploadDeleteActionWaitsAgainOnContentInDeletion proves a re-issued
+// backup deletion waits again on a static content an earlier request left
+// being deleted -- unlike the release, which checks it once -- so the retry
+// confirms the snapshot is gone, and succeeds once the driver deletes it.
+func TestDataUploadDeleteActionWaitsAgainOnContentInDeletion(t *testing.T) {
+	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
+	backup.UID = "daily-uid"
+	du := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
+	du.Spec.DataMover = "velero-block"
+	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}, driverFails: true}
+	crClient := sidecar.client(t)
+	resourceTimeout := 300 * time.Millisecond
+	var pending *csi.RetainedSnapshotDeletionPendingError
+
+	first := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, resourceTimeout)
+	require.ErrorAs(t, first.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}), &pending)
+
+	// A re-issued deletion is a new request, a new action.
+	retry := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, resourceTimeout)
+	require.ErrorAs(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}), &pending)
+	assert.Equal(t, resourceTimeout, pending.Waited, "the content left in deletion is waited on again")
+
+	sidecar.driverFails = false
+	again := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, resourceTimeout)
+	require.NoError(t, again.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+	assert.False(t, sidecar.snapshots[deleteTestHandle])
+}
