@@ -19,11 +19,11 @@ package controller
 import (
 	"context"
 	"encoding/json"
-	"strings"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapshotv1fake "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned/typed/volumesnapshot/v1/fake"
 	"github.com/stretchr/testify/assert"
@@ -33,13 +33,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgofake "k8s.io/client-go/kubernetes/fake"
 	clientTesting "k8s.io/client-go/testing"
-	testclocks "k8s.io/utils/clock/testing"
-	"k8s.io/utils/ptr"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
-
-	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -47,13 +43,13 @@ import (
 	"github.com/velero-io/velero/pkg/datapath"
 	"github.com/velero-io/velero/pkg/exposer"
 	velerotest "github.com/velero-io/velero/pkg/test"
-	"github.com/velero-io/velero/pkg/uploader/block"
 	"github.com/velero-io/velero/pkg/util/csi"
 )
 
 const (
 	retentionHandle = "0001-0009-rook-ceph-0000000000000001-snap"
 	retentionDriver = "rbd.csi.ceph.com"
+	baseHandle      = "0001-0009-rook-ceph-0000000000000000-snap"
 )
 
 // retentionDataUploadBuilder returns a DataUpload that opted into base snapshot
@@ -62,7 +58,8 @@ const (
 func retentionDataUploadBuilder() *builder.DataUploadBuilder {
 	return dataUploadBuilder().
 		DataMover("velero-block").
-		DataMoverConfig(map[string]string{velerov2alpha1api.RetainSnapshotDataMoverConfigKey: "true"})
+		DataMoverConfig(map[string]string{velerov2alpha1api.RetainSnapshotDataMoverConfigKey: "true"}).
+		Labels(map[string]string{velerov1api.BackupUIDLabel: "backup-uid"})
 }
 
 // retentionBackupVSC returns the backup VolumeSnapshotContent the exposer
@@ -78,14 +75,11 @@ func retentionBackupVSC() *snapshotv1api.VolumeSnapshotContent {
 				csi.VSCDeletionSecretNameAnnotation:      "rook-csi-rbd-provisioner",
 				csi.VSCDeletionSecretNamespaceAnnotation: "rook-ceph",
 			},
-			ResourceVersion: "42",
 		},
 		Spec: snapshotv1api.VolumeSnapshotContentSpec{
 			DeletionPolicy: snapshotv1api.VolumeSnapshotContentDelete,
 			Driver:         retentionDriver,
-			Source: snapshotv1api.VolumeSnapshotContentSource{
-				SnapshotHandle: &handle,
-			},
+			Source:         snapshotv1api.VolumeSnapshotContentSource{SnapshotHandle: &handle},
 		},
 	}
 }
@@ -94,54 +88,107 @@ func retentionRecord() *velerov2alpha1api.RetainedCSIStorageSnapshot {
 	return &velerov2alpha1api.RetainedCSIStorageSnapshot{
 		CSISnapshotHandle: retentionHandle,
 		Driver:            retentionDriver,
-		DeletionSecretRef: &corev1api.SecretReference{
-			Name:      "rook-csi-rbd-provisioner",
-			Namespace: "rook-ceph",
-		},
+		DeletionSecretRef: &corev1api.SecretReference{Name: "rook-csi-rbd-provisioner", Namespace: "rook-ceph"},
 	}
 }
 
-// pruningDataUploadClient simulates a cluster whose DataUpload CRD predates
-// the retainedCSIStorageSnapshot field: the API server prunes it on write and
-// the update still reports success.
-type pruningDataUploadClient struct {
-	kbclient.Client
+// recordingEvents is a kube.EventRecorder that records the event reasons.
+type recordingEvents struct {
+	reasons  []string
+	warnings []bool
 }
 
-func (c *pruningDataUploadClient) Update(ctx context.Context, obj kbclient.Object, opts ...kbclient.UpdateOption) error {
-	if du, ok := obj.(*velerov2alpha1api.DataUpload); ok {
-		du.Status.RetainedCSIStorageSnapshot = nil
-	}
-	return c.Client.Update(ctx, obj, opts...)
+func (e *recordingEvents) Event(_ runtime.Object, warning bool, reason string, _ string, _ ...any) {
+	e.reasons = append(e.reasons, reason)
+	e.warnings = append(e.warnings, warning)
+}
+func (e *recordingEvents) EndingEvent(o runtime.Object, warning bool, reason string, message string, a ...any) {
+	e.Event(o, warning, reason, message, a...)
+}
+func (e *recordingEvents) Shutdown() {}
+
+// retentionHarness records, in order, every DataUpload update (phase and
+// whether the record is set), every Retain patch of the backup content and
+// every static release content created, so a test can assert the completion
+// order. It also plays the CSI snapshotter for the release: a static content
+// being deleted with a seeded handle is removed on the next read unless its
+// handle is in failing.
+type retentionHarness struct {
+	steps       []string
+	failing     map[string]bool
+	deleteCalls []string
+	pruneRecord bool
 }
 
-// vscPatchRecorder records the payloads of the VolumeSnapshotContent patches.
-type vscPatchRecorder struct {
-	patches []string
-}
-
-func (p *vscPatchRecorder) hasDeletionPolicy(policy string) bool {
-	for _, patch := range p.patches {
-		var payload map[string]any
-		if err := json.Unmarshal([]byte(patch), &payload); err != nil {
-			continue
-		}
-		spec, _ := payload["spec"].(map[string]any)
-		if spec != nil && spec["deletionPolicy"] == policy {
-			return true
-		}
-	}
-	return false
-}
-
-func createRetainedSnapshotObjects(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) {
+func (h *retentionHarness) client(t *testing.T, objs ...runtime.Object) kbclient.Client {
 	t.Helper()
-	ctx := t.Context()
-	require.NoError(t, r.client.Create(ctx, du))
+	base := velerotest.NewFakeControllerRuntimeClientBuilder(t).
+		WithRuntimeObjects(objs...).
+		WithStatusSubresource(&snapshotv1api.VolumeSnapshotContent{}).
+		Build()
+	return interceptor.NewClient(base.(kbclient.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, c kbclient.WithWatch, obj kbclient.Object, opts ...kbclient.UpdateOption) error {
+			if du, ok := obj.(*velerov2alpha1api.DataUpload); ok {
+				if h.pruneRecord {
+					// A DataUpload CRD that predates the field prunes it on
+					// write; the update still succeeds.
+					du.Status.RetainedCSIStorageSnapshot = nil
+				}
+				h.steps = append(h.steps, fmt.Sprintf("update:%s:record=%v", du.Status.Phase, du.Status.RetainedCSIStorageSnapshot != nil))
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+		Create: func(ctx context.Context, c kbclient.WithWatch, obj kbclient.Object, opts ...kbclient.CreateOption) error {
+			if vsc, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
+				h.steps = append(h.steps, "release:"+*vsc.Spec.Source.SnapshotHandle)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Get: func(ctx context.Context, c kbclient.WithWatch, key kbclient.ObjectKey, obj kbclient.Object, opts ...kbclient.GetOption) error {
+			if _, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
+				vsc := &snapshotv1api.VolumeSnapshotContent{}
+				if err := c.Get(ctx, key, vsc); err == nil && vsc.DeletionTimestamp != nil && vsc.Status != nil && vsc.Status.SnapshotHandle != nil {
+					h.deleteCalls = append(h.deleteCalls, *vsc.Status.SnapshotHandle)
+					if !h.failing[*vsc.Status.SnapshotHandle] {
+						vsc.Finalizers = nil
+						_ = c.Update(ctx, vsc)
+					}
+				}
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+}
+
+// newRetentionReconciler returns a reconciler whose DataUpload client is the
+// harness's, with the DataUpload and its backup content created, the Retain
+// patches recorded into the harness steps, and patchErr returned for them.
+func newRetentionReconciler(t *testing.T, h *retentionHarness, du *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent, patchErr error) (*DataUploadReconciler, *recordingEvents) {
+	t.Helper()
+	r, err := initDataUploaderReconciler()
+	require.NoError(t, err)
+	r.client = h.client(t, du)
+	events := &recordingEvents{}
+	r.eventRecorder = events
 	if vsc != nil {
-		_, err := r.csiSnapshotClient.VolumeSnapshotContents().Create(ctx, vsc, metav1.CreateOptions{})
+		_, err := r.csiSnapshotClient.VolumeSnapshotContents().Create(t.Context(), vsc, metav1.CreateOptions{})
 		require.NoError(t, err)
 	}
+	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
+		var payload map[string]any
+		_ = json.Unmarshal(action.(clientTesting.PatchAction).GetPatch(), &payload)
+		if spec, _ := payload["spec"].(map[string]any); spec != nil {
+			h.steps = append(h.steps, fmt.Sprintf("patch:%v", spec["deletionPolicy"]))
+		}
+		if patchErr != nil {
+			return true, nil, patchErr
+		}
+		return false, nil, nil
+	})
+	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
+		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
+	}
+	return r, events
 }
 
 func getDataUpload(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) *velerov2alpha1api.DataUpload {
@@ -151,1427 +198,259 @@ func getDataUpload(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.
 	return current
 }
 
-func getBackupVSC(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) (*snapshotv1api.VolumeSnapshotContent, error) {
+func shortRelease(t *testing.T) {
 	t.Helper()
-	return r.csiSnapshotClient.VolumeSnapshotContents().Get(t.Context(), du.Name, metav1.GetOptions{})
+	orig := csi.RetainedSnapshotDeletionTimeout
+	csi.RetainedSnapshotDeletionTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { csi.RetainedSnapshotDeletionTimeout = orig })
 }
 
-// TestOnDataUploadCompletedRetentionRecordBeforeRetain proves the ordering
-// rule of section 2 of the design: the record is persisted on the DataUpload
-// before the backup VolumeSnapshotContent is switched to Retain, and the
-// switch only happens when the uncached read-back confirms the record. A
-// cluster whose CRD prunes the field must keep the Delete policy.
-func TestOnDataUploadCompletedRetentionRecordBeforeRetain(t *testing.T) {
-	tests := []struct {
-		name             string
-		pruneRecord      bool
-		wantRetained     bool
-		wantPhase        velerov2alpha1api.DataUploadPhase
-		wantRecordOnFail bool
+// TestOnDataUploadCompletedRetentionOrder proves the completion order of a
+// retaining DataUpload: one update writes Completed together with the record,
+// then the backup content is switched to Retain, then the cleanup runs and
+// deletes the content. Nothing retention-relevant happens before Completed
+// wins: an update that declines leaves no record and no Retain, a response
+// without the record skips Retain, and a failed Retain still leaves the
+// DataUpload Completed. None of them fails the DataUpload.
+func TestOnDataUploadCompletedRetentionOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		phase       velerov2alpha1api.DataUploadPhase
+		noContent   bool
+		pruneRecord bool
+		patchErr    error
+		wantSteps   []string
+		wantPhase   velerov2alpha1api.DataUploadPhase
+		wantRecord  bool
+		wantEvents  []string
 	}{
 		{
-			name:         "the record is verified and the content is switched to Retain",
-			wantRetained: true,
-			wantPhase:    velerov2alpha1api.DataUploadPhaseCompleted,
+			name:       "record and Completed in one update, then Retain, then cleanup",
+			wantSteps:  []string{"update:Completed:record=true", "patch:Retain"},
+			wantPhase:  velerov2alpha1api.DataUploadPhaseCompleted,
+			wantRecord: true,
 		},
 		{
-			// The update reports success but the field comes back empty: the
-			// read-back, not the API response, is the proof. The DataUpload
-			// fails and the content keeps Delete.
-			name:        "a CRD that prunes the record fails the DataUpload and keeps Delete",
-			pruneRecord: true,
-			wantPhase:   velerov2alpha1api.DataUploadPhaseFailed,
+			name:      "a DataUpload already in a final phase: the update declines, no record, no Retain",
+			phase:     velerov2alpha1api.DataUploadPhaseCanceled,
+			wantPhase: velerov2alpha1api.DataUploadPhaseCanceled,
 		},
-	}
-
-	for _, tc := range tests {
+		{
+			name:        "a response without the record skips Retain and completes without retention",
+			pruneRecord: true,
+			wantSteps:   []string{"update:Completed:record=false"},
+			wantPhase:   velerov2alpha1api.DataUploadPhaseCompleted,
+			wantEvents:  []string{"RetainedSnapshotSkipped"},
+		},
+		{
+			name:       "a failed Retain still leaves the DataUpload Completed",
+			patchErr:   errors.New("throttled"),
+			wantSteps:  []string{"update:Completed:record=true", "patch:Retain"},
+			wantPhase:  velerov2alpha1api.DataUploadPhaseCompleted,
+			wantRecord: true,
+			wantEvents: []string{"RetainedSnapshotSkipped"},
+		},
+		{
+			name:       "no backup content to read the handle from: Completed without retention",
+			noContent:  true,
+			wantSteps:  []string{"update:Completed:record=false"},
+			wantPhase:  velerov2alpha1api.DataUploadPhaseCompleted,
+			wantEvents: []string{"RetainedSnapshotSkipped"},
+		},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-
-			du := retentionDataUploadBuilder().Result()
-			if tc.pruneRecord {
-				r.client = &pruningDataUploadClient{Client: r.client}
+			h := &retentionHarness{pruneRecord: tc.pruneRecord}
+			b := retentionDataUploadBuilder()
+			if tc.phase != "" {
+				b = b.Phase(tc.phase)
 			}
-			createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-
-			// The switch to Retain happens only after the record is read back.
-			patches := &vscPatchRecorder{}
-			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-				patches.patches = append(patches.patches, string(action.(clientTesting.PatchAction).GetPatch()))
-				if action.(clientTesting.PatchAction).GetName() == dataUploadName {
-					current := getDataUpload(t, r, du)
-					if tc.wantRetained {
-						// Persisted before retained.
-						require.NotNil(t, current.Status.RetainedCSIStorageSnapshot, "the record must be persisted before the Retain patch")
-						require.Equal(t, retentionHandle, current.Status.RetainedCSIStorageSnapshot.CSISnapshotHandle)
-					}
-				}
-				return false, nil, nil
-			})
-			r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-				velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
+			du := b.Result()
+			vsc := retentionBackupVSC()
+			if tc.noContent {
+				vsc = nil
 			}
+			r, events := newRetentionReconciler(t, h, du, vsc, tc.patchErr)
 
-			r.OnDataUploadCompleted(t.Context(), du.Namespace, du.Name, datapath.Result{Backup: datapath.BackupResult{SnapshotID: "fake-id"}})
+			r.OnDataUploadCompleted(t.Context(), du.Namespace, du.Name, datapath.Result{Backup: datapath.BackupResult{SnapshotID: "repo-snap"}})
 
+			assert.Equal(t, tc.wantSteps, h.steps)
 			updated := getDataUpload(t, r, du)
 			assert.Equal(t, tc.wantPhase, updated.Status.Phase)
-			// The terminal update drops the lease marks: nothing reads them
-			// past the terminal phase, and they must not accumulate on the
-			// object forever.
-			assert.NotContains(t, updated.Annotations, dataUploadRetainLeaseAnnotation,
-				"the terminal update must drop the retention lease mark")
-			assert.NotContains(t, updated.Annotations, dataUploadRollbackLeaseAnnotation,
-				"the terminal update must drop the rollback lease mark")
-			if tc.wantRetained {
+			if tc.wantRecord {
 				assert.Equal(t, retentionRecord(), updated.Status.RetainedCSIStorageSnapshot)
-				assert.True(t, patches.hasDeletionPolicy("Retain"), "the backup VSC must be switched to Retain, patches: %v", patches.patches)
-				// The retention-path cleanup deletes the content explicitly.
-				_, err := getBackupVSC(t, r, du)
-				assert.True(t, apierrors.IsNotFound(err), "the retained backup VSC must be deleted, got %v", err)
 			} else {
 				assert.Nil(t, updated.Status.RetainedCSIStorageSnapshot)
-				assert.Equal(t, "fake-id", updated.Status.SnapshotID,
-					"the repository snapshot ID is persisted with the failure, the backup deletion reaches the data through it")
-				assert.False(t, patches.hasDeletionPolicy("Retain"), "the backup VSC must keep Delete when the record did not persist, patches: %v", patches.patches)
-				// The content keeps the Delete policy, so the exposer cleanup
-				// reclaims the snapshot through the VolumeSnapshot deletion
-				// cascade.
-				vsc, getErr := getBackupVSC(t, r, du)
-				if getErr == nil {
-					assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, vsc.Spec.DeletionPolicy)
-				} else {
-					assert.True(t, apierrors.IsNotFound(getErr))
+			}
+			assert.Equal(t, tc.wantEvents, events.reasons)
+			if !tc.noContent {
+				_, err := r.csiSnapshotClient.VolumeSnapshotContents().Get(t.Context(), du.Name, metav1.GetOptions{})
+				if tc.wantRecord && tc.patchErr == nil {
+					assert.True(t, apierrors.IsNotFound(err), "the retained content object is deleted after the cleanup, got %v", err)
 				}
 			}
 		})
 	}
 }
 
-// TestRetainSnapshotOnCompletionLeaseFencing proves the lease fence of section
-// 3: the completion callback cannot retain while a rollback is in progress,
-// and a completion-side mark another holder left -- a node-agent that died
-// inside the callback -- is waited out and taken, not a reason to fail, unless
-// it outlasts the longest mark the completion side ever writes.
-func TestRetainSnapshotOnCompletionLeaseFencing(t *testing.T) {
-	tests := []struct {
+// TestOnDataUploadCompletedReleasesBase proves the release at completion: the
+// base the data path reported is deleted through a static content after
+// Completed and the Retain switch, with the driver and deletion secret of the
+// DataUpload's own record; nothing is released after a full read, when the
+// snapshot was not retained, or when the base is the snapshot itself; a failed
+// release leaves the DataUpload Completed with RetainedSnapshotReleaseFailed.
+func TestOnDataUploadCompletedReleasesBase(t *testing.T) {
+	for _, tc := range []struct {
 		name         string
-		annotation   string
-		future       bool
-		farFuture    bool
-		wantRetained bool
+		result       datapath.BackupResult
+		pruneRecord  bool
+		failing      bool
+		wantSteps    []string
+		wantReleased bool
+		wantEvents   []string
 	}{
 		{
-			name:         "an unexpired retaining lease of another holder is waited out and taken",
-			annotation:   dataUploadRetainLeaseAnnotation,
-			future:       true,
-			wantRetained: true,
+			name:         "the base of an incremental is released after Completed and Retain",
+			result:       datapath.BackupResult{ParentChangeID: baseHandle},
+			wantSteps:    []string{"update:Completed:record=true", "patch:Retain", "release:" + baseHandle},
+			wantReleased: true,
+			wantEvents:   []string{"RetainedSnapshotReleased"},
 		},
 		{
-			name:         "a retaining lease beyond the longest completion-side mark blocks the completion callback",
-			annotation:   dataUploadRetainLeaseAnnotation,
-			farFuture:    true,
-			wantRetained: false,
+			name:      "a full read releases nothing",
+			result:    datapath.BackupResult{FallbackFull: true, FallbackReason: "base snapshot gone: not found"},
+			wantSteps: []string{"update:Completed:record=true", "patch:Retain"},
 		},
 		{
-			name:         "an expired retaining lease does not block",
-			annotation:   dataUploadRetainLeaseAnnotation,
-			wantRetained: true,
+			name:        "a snapshot not retained releases nothing",
+			result:      datapath.BackupResult{ParentChangeID: baseHandle},
+			pruneRecord: true,
+			wantSteps:   []string{"update:Completed:record=false"},
+			wantEvents:  []string{"RetainedSnapshotSkipped"},
 		},
 		{
-			name:         "an unexpired rollback lease blocks the completion callback",
-			annotation:   dataUploadRollbackLeaseAnnotation,
-			future:       true,
-			wantRetained: false,
+			name:      "the snapshot itself is never released",
+			result:    datapath.BackupResult{ParentChangeID: retentionHandle},
+			wantSteps: []string{"update:Completed:record=true", "patch:Retain"},
 		},
-	}
-
-	for _, tc := range tests {
+		{
+			name:       "a failed release leaves the DataUpload Completed",
+			result:     datapath.BackupResult{ParentChangeID: baseHandle},
+			failing:    true,
+			wantSteps:  []string{"update:Completed:record=true", "patch:Retain", "release:" + baseHandle},
+			wantEvents: []string{"RetainedSnapshotReleaseFailed"},
+		},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-			// The lease expiry is evaluated against the reconciler's clock.
-			offset := -10 * time.Minute
-			if tc.future {
-				offset = 10 * time.Minute
-			}
-			if tc.farFuture {
-				offset = time.Hour
-			}
-			lease := (&dataUploadLease{Holder: "other-node-1", ExpiresAt: r.Clock.Now().Add(offset)}).String()
+			shortRelease(t)
+			h := &retentionHarness{pruneRecord: tc.pruneRecord, failing: map[string]bool{baseHandle: tc.failing}}
+			du := retentionDataUploadBuilder().Result()
+			r, events := newRetentionReconciler(t, h, du, retentionBackupVSC(), nil)
 
-			du := retentionDataUploadBuilder().Annotations(map[string]string{tc.annotation: lease}).Result()
-			createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
+			r.OnDataUploadCompleted(t.Context(), du.Namespace, du.Name, datapath.Result{Backup: tc.result})
 
-			patches := &vscPatchRecorder{}
-			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-				patches.patches = append(patches.patches, string(action.(clientTesting.PatchAction).GetPatch()))
-				return false, nil, nil
-			})
-			r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-				velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
+			assert.Equal(t, tc.wantSteps, h.steps)
+			assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, getDataUpload(t, r, du).Status.Phase)
+			assert.Equal(t, tc.wantEvents, events.reasons)
+			static := &snapshotv1api.VolumeSnapshotContent{}
+			err := r.client.Get(t.Context(), kbclient.ObjectKey{Name: csi.TempVSCName(retentionDriver, baseHandle)}, static)
+			if tc.wantReleased {
+				assert.Contains(t, h.deleteCalls, baseHandle)
+				assert.True(t, apierrors.IsNotFound(err), "the static content is gone, got %v", err)
 			}
+			if tc.failing {
+				require.NoError(t, err, "a release that does not finish leaves its content being deleted")
+				assert.NotNil(t, static.DeletionTimestamp)
+				assert.Equal(t, "rook-csi-rbd-provisioner", static.Annotations[csi.VSCDeletionSecretNameAnnotation], "the base is deleted with the record's deletion secret")
+			}
+		})
+	}
+}
 
-			retainErr := r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger())
+// TestFailurePathsLeaveNoRecord proves an unfinished movement holds no record
+// and no Retain content: the cancel, failure and prepare-timeout paths write
+// their final phase and clean up without touching retention.
+func TestFailurePathsLeaveNoRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase velerov2alpha1api.DataUploadPhase
+		run   func(r *DataUploadReconciler, du *velerov2alpha1api.DataUpload)
+		want  velerov2alpha1api.DataUploadPhase
+	}{
+		{
+			name:  "OnDataUploadFailed",
+			phase: velerov2alpha1api.DataUploadPhaseInProgress,
+			run: func(r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) {
+				r.OnDataUploadFailed(context.Background(), du.Namespace, du.Name, errors.New("data path failed"))
+			},
+			want: velerov2alpha1api.DataUploadPhaseFailed,
+		},
+		{
+			name:  "OnDataUploadCancelled",
+			phase: velerov2alpha1api.DataUploadPhaseInProgress,
+			run: func(r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) {
+				r.OnDataUploadCancelled(context.Background(), du.Namespace, du.Name)
+			},
+			want: velerov2alpha1api.DataUploadPhaseCanceled,
+		},
+		{
+			name:  "tryCancelDataUpload",
+			phase: velerov2alpha1api.DataUploadPhaseAccepted,
+			run: func(r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) {
+				r.tryCancelDataUpload(context.Background(), du, "canceled")
+			},
+			want: velerov2alpha1api.DataUploadPhaseCanceled,
+		},
+		{
+			name:  "onPrepareTimeout",
+			phase: velerov2alpha1api.DataUploadPhasePrepared,
+			run: func(r *DataUploadReconciler, du *velerov2alpha1api.DataUpload) {
+				r.onPrepareTimeout(context.Background(), du)
+			},
+			want: velerov2alpha1api.DataUploadPhaseFailed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &retentionHarness{}
+			du := retentionDataUploadBuilder().Phase(tc.phase).Result()
+			r, events := newRetentionReconciler(t, h, du, retentionBackupVSC(), nil)
+
+			tc.run(r, getDataUpload(t, r, du))
 
 			updated := getDataUpload(t, r, du)
-			if tc.wantRetained {
-				require.NoError(t, retainErr)
-				assert.Equal(t, retentionRecord(), updated.Status.RetainedCSIStorageSnapshot)
-				assert.True(t, patches.hasDeletionPolicy("Retain"))
-				return
-			}
-			require.Error(t, retainErr)
+			assert.Equal(t, tc.want, updated.Status.Phase)
 			assert.Nil(t, updated.Status.RetainedCSIStorageSnapshot)
-			assert.False(t, patches.hasDeletionPolicy("Retain"), "the content must keep Delete when the callback is fenced out")
+			assert.NotContains(t, h.steps, "patch:Retain")
+			assert.Empty(t, events.reasons)
 		})
 	}
 }
 
-// TestRetainSnapshotOnCompletionPatchPrecondition proves that the Retain patch
-// carries the content's resourceVersion, so a rollback that has patched or
-// deleted the content in between makes the delayed write fail instead of
-// landing after it.
-func TestRetainSnapshotOnCompletionPatchPrecondition(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Result()
-	createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-
-	var patchPayloads []map[string]any
-	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		payload := map[string]any{}
-		if err := json.Unmarshal(action.(clientTesting.PatchAction).GetPatch(), &payload); err == nil {
-			patchPayloads = append(patchPayloads, payload)
-		}
-		return false, nil, nil
-	})
-
-	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger()))
-
-	require.Len(t, patchPayloads, 1)
-	assert.Equal(t, "42", patchPayloads[0]["metadata"].(map[string]any)["resourceVersion"],
-		"the Retain patch must be preconditioned on the content's resourceVersion, carried under metadata.resourceVersion where the API server enforces it")
-	assert.Equal(t, "Retain", patchPayloads[0]["spec"].(map[string]any)["deletionPolicy"])
-}
-
-// TestReleaseRetainedSnapshotOrdering proves the patch-back rule of section 3:
-// delete-first, clear-last. The content is patched to Delete before the backup
-// VolumeSnapshot and VolumeSnapshotContent are deleted, and the record is
-// cleared only after the content is confirmed gone.
-func TestReleaseRetainedSnapshotOrdering(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-		Annotations(map[string]string{}).Result()
+// TestCrashBetweenCompletedAndRetain proves the state a node-agent that dies
+// between the Completed update and the Retain switch leaves: the DataUpload is
+// Completed with its record, the content keeps Delete, and the restarted
+// node-agent's resume leaves the Completed DataUpload alone. The snapshot is
+// not retained; deleting it again at backup deletion succeeds.
+func TestCrashBetweenCompletedAndRetain(t *testing.T) {
+	h := &retentionHarness{}
+	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseCompleted).Result()
 	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	createRetainedSnapshotObjects(t, r, du, func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		return vsc
-	}())
+	r, _ := newRetentionReconciler(t, h, du, retentionBackupVSC(), nil)
 
-	// The backup VS and PVC, named after the DataUpload as the exposer does.
-	_, err = r.csiSnapshotClient.VolumeSnapshots(du.Namespace).Create(t.Context(), &snapshotv1api.VolumeSnapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: dataUploadName, Namespace: du.Namespace, ResourceVersion: "7"},
-	}, metav1.CreateOptions{})
-	require.NoError(t, err)
-	pvcClient := r.kubeClient.(*clientgofake.Clientset)
-	_, err = pvcClient.CoreV1().PersistentVolumeClaims(du.Namespace).Create(t.Context(), &corev1api.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: dataUploadName, Namespace: du.Namespace},
-	}, metav1.CreateOptions{})
-	require.NoError(t, err)
-
-	var events []string
-	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("*", "*", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		switch a := action.(type) {
-		case clientTesting.PatchAction:
-			if a.GetResource().Resource == "volumesnapshotcontents" {
-				events = append(events, "patch-vsc:"+string(a.GetPatch()))
-			}
-		case clientTesting.DeleteAction:
-			switch a.GetResource().Resource {
-			case "volumesnapshots":
-				events = append(events, "delete-vs")
-			case "volumesnapshotcontents":
-				events = append(events, "delete-vsc")
-			}
-		}
-		return false, nil, nil
-	})
-	pvcClient.PrependReactor("*", "persistentvolumeclaims", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		if d, ok := action.(clientTesting.DeleteAction); ok {
-			events = append(events, "delete-pvc:"+d.GetName())
-		}
-		return false, nil, nil
-	})
-
-	// Record what the DataUpload carries at the moment the content is deleted:
-	// the record must still be there.
-	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("delete", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		current := getDataUpload(t, r, du)
-		if current.Status.RetainedCSIStorageSnapshot == nil {
-			t.Error("the record must be cleared only after the content is deleted")
-		}
-		return false, nil, nil
-	})
-
-	require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-
-	// Delete-first: the Delete patch precedes the PVC, VS and VSC deletions.
-	deletePatchIdx, pvcIdx, vsIdx, vscIdx := -1, -1, -1, -1
-	for i, event := range events {
-		if deletePatchIdx < 0 && strings.HasPrefix(event, "patch-vsc:") && strings.Contains(event, `"Delete"`) {
-			deletePatchIdx = i
-		}
-		if pvcIdx < 0 && strings.HasPrefix(event, "delete-pvc:") {
-			pvcIdx = i
-		}
-		if vsIdx < 0 && event == "delete-vs" {
-			vsIdx = i
-		}
-		if vscIdx < 0 && event == "delete-vsc" {
-			vscIdx = i
-		}
-	}
-	require.GreaterOrEqual(t, deletePatchIdx, 0, "the content must be patched to Delete, events: %v", events)
-	require.GreaterOrEqual(t, pvcIdx, 0, "the backup PVC must be deleted, events: %v", events)
-	require.GreaterOrEqual(t, vsIdx, 0, "the backup VS must be deleted, events: %v", events)
-	require.GreaterOrEqual(t, vscIdx, 0, "the backup VSC must be deleted, events: %v", events)
-	assert.Less(t, deletePatchIdx, pvcIdx, "the Delete patch precedes the PVC deletion")
-	assert.Less(t, pvcIdx, vsIdx, "the PVC deletion precedes the VS deletion")
-	assert.Less(t, vsIdx, vscIdx, "the VS deletion precedes the VSC deletion")
-
-	// Clear-last: the record is gone after the release.
-	assert.Nil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot)
-}
-
-// TestReleaseRetainedSnapshotNotFoundKeepsRecord proves the NotFound rule of
-// section 3: a content that is absent, e.g. because the retention-path cleanup
-// already deleted it under Retain after a Completed update that failed to
-// stick, must not clear the record, or a retained snapshot would be stranded
-// with no cleanup record.
-func TestReleaseRetainedSnapshotNotFoundKeepsRecord(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	createRetainedSnapshotObjects(t, r, du, nil)
-
-	require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-	assert.Equal(t, retentionRecord(), getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot,
-		"the record must be kept when the content is absent")
-}
-
-// TestReleaseRetainedSnapshotBlockedByRetainLease proves the other side of the
-// fence: the patch-back fails while an unexpired retaining mark exists.
-func TestReleaseRetainedSnapshotBlockedByRetainLease(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	lease := &dataUploadLease{Holder: "other-node-1", ExpiresAt: r.Clock.Now().Add(10 * time.Minute)}
-	du.Annotations = map[string]string{dataUploadRetainLeaseAnnotation: lease.String()}
-	createRetainedSnapshotObjects(t, r, du, func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		return vsc
-	}())
-
-	err = r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "retention lease")
-
-	vsc, getErr := getBackupVSC(t, r, du)
-	require.NoError(t, getErr)
-	assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, vsc.Spec.DeletionPolicy,
-		"the content must not be touched while the retaining mark is unexpired")
-	assert.Equal(t, retentionRecord(), getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot)
-}
-
-// TestReleaseRetainedSnapshotNothingRetained proves the fast path: a DataUpload
-// without a record whose content has the Delete policy releases nothing, so
-// the failure paths of an ordinary data movement are not slowed down.
-func TestReleaseRetainedSnapshotNothingRetained(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := dataUploadBuilder().Result()
-	createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-
-	var deletions int
-	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("delete", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		deletions++
-		return false, nil, nil
-	})
-
-	require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-	assert.Zero(t, deletions)
-}
-
-// TestReconcileReleasesRetainedSnapshotOfUnfinishedDataUpload proves that the
-// patch-back is owned by the reconcile and that the node gate is dropped for
-// it: a reconciler on another node releases the snapshot of an unfinished
-// DataUpload, the case a hard kill of the owning node-agent leaves behind.
-func TestReconcileReleasesRetainedSnapshotOfUnfinishedDataUpload(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-	// This reconciler is not the node the DataUpload was assigned to.
-	r.nodeName = "other-node"
-
-	du := retentionDataUploadBuilder().
-		Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-		Node("dead-node").
-		Finalizers([]string{DataUploadDownloadFinalizer}).
-		Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	createRetainedSnapshotObjects(t, r, du, func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		return vsc
-	}())
-	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
-	}
-
-	// The first reconcile adds the finalizer; the second one runs the release.
-	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-	require.NoError(t, err)
-	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-	require.NoError(t, err)
-
-	assert.Nil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot,
-		"the record must be cleared after the release")
-	vsc, getErr := getBackupVSC(t, r, du)
-	if getErr == nil {
-		// The fake snapshot clientset has no snapshotter running, so the
-		// content keeps its finalizer; the Delete policy is what the release
-		// controls.
-		assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, vsc.Spec.DeletionPolicy)
-	} else {
-		assert.True(t, apierrors.IsNotFound(getErr))
-	}
-}
-
-// TestReconcileSkipsReleaseForDataUploadWithoutRecord proves the hook's gate:
-// only a DataUpload carrying a retained snapshot record runs the release,
-// because the record provably precedes the Retain patch, so it covers every
-// retained case. An in-flight CSI DataUpload without a record -- including a
-// progress-update-driven reconcile and a file system data mover one -- must
-// not pay the release's uncached DataUpload and VolumeSnapshotContent reads.
-func TestReconcileSkipsReleaseForDataUploadWithoutRecord(t *testing.T) {
-	tests := []struct {
-		name   string
-		du     *velerov2alpha1api.DataUpload
-		cancel bool
-	}{
-		{
-			name: "an in-progress CSI data upload without a record",
-			du: retentionDataUploadBuilder().
-				Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-				Node("node-1").
-				Finalizers([]string{DataUploadDownloadFinalizer}).
-				Result(),
-		},
-		{
-			name: "a prepared CSI data upload without a record",
-			du: retentionDataUploadBuilder().
-				Phase(velerov2alpha1api.DataUploadPhasePrepared).
-				Node("node-1").
-				Finalizers([]string{DataUploadDownloadFinalizer}).
-				Result(),
-		},
-		{
-			name: "a canceling CSI data upload without a record",
-			du: retentionDataUploadBuilder().
-				Phase(velerov2alpha1api.DataUploadPhaseCanceling).
-				Node("node-1").
-				Finalizers([]string{DataUploadDownloadFinalizer}).
-				Result(),
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-
-			createRetainedSnapshotObjects(t, r, tc.du, retentionBackupVSC())
-
-			var vscReads int
-			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("*", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-				if _, ok := action.(clientTesting.GetAction); ok {
-					vscReads++
-				}
-				return false, nil, nil
-			})
-
-			// The finalizer is already in place, so one reconcile reaches the hook.
-			_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: tc.du.Namespace, Name: tc.du.Name}})
-			require.NoError(t, err)
-
-			assert.Zero(t, vscReads, "a DataUpload without a record must not read the VolumeSnapshotContent")
-		})
-	}
-}
-
-// TestReconcileDoesNotReleaseDuringRetentionCleanup proves the lease renewal
-// of the completion callback: the retention-path cleanup that follows the
-// Retain patch is bounded by the deletion timeout, which outlasts the
-// one-minute lease, so at T+1min -- with the callback still inside the
-// cleanup and the DataUpload not yet final -- an expired, stealable mark must
-// not let the reconcile hook patch the content back to Delete and destroy a
-// successfully retained snapshot. Once the renewal expires too, the hook
-// steals the mark and the hard-kill recovery keeps working.
-func TestReconcileDoesNotReleaseDuringRetentionCleanup(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().
-		Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-		Node("node-1").
-		Finalizers([]string{DataUploadDownloadFinalizer}).
-		Result()
-	createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
-	}
-
-	// The completion callback persists the record and switches the content to
-	// Retain; the lease is renewed to cover the cleanup that follows.
-	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger()))
-
-	// The callback is now inside the retention-path cleanup, bounded by the
-	// deletion timeout. Advance the clock past the original one-minute lease
-	// expiry, as a progress-update-driven reconcile observes it.
-	fakeClock := r.Clock.(*testclocks.FakeClock)
-	fakeClock.Step(2 * time.Minute)
-
-	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-	require.NoError(t, err)
-
-	vsc, getErr := getBackupVSC(t, r, du)
-	require.NoError(t, getErr)
-	assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, vsc.Spec.DeletionPolicy,
-		"the successfully retained snapshot must not be released while the completion callback is still cleaning up")
-	assert.NotNil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot,
-		"the record must survive the interleaving")
-
-	// Past the renewed expiry the mark is stealable again and the hook
-	// recovers the hard-kill case: the release proceeds.
-	fakeClock.Step(csi.RetainedSnapshotDeletionTimeout + 2*time.Minute)
-	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-	require.NoError(t, err)
-
-	assert.Nil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot,
-		"the release must proceed once the renewed lease has expired")
-	vsc, getErr = getBackupVSC(t, r, du)
-	if getErr == nil {
-		assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, vsc.Spec.DeletionPolicy)
-	} else {
-		assert.True(t, apierrors.IsNotFound(getErr))
-	}
-}
-
-// TestReconcileReleaseRetrySemantics proves the hook's retry wiring: a
-// refused lease mark is requeued for the blocking mark's parsed remaining
-// time, when it has expired, because nothing else re-enqueues the DataUpload
-// for it -- a fixed lease-duration requeue would retry into the same refusal
-// for as long as a renewed retention mark runs; any other release failure is
-// returned to the controller runtime's backoff instead of being swallowed
-// into a fixed requeue.
-func TestReconcileReleaseRetrySemantics(t *testing.T) {
-	t.Run("a refused lease mark requeues for the blocking mark's remaining time", func(t *testing.T) {
-		r, err := initDataUploaderReconciler()
-		require.NoError(t, err)
-
-		du := retentionDataUploadBuilder().
-			Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-			Node("node-1").
-			Finalizers([]string{DataUploadDownloadFinalizer}).
-			Result()
-		du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-		// Another actor's unexpired retaining mark refuses the release; a
-		// renewed one runs for the deletion timeout plus margins, far beyond
-		// the lease duration.
-		du.Annotations = map[string]string{dataUploadRetainLeaseAnnotation: (&dataUploadLease{
-			Holder:    "other-node-1",
-			ExpiresAt: r.Clock.Now().Add(10 * time.Minute),
-		}).String()}
-		createRetainedSnapshotObjects(t, r, du, func() *snapshotv1api.VolumeSnapshotContent {
-			vsc := retentionBackupVSC()
-			vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-			return vsc
-		}())
-
-		result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-		require.NoError(t, err)
-		assert.Equal(t, 10*time.Minute+time.Second, result.RequeueAfter,
-			"the refused mark is retried when the blocking mark has expired, not after a fixed lease duration")
-
-		vsc, getErr := getBackupVSC(t, r, du)
-		require.NoError(t, getErr)
-		assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, vsc.Spec.DeletionPolicy,
-			"the content must not be touched while the mark is unexpired")
-	})
-
-	t.Run("any other release failure is returned for backoff", func(t *testing.T) {
-		r, err := initDataUploaderReconciler()
-		require.NoError(t, err)
-
-		du := retentionDataUploadBuilder().
-			Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-			Node("node-1").
-			Finalizers([]string{DataUploadDownloadFinalizer}).
-			Result()
-		du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-		createRetainedSnapshotObjects(t, r, du, nil)
-
-		// The content read fails with a non-refused error.
-		r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("get", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-			if action.(clientTesting.GetAction).GetName() == dataUploadName {
-				return true, nil, apierrors.NewInternalError(errors.New("fake apiserver error"))
-			}
-			return false, nil, nil
-		})
-
-		result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-		require.Error(t, err, "a non-refused release failure must reach the controller runtime's backoff")
-		assert.Zero(t, result.RequeueAfter)
-	})
-}
-
-// TestReconcileFailsDataUploadAtReleaseBound proves the bound rule of design
-// section 3: when the patch-back's bounded wait for the content's
-// disappearance expires, the DataUpload fails terminally with the record kept
-// -- so the backup deletion's read-any-record rule owns the snapshot --
-// instead of the hook requeueing every lease duration forever.
-func TestReconcileFailsDataUploadAtReleaseBound(t *testing.T) {
-	// Shorten the deletion wait so the bound is reached quickly.
-	originalTimeout := csi.RetainedSnapshotDeletionTimeout
-	t.Cleanup(func() { csi.RetainedSnapshotDeletionTimeout = originalTimeout })
-	csi.RetainedSnapshotDeletionTimeout = 200 * time.Millisecond
-
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().
-		Phase(velerov2alpha1api.DataUploadPhaseInProgress).
-		Node("node-1").
-		Finalizers([]string{DataUploadDownloadFinalizer}).
-		Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	createRetainedSnapshotObjects(t, r, du, func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		return vsc
-	}())
-	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
-	}
-
-	// The content never disappears: the CSI snapshotter is not running, and
-	// the deletion is swallowed, as a driver that keeps failing
-	// DeleteSnapshot behind the bound-protection finalizer looks.
-	r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("delete", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		return true, nil, nil
-	})
-
-	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: du.Namespace, Name: du.Name}})
-	require.NoError(t, err)
-	assert.Zero(t, result.RequeueAfter, "the bound is terminal, the hook must not requeue forever")
+	require.NoError(t, r.AttemptDataUploadResume(t.Context(), r.logger.WithField("test", t.Name()), du.Namespace))
 
 	updated := getDataUpload(t, r, du)
-	assert.Equal(t, velerov2alpha1api.DataUploadPhaseFailed, updated.Status.Phase,
-		"at the bound the DataUpload fails")
-	assert.NotNil(t, updated.Status.RetainedCSIStorageSnapshot,
-		"the record stays in place so the backup deletion owns the snapshot")
-	assert.Contains(t, updated.Status.Message, "timeout releasing the retained snapshot")
-	// The terminal update drops the rollback lease mark the release acquired.
-	assert.NotContains(t, updated.Annotations, dataUploadRollbackLeaseAnnotation,
-		"the terminal update must drop the rollback lease mark")
-
-	// The content is patched back to Delete, so the driver deletes the
-	// snapshot when it resumes, and the record is the backstop.
-	vsc, getErr := getBackupVSC(t, r, du)
-	require.NoError(t, getErr)
-	assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, vsc.Spec.DeletionPolicy)
-}
-
-// TestOnDataUploadFailedReleasesRetainedSnapshot proves the failure
-// propagation: a DataUpload that fails after the record was persisted carries
-// a stale record only until the patch-back clears it after the release.
-func TestOnDataUploadFailedReleasesRetainedSnapshot(t *testing.T) {
-	r, err := initDataUploaderReconciler()
+	assert.Equal(t, velerov2alpha1api.DataUploadPhaseCompleted, updated.Status.Phase)
+	assert.Equal(t, retentionRecord(), updated.Status.RetainedCSIStorageSnapshot)
+	assert.Empty(t, h.steps, "nothing is written after the restart")
+	vsc, err := r.csiSnapshotClient.VolumeSnapshotContents().Get(t.Context(), du.Name, metav1.GetOptions{})
 	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	createRetainedSnapshotObjects(t, r, du, func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		return vsc
-	}())
-	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
-	}
-
-	r.OnDataUploadFailed(t.Context(), du.Namespace, du.Name, errors.New("fake data path failure"))
-
-	updated := getDataUpload(t, r, du)
-	assert.Equal(t, velerov2alpha1api.DataUploadPhaseFailed, updated.Status.Phase)
-	assert.Nil(t, updated.Status.RetainedCSIStorageSnapshot, "the stale record must be cleared after the release")
-
-	vsc, getErr := getBackupVSC(t, r, du)
-	if getErr == nil {
-		assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, vsc.Spec.DeletionPolicy,
-			"the content must be switched back to Delete so the driver deletes the snapshot")
-	} else {
-		assert.True(t, apierrors.IsNotFound(getErr))
-	}
+	assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, vsc.Spec.DeletionPolicy, "the snapshot was never retained")
 }
 
-// TestRetainSnapshotOnCompletionStaleResourceVersionConflicts proves that the
-// resourceVersion precondition on the Retain patch is real optimistic locking:
-// when the content changed between the capture and the patch, the patch fails
-// with a conflict instead of landing after the concurrent write, where the
-// sidecar would remove the finalizer under Retain with no DeleteSnapshot.
-func TestRetainSnapshotOnCompletionStaleResourceVersionConflicts(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Result()
-	vsc := retentionBackupVSC() // resourceVersion 42
-	createRetainedSnapshotObjects(t, r, du, vsc)
-
-	fakeV1 := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
-	// Serve the callback a stale read, as a cached client or a slow request
-	// would: the object the callback sees carries resourceVersion 41, while the
-	// API server holds 42.
-	fakeV1.PrependReactor("get", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		if action.(clientTesting.GetAction).GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		stale := vsc.DeepCopy()
-		stale.ResourceVersion = "41"
-		return true, stale, nil
-	})
-	// Enforce the precondition semantics the real API server provides: a merge
-	// patch that carries a resourceVersion must match the stored object, which
-	// the API server holds at resourceVersion 42.
-	storedResourceVersion := "42"
-	fakeV1.PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		patchAction := action.(clientTesting.PatchAction)
-		if patchAction.GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		payload := map[string]any{}
-		if err := json.Unmarshal(patchAction.GetPatch(), &payload); err != nil {
-			return true, nil, err
-		}
-		if rv, ok := payload["metadata"].(map[string]any)["resourceVersion"].(string); ok && rv != storedResourceVersion {
-			return true, nil, apierrors.NewConflict(snapshotv1api.Resource("volumesnapshotcontents"), dataUploadName, errors.New("resourceVersion mismatch"))
-		}
-		return false, nil, nil
-	})
-
-	err = r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "error switching the backup VolumeSnapshotContent", "the stale Retain patch must fail")
-
-	// The content keeps its policy; nothing landed.
-	current, getErr := getBackupVSC(t, r, du)
-	require.NoError(t, getErr)
-	assert.Equal(t, snapshotv1api.VolumeSnapshotContentDelete, current.Spec.DeletionPolicy,
-		"the stale Retain patch must not land")
-}
-
-// TestRetainSnapshotOnCompletionFreshResourceVersionAfterRecheck proves the
-// capture point of the Retain patch precondition: the resourceVersion is read
-// immediately after the lease re-check, not reused from the Get at the top of
-// the callback, which predates the lease acquisition, the record persist and
-// the read-back -- a window in which the snapshot controllers update the
-// content routinely. A stale capture there fails the patch spuriously, which
-// fails the DataUpload and degrades the next incremental to a full backup.
-func TestRetainSnapshotOnCompletionFreshResourceVersionAfterRecheck(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Result()
-	vsc := retentionBackupVSC() // stored at resourceVersion 42
-	createRetainedSnapshotObjects(t, r, du, vsc)
-
-	fakeV1 := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
-	// Serve the callback a stale first read, as a cached client or a slow
-	// request would: the object the callback starts from carries
-	// resourceVersion 41, while the API server holds 42 and a snapshot
-	// controller write has landed in between.
-	var gets int
-	fakeV1.PrependReactor("get", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		if action.(clientTesting.GetAction).GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		gets++
-		if gets == 1 {
-			stale := vsc.DeepCopy()
-			stale.ResourceVersion = "41"
-			return true, stale, nil
-		}
-		return false, nil, nil
-	})
-	// Enforce the precondition semantics the real API server provides.
-	fakeV1.PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		patchAction := action.(clientTesting.PatchAction)
-		if patchAction.GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		payload := map[string]any{}
-		if err := json.Unmarshal(patchAction.GetPatch(), &payload); err != nil {
-			return true, nil, err
-		}
-		if rv, ok := payload["metadata"].(map[string]any)["resourceVersion"].(string); ok && rv != "42" {
-			return true, nil, apierrors.NewConflict(snapshotv1api.Resource("volumesnapshotcontents"), dataUploadName, errors.New("resourceVersion mismatch"))
-		}
-		return false, nil, nil
-	})
-
-	require.NoError(t, r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger()),
-		"the Retain patch must carry the post-recheck resourceVersion, not the stale one from the first Get")
-
-	current, getErr := getBackupVSC(t, r, du)
-	require.NoError(t, getErr)
-	assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, current.Spec.DeletionPolicy)
-}
-
-// TestReleaseRetainedSnapshotUsesFreshResourceVersions proves the
-// resourceVersion chain of the patch-back: every write bumps the content's
-// resourceVersion, so the status seed must carry the resourceVersion of the
-// Get at the top, the Delete patch must be preconditioned on the
-// resourceVersion the seed returned, and the content delete must be
-// preconditioned on the resourceVersion of the re-read that follows the
-// bounded PVC wait -- never on the post-patch one, which the sidecar's own
-// status writes during the wait have already superseded. The fake snapshot
-// clientset neither bumps resourceVersions nor enforces the delete
-// preconditions, so the reactors simulate the bumps and the test asserts the
-// resourceVersions the operations actually carry.
-func TestReleaseRetainedSnapshotUsesFreshResourceVersions(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	stored := func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC() // resourceVersion 42
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		vsc.Status = nil
-		return vsc
-	}()
-	createRetainedSnapshotObjects(t, r, du, stored)
-
-	var statusUpdateResourceVersions []string
-	var patchPreconditions []string
-	var deletePreconditions []string
-	fakeV1 := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
-	// The status seed bumps the resourceVersion, as the API server does.
-	fakeV1.PrependReactor("update", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		updateAction := action.(clientTesting.UpdateAction)
-		updated, ok := updateAction.GetObject().(*snapshotv1api.VolumeSnapshotContent)
-		if !ok || updateAction.GetSubresource() != "status" || updated.Name != dataUploadName {
-			return false, nil, nil
-		}
-		statusUpdateResourceVersions = append(statusUpdateResourceVersions, updated.ResourceVersion)
-		stored = stored.DeepCopy()
-		stored.ResourceVersion = "43"
-		handle := retentionHandle
-		stored.Status = &snapshotv1api.VolumeSnapshotContentStatus{SnapshotHandle: &handle}
-		return true, stored, nil
-	})
-	// The Delete patch is preconditioned on the seeded object's
-	// resourceVersion and bumps it again.
-	fakeV1.PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		patchAction := action.(clientTesting.PatchAction)
-		if patchAction.GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		payload := map[string]any{}
-		if err := json.Unmarshal(patchAction.GetPatch(), &payload); err != nil {
-			return true, nil, err
-		}
-		if metadata, ok := payload["metadata"].(map[string]any); ok {
-			patchPreconditions = append(patchPreconditions, metadata["resourceVersion"].(string))
-		}
-		stored = stored.DeepCopy()
-		stored.ResourceVersion = "44"
-		stored.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentDelete
-		return true, stored, nil
-	})
-	// The re-read after the PVC wait observes the sidecar's own status write
-	// from inside the wait window, which bumps the resourceVersion once more.
-	var gets int
-	fakeV1.PrependReactor("get", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		if action.(clientTesting.GetAction).GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		gets++
-		if gets == 2 {
-			// The re-read before the delete: post-patch, post-sidecar-write.
-			bumped := stored.DeepCopy()
-			bumped.ResourceVersion = "45"
-			return true, bumped, nil
-		}
-		return false, nil, nil
-	})
-	// The delete's resourceVersion precondition is what the test asserts.
-	fakeV1.PrependReactor("delete", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		deleteAction := action.(clientTesting.DeleteAction)
-		if deleteAction.GetName() != dataUploadName {
-			return false, nil, nil
-		}
-		if deleteAction.GetDeleteOptions().Preconditions != nil && deleteAction.GetDeleteOptions().Preconditions.ResourceVersion != nil {
-			deletePreconditions = append(deletePreconditions, *deleteAction.GetDeleteOptions().Preconditions.ResourceVersion)
-		}
-		return false, nil, nil
-	})
-
-	require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-
-	require.Len(t, statusUpdateResourceVersions, 1, "the status must be seeded exactly once")
-	assert.Equal(t, "42", statusUpdateResourceVersions[0],
-		"the status seed must carry the resourceVersion of the Get at the top, before any write of this path")
-	require.NotEmpty(t, patchPreconditions, "the Delete patch must be preconditioned on a resourceVersion")
-	assert.Equal(t, "43", patchPreconditions[0],
-		"the Delete patch must be preconditioned on the resourceVersion the status seed returned, not on the pre-seed one")
-	require.NotEmpty(t, deletePreconditions, "the content must be deleted with a resourceVersion precondition")
-	assert.Equal(t, "45", deletePreconditions[0],
-		"the content delete must be preconditioned on the post-wait resourceVersion, not the post-patch one the sidecar's wait-window writes superseded")
-}
-
-// TestReleaseRetainedSnapshotSeedsStatus proves that the patch-back seeds
-// status.snapshotHandle before deleting the content: the sidecar only issues
-// DeleteSnapshot when the policy is Delete and the status carries the handle,
-// otherwise it removes the finalizer with no CSI call and the content's
-// disappearance would read as release while the snapshot leaks.
-func TestReleaseRetainedSnapshotSeedsStatus(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	vsc := func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		vsc.Status = nil // the sidecar never got to set it
-		return vsc
-	}()
-	createRetainedSnapshotObjects(t, r, du, vsc)
-
-	var events []string
-	fakeV1 := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
-	fakeV1.PrependReactor("*", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		switch a := action.(type) {
-		case clientTesting.PatchAction:
-			events = append(events, "patch")
-		case clientTesting.UpdateAction:
-			if a.GetSubresource() == "status" {
-				events = append(events, "update-status")
-			}
-		case clientTesting.DeleteAction:
-			events = append(events, "delete")
-		}
-		return false, nil, nil
-	})
-
-	require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-
-	statusIdx, patchIdx, deleteIdx := -1, -1, -1
-	for i, event := range events {
-		if statusIdx < 0 && event == "update-status" {
-			statusIdx = i
-		}
-		if patchIdx < 0 && event == "patch" {
-			patchIdx = i
-		}
-		if deleteIdx < 0 && event == "delete" {
-			deleteIdx = i
-		}
-	}
-	require.GreaterOrEqual(t, statusIdx, 0, "the patch-back must seed the content status, events: %v", events)
-	require.GreaterOrEqual(t, patchIdx, 0, "the patch-back must patch the content to Delete, events: %v", events)
-	require.GreaterOrEqual(t, deleteIdx, 0, "the patch-back must delete the content, events: %v", events)
-	assert.Less(t, statusIdx, patchIdx, "the status must be seeded before the policy is flipped to Delete, or a cascading deletion would drop the finalizer with no DeleteSnapshot")
-	assert.Less(t, statusIdx, deleteIdx, "the status must be seeded before the content is deleted")
-
-	// The seeded status carries the record's handle.
-	current, getErr := getBackupVSC(t, r, du)
-	if getErr == nil {
-		require.NotNil(t, current.Status)
-		require.NotNil(t, current.Status.SnapshotHandle)
-		assert.Equal(t, retentionHandle, *current.Status.SnapshotHandle)
-	} else {
-		assert.True(t, apierrors.IsNotFound(getErr))
-	}
-}
-
-// TestReleaseRetainedSnapshotFinalStateGuard proves the patch-back guard
-// no-ops on a Completed DataUpload only: a completed backup's base snapshot is
-// never deleted by it, while a Canceled or Failed DataUpload with a record --
-// the cancel path and the prepare timeout mark the object before they clean up
-// -- has its snapshot released like any other unfinished data movement's.
-func TestReleaseRetainedSnapshotFinalStateGuard(t *testing.T) {
-	for _, tc := range []struct {
-		phase       velerov2alpha1api.DataUploadPhase
-		wantRelease bool
-	}{
-		{phase: velerov2alpha1api.DataUploadPhaseCompleted, wantRelease: false},
-		{phase: velerov2alpha1api.DataUploadPhaseCanceled, wantRelease: true},
-		{phase: velerov2alpha1api.DataUploadPhaseFailed, wantRelease: true},
-	} {
-		t.Run(string(tc.phase), func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-
-			// The in-memory DataUpload looks unfinished, but the API object has
-			// already reached a terminal phase.
-			du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-			du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-			vsc := retentionBackupVSC()
-			vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-			createRetainedSnapshotObjects(t, r, du, vsc)
-			final := getDataUpload(t, r, du)
-			final.Status.Phase = tc.phase
-			require.NoError(t, r.client.Update(t.Context(), final))
-
-			var writes int
-			r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1).PrependReactor("*", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-				if _, ok := action.(clientTesting.GetAction); !ok {
-					writes++
-				}
-				return false, nil, nil
-			})
-
-			require.NoError(t, r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger()))
-
-			current, getErr := getBackupVSC(t, r, du)
-			if !tc.wantRelease {
-				assert.Zero(t, writes, "the patch-back must not touch the content of a Completed DataUpload")
-				require.NoError(t, getErr)
-				assert.Equal(t, snapshotv1api.VolumeSnapshotContentRetain, current.Spec.DeletionPolicy, "the base snapshot of the completed backup must stay retained")
-				assert.NotNil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot)
-				return
-			}
-			assert.NotZero(t, writes, "the patch-back runs on a %s DataUpload", tc.phase)
-			assert.True(t, apierrors.IsNotFound(getErr), "the backup content is deleted, so the driver deletes the snapshot")
-			assert.Nil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot, "the record is cleared after the release")
-		})
-	}
-}
-
-// conflictOnceDataUploadClient fails the first DataUpload update with a
-// conflict, as a concurrent writer would, and hands control back so the test
-// can change the object between the conflicted write and its retry.
-type conflictOnceDataUploadClient struct {
-	kbclient.Client
-	conflicted bool
-	onConflict func()
-}
-
-func (c *conflictOnceDataUploadClient) Update(ctx context.Context, obj kbclient.Object, opts ...kbclient.UpdateOption) error {
-	if !c.conflicted {
-		if _, ok := obj.(*velerov2alpha1api.DataUpload); ok {
-			c.conflicted = true
-			c.onConflict()
-			return apierrors.NewConflict(velerov2alpha1api.Resource("dataupload"), obj.GetName(), errors.New("conflict"))
-		}
-	}
-	return c.Client.Update(ctx, obj, opts...)
-}
-
-// TestTryAcquireDataUploadLeaseReportsTheLatestAttempt proves the lease
-// acquisition reports the outcome of its last attempt only: an update that
-// conflicts and is retried must not leak an earlier attempt's acquisition
-// out when the retry finds another holder or a final state, or the caller
-// would proceed to roll the snapshot back without owning the lease.
-func TestTryAcquireDataUploadLeaseReportsTheLatestAttempt(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Result()
-	createRetainedSnapshotObjects(t, r, du, nil)
-
-	underlying := r.client
-	r.client = &conflictOnceDataUploadClient{Client: underlying, onConflict: func() {
-		// Between the conflicted write and its retry, another actor acquired
-		// the retention lease.
-		current := &velerov2alpha1api.DataUpload{}
-		require.NoError(t, underlying.Get(t.Context(), types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, current))
-		if current.Annotations == nil {
-			current.Annotations = map[string]string{}
-		}
-		current.Annotations[dataUploadRetainLeaseAnnotation] = (&dataUploadLease{
-			Holder:    "other-node",
-			ExpiresAt: time.Now().Add(time.Minute),
-		}).String()
-		require.NoError(t, underlying.Update(t.Context(), current))
-	}}
-
-	acquired, blockedFor, err := r.tryAcquireDataUploadLease(t.Context(), du, dataUploadRollbackLeaseAnnotation, "node-a", time.Minute, velerotest.NewLogger())
-	require.NoError(t, err)
-	assert.False(t, acquired, "the refused retry must not report the conflicted first attempt's acquisition")
-	assert.Positive(t, blockedFor, "the refusal reports the blocking mark's remaining time")
-
-	// The other holder's mark is intact; the caller never wrote its own.
-	current := getDataUpload(t, r, du)
-	lease, ok := parseDataUploadLease(current.Annotations[dataUploadRetainLeaseAnnotation])
-	require.True(t, ok)
-	assert.Equal(t, "other-node", lease.Holder)
-}
-
-// TestReleaseRetainedSnapshotKeepsRecordWhenContentVanishesBeforeSeed proves
-// the seed's NotFound is not tolerated: a content that disappears before its
-// status was seeded released nothing under this path's control -- under
-// Retain the sidecar drops the finalizer without a DeleteSnapshot -- so the
-// record is kept and the backup deletion owns the snapshot.
-func TestReleaseRetainedSnapshotKeepsRecordWhenContentVanishesBeforeSeed(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	vsc := func() *snapshotv1api.VolumeSnapshotContent {
-		vsc := retentionBackupVSC()
-		vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-		vsc.Status = nil
-		return vsc
-	}()
-	createRetainedSnapshotObjects(t, r, du, vsc)
-
-	// The content vanishes before the status seed lands.
-	fakeV1 := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
-	fakeV1.PrependReactor("update", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-		if action.(clientTesting.UpdateAction).GetSubresource() == "status" {
-			return true, nil, apierrors.NewNotFound(snapshotv1api.Resource("volumesnapshotcontents"), dataUploadName)
-		}
-		return false, nil, nil
-	})
-
-	err = r.releaseRetainedSnapshot(t.Context(), du, velerotest.NewLogger())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "error seeding the status of the backup VolumeSnapshotContent")
-
-	current := getDataUpload(t, r, du)
-	assert.NotNil(t, current.Status.RetainedCSIStorageSnapshot,
-		"the record is kept when the content vanishes before the seed, the backup deletion owns the snapshot")
-}
-
-// TestErrorOutAfterUploadPersistsSnapshotID proves the failure paths after a
-// finished upload record the repository snapshot ID with the failure: the
-// backup deletion reaches the repository data and the retained snapshot
-// record through it, and updateStatusToFailed alone would drop it, because
-// the error is not a datapath.DataPathError.
-func TestErrorOutAfterUploadPersistsSnapshotID(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-
-	r.errorOutAfterUpload(t.Context(), du, errors.New("retain failed"), "failed to retain the volume snapshot", "repo-snap-1", velerotest.NewLogger())
-
-	updated := getDataUpload(t, r, du)
-	assert.Equal(t, velerov2alpha1api.DataUploadPhaseFailed, updated.Status.Phase)
-	assert.Equal(t, "repo-snap-1", updated.Status.SnapshotID,
-		"the repository snapshot ID is persisted with the failure")
-}
-
-// TestFallbackReasonOf proves the node-agent's refinement of the uploader's
-// fallback reason (design, Implementation: diagnostics): a driver-side failure
-// is named "base snapshot not retained" when the previous completed
-// DataUpload of the PVC carries no retention record, kept as the retained
-// handle's failure when it does, names the unfinished DataUpload whose
-// committed repository snapshot the uploader took as the parent, and is passed
-// through for a missing parent or an absent CBT service, where the previous
-// backup's retention is beside the point.
+// TestFallbackReasonOf proves the fallback reason is the uploader's
+// classification of the driver error, nothing else.
 func TestFallbackReasonOf(t *testing.T) {
-	start := metav1.NewTime(time.Now())
-	earlier := metav1.NewTime(start.Add(-time.Hour))
-	later := metav1.NewTime(start.Add(time.Hour))
-
-	newDU := func(name string, phase velerov2alpha1api.DataUploadPhase, completed *metav1.Time, record *velerov2alpha1api.RetainedCSIStorageSnapshot) *velerov2alpha1api.DataUpload {
-		du := builder.ForDataUpload(velerov1api.DefaultNamespace, name).
-			DataMover("velero-block").
-			Labels(map[string]string{velerov1api.PVCUIDLabel: "pvc-uid"}).
-			Phase(phase).
-			Result()
-		du.Status.CompletionTimestamp = completed
-		du.Status.RetainedCSIStorageSnapshot = record
-		return du
-	}
-	current := newDU("current", velerov2alpha1api.DataUploadPhaseInProgress, nil, nil)
-	current.Status.StartTimestamp = &start
-	// committed stamps the repository snapshot the movement wrote and when it
-	// started, which is what the uploader's parent search orders by.
-	committed := func(du *velerov2alpha1api.DataUpload, snapshotID string, startedAgo time.Duration) *velerov2alpha1api.DataUpload {
-		du.Status.SnapshotID = snapshotID
-		du.Status.StartTimestamp = ptr.To(metav1.NewTime(start.Add(-startedAgo)))
-		return du
-	}
-	retained := &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h-1", Driver: retentionDriver}
-
-	tests := []struct {
-		name     string
-		result   datapath.BackupResult
-		previous []*velerov2alpha1api.DataUpload
-		want     string
-	}{
-		{name: "no fallback", result: datapath.BackupResult{}, want: ""},
-		{name: "no parent passes through", result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonNoParent + ": first backup"}, want: block.FallbackReasonNoParent + ": first backup"},
-		{name: "CBT unavailable passes through", result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonCBTUnavailable + ": none"}, want: block.FallbackReasonCBTUnavailable + ": none"},
-		{name: "driver error without a previous DataUpload", result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"}, want: block.FallbackReasonDriverError + ": rbd"},
-		{
-			name:     "previous backup did not retain",
-			result:   datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
-			previous: []*velerov2alpha1api.DataUpload{newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, nil)},
-			want:     "base snapshot not retained by the previous backup (DataUpload prev); " + block.FallbackReasonDriverError + ": rbd",
-		},
-		{
-			name:     "previous backup retained but the base could not be used",
-			result:   datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
-			previous: []*velerov2alpha1api.DataUpload{newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h-1", Driver: retentionDriver})},
-			want:     "base snapshot h-1 of the previous backup (DataUpload prev) was retained but could not be used; " + block.FallbackReasonBaseGone + ": not found",
-		},
-		{
-			// The backup holding the rolling base was deleted: the parent is
-			// an older backup whose snapshot the base move released.
-			name:     "previous backup's snapshot was released by the rolling base",
-			result:   datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
-			previous: []*velerov2alpha1api.DataUpload{newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "h-1", Driver: retentionDriver, Released: true, ReleasedBy: "holder-uid"})},
-			want:     "base snapshot h-1 of the previous backup (DataUpload prev) was released as the rolling base moved on (released by backup holder-uid), and the backup holding the newer base is gone; " + block.FallbackReasonBaseGone + ": not found",
-		},
-		{
-			name:   "the latest completed previous DataUpload wins, later and unfinished ones are ignored",
-			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
-			previous: []*velerov2alpha1api.DataUpload{
-				newDU("older", velerov2alpha1api.DataUploadPhaseCompleted, ptr.To(metav1.NewTime(earlier.Add(-time.Hour))), &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "old", Driver: retentionDriver}),
-				newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, nil),
-				newDU("after", velerov2alpha1api.DataUploadPhaseCompleted, &later, &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "new", Driver: retentionDriver}),
-				newDU("failed", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil),
-			},
-			want: "base snapshot not retained by the previous backup (DataUpload prev); " + block.FallbackReasonDriverError + ": rbd",
-		},
-		{
-			// A movement that failed after its repository snapshot was
-			// committed is the newest repository snapshot, so the uploader
-			// took it as the parent; its storage snapshot is gone, while the
-			// previous completed backup's base is retained but unused.
-			name:   "an unfinished DataUpload with a committed repository snapshot is named as the parent",
-			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonDriverError + ": rbd"},
-			previous: []*velerov2alpha1api.DataUpload{
-				committed(newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, ptr.To(metav1.NewTime(start.Add(-90*time.Minute))), retained.DeepCopy()), "repo-prev", 2*time.Hour),
-				committed(newDU("failed", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil), "repo-failed", 80*time.Minute),
-			},
-			want: "parent repository snapshot repo-failed belongs to DataUpload failed (Failed), whose snapshot was not retained; " + block.FallbackReasonDriverError + ": rbd",
-		},
-		{
-			name:   "a canceled one is named the same way",
-			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
-			previous: []*velerov2alpha1api.DataUpload{
-				committed(newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, ptr.To(metav1.NewTime(start.Add(-90*time.Minute))), retained.DeepCopy()), "repo-prev", 2*time.Hour),
-				committed(newDU("canceled", velerov2alpha1api.DataUploadPhaseCanceled, &earlier, nil), "repo-canceled", 80*time.Minute),
-			},
-			want: "parent repository snapshot repo-canceled belongs to DataUpload canceled (Canceled), whose snapshot was not retained; " + block.FallbackReasonBaseGone + ": not found",
-		},
-		{
-			// The newest repository snapshot is the completed backup's: the
-			// previous-backup reasoning applies; an unfinished movement that
-			// started after the current one, or wrote no repository snapshot,
-			// is not the parent.
-			name:   "a completed newest parent keeps the previous-backup reason",
-			result: datapath.BackupResult{FallbackFull: true, FallbackReason: block.FallbackReasonBaseGone + ": not found"},
-			previous: []*velerov2alpha1api.DataUpload{
-				committed(newDU("failed-before", velerov2alpha1api.DataUploadPhaseFailed, ptr.To(metav1.NewTime(start.Add(-2*time.Hour))), nil), "repo-failed-before", 3*time.Hour),
-				committed(newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, retained.DeepCopy()), "repo-prev", 2*time.Hour),
-				newDU("failed-no-snapshot", velerov2alpha1api.DataUploadPhaseFailed, &earlier, nil),
-				committed(newDU("failed-after", velerov2alpha1api.DataUploadPhaseFailed, &later, nil), "repo-failed-after", -time.Minute),
-			},
-			want: "base snapshot h-1 of the previous backup (DataUpload prev) was retained but could not be used; " + block.FallbackReasonBaseGone + ": not found",
-		},
-		{
-			name:   "an empty uploader reason still records the fall back",
-			result: datapath.BackupResult{FallbackFull: true},
-			want:   "fallen back to a full read",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-			for _, du := range tc.previous {
-				require.NoError(t, r.client.Create(t.Context(), du))
-			}
-			assert.Equal(t, tc.want, r.fallbackReasonOf(t.Context(), current, tc.result, velerotest.NewLogger()))
-		})
-	}
-
-	t.Run("the file system data mover keeps the uploader's reason", func(t *testing.T) {
-		r, err := initDataUploaderReconciler()
-		require.NoError(t, err)
-		require.NoError(t, r.client.Create(t.Context(), newDU("prev", velerov2alpha1api.DataUploadPhaseCompleted, &earlier, nil)))
-		fs := current.DeepCopy()
-		fs.Spec.DataMover = "velero"
-		assert.Equal(t, "no usable parent repository snapshot", r.fallbackReasonOf(t.Context(), fs, datapath.BackupResult{FallbackFull: true, FallbackReason: "no usable parent repository snapshot"}, velerotest.NewLogger()))
-	})
-}
-
-// TestRetainSnapshotOnCompletionRecordsChain proves the record carries the
-// rolling-base chain: the source volume's CSI volume handle, and the base the
-// delta used -- the record of the previous completed DataUpload of the same
-// PVC -- except on a full read, which has no base.
-func TestRetainSnapshotOnCompletionRecordsChain(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		fallbackFull bool
-		wantBase     string
-	}{
-		{name: "incremental records the previous record as its base", wantBase: "base-handle"},
-		{name: "full read records no base", fallbackFull: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-			ctx := t.Context()
-
-			_, err = r.kubeClient.CoreV1().PersistentVolumeClaims("fake-ns").Create(ctx, &corev1api.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "fake-ns", Name: "test-pvc"},
-				Spec:       corev1api.PersistentVolumeClaimSpec{VolumeName: "pv-1"},
-			}, metav1.CreateOptions{})
-			require.NoError(t, err)
-			_, err = r.kubeClient.CoreV1().PersistentVolumes().Create(ctx, &corev1api.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{Name: "pv-1"},
-				Spec: corev1api.PersistentVolumeSpec{PersistentVolumeSource: corev1api.PersistentVolumeSource{
-					CSI: &corev1api.CSIPersistentVolumeSource{Driver: retentionDriver, VolumeHandle: "volume-handle-1"},
-				}},
-			}, metav1.CreateOptions{})
-			require.NoError(t, err)
-
-			earlier := metav1.NewTime(time.Now().Add(-time.Hour))
-			previous := retentionDataUploadBuilder().Result()
-			previous.Name = "previous-du"
-			previous.Labels = map[string]string{velerov1api.PVCUIDLabel: "pvc-uid"}
-			previous.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
-			previous.Status.CompletionTimestamp = &earlier
-			previous.Status.RetainedCSIStorageSnapshot = &velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: "base-handle", Driver: retentionDriver}
-			require.NoError(t, r.client.Create(ctx, previous))
-
-			du := retentionDataUploadBuilder().Result()
-			du.Labels = map[string]string{velerov1api.PVCUIDLabel: "pvc-uid"}
-			createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-
-			require.NoError(t, r.retainSnapshotOnCompletion(ctx, du, tc.fallbackFull, velerotest.NewLogger()))
-
-			record := getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot
-			require.NotNil(t, record)
-			assert.Equal(t, "volume-handle-1", record.CSIVolumeHandle)
-			assert.Equal(t, tc.wantBase, record.BaseCSISnapshotHandle)
-			assert.False(t, record.Released)
-		})
-	}
-}
-
-// TestRetainSnapshotOnCompletionLeaseWindow proves the lease window: the
-// callback takes the Retain patch's resourceVersion from a read that shows the
-// content live and re-checks its lease after that read, so a patch-back that
-// took over after the callback's earlier lease check is caught. The callback
-// passes its lease check and persists the record, then the patch-back acts
-// before the callback's read: the callback must abort without patching Retain.
-func TestRetainSnapshotOnCompletionLeaseWindow(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		// interleave runs when the callback reads the content for the patch,
-		// after its earlier lease check passed.
-		interleave func(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) *snapshotv1api.VolumeSnapshotContent
-		wantErr    string
-	}{
-		{
-			name: "the patch-back deleted the content",
-			interleave: func(_ *testing.T, _ *DataUploadReconciler, _ *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) *snapshotv1api.VolumeSnapshotContent {
-				deleting := vsc.DeepCopy()
-				now := metav1.Now()
-				deleting.DeletionTimestamp = &now
-				deleting.Finalizers = []string{csi.VSCBoundProtectionFinalizer}
-				return deleting
-			},
-			wantErr: "is being deleted",
-		},
-		{
-			name: "the patch-back took the rollback mark after the callback's lease expired",
-			interleave: func(t *testing.T, r *DataUploadReconciler, du *velerov2alpha1api.DataUpload, vsc *snapshotv1api.VolumeSnapshotContent) *snapshotv1api.VolumeSnapshotContent {
-				t.Helper()
-				current := getDataUpload(t, r, du)
-				current.Annotations[dataUploadRollbackLeaseAnnotation] = (&dataUploadLease{Holder: "other-node-1", ExpiresAt: r.Clock.Now().Add(time.Minute)}).String()
-				require.NoError(t, r.client.Update(t.Context(), current))
-				return vsc
-			},
-			wantErr: "a rollback of DataUpload",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r, err := initDataUploaderReconciler()
-			require.NoError(t, err)
-			du := retentionDataUploadBuilder().Result()
-			createRetainedSnapshotObjects(t, r, du, retentionBackupVSC())
-
-			fake := r.csiSnapshotClient.(*snapshotv1fake.FakeSnapshotV1)
-			gets := 0
-			fake.PrependReactor("get", "volumesnapshotcontents", func(clientTesting.Action) (bool, runtime.Object, error) {
-				gets++
-				if gets < 2 {
-					return false, nil, nil
-				}
-				return true, tc.interleave(t, r, du, retentionBackupVSC()), nil
-			})
-			patches := &vscPatchRecorder{}
-			fake.PrependReactor("patch", "volumesnapshotcontents", func(action clientTesting.Action) (bool, runtime.Object, error) {
-				patches.patches = append(patches.patches, string(action.(clientTesting.PatchAction).GetPatch()))
-				return false, nil, nil
-			})
-
-			err = r.retainSnapshotOnCompletion(t.Context(), du, false, velerotest.NewLogger())
-			require.ErrorContains(t, err, tc.wantErr)
-			assert.GreaterOrEqual(t, gets, 2, "the callback re-read the content after its lease check")
-			assert.False(t, patches.hasDeletionPolicy("Retain"), "the callback must abort without patching Retain")
-			assert.NotNil(t, getDataUpload(t, r, du).Status.RetainedCSIStorageSnapshot, "the record stays, the patch-back and the backup deletion own the snapshot")
-		})
-	}
-}
-
-// TestOnPrepareTimeoutReleasesRetainedSnapshot proves the prepare timeout runs
-// the patch-back: it marks the DataUpload Failed before its cleanup, and the
-// snapshot a record names is released instead of being left to the backup
-// deletion.
-func TestOnPrepareTimeoutReleasesRetainedSnapshot(t *testing.T) {
-	r, err := initDataUploaderReconciler()
-	require.NoError(t, err)
-	r.snapshotExposerList = map[velerov2alpha1api.SnapshotType]exposer.SnapshotExposer{
-		velerov2alpha1api.SnapshotTypeCSI: exposer.NewCSISnapshotExposer(r.kubeClient, r.csiSnapshotClient, velerotest.NewLogger()),
-	}
-
-	du := retentionDataUploadBuilder().Phase(velerov2alpha1api.DataUploadPhasePrepared).Result()
-	du.Status.RetainedCSIStorageSnapshot = retentionRecord()
-	vsc := retentionBackupVSC()
-	vsc.Spec.DeletionPolicy = snapshotv1api.VolumeSnapshotContentRetain
-	createRetainedSnapshotObjects(t, r, du, vsc)
-
-	r.onPrepareTimeout(t.Context(), getDataUpload(t, r, du))
-
-	updated := getDataUpload(t, r, du)
-	assert.Equal(t, velerov2alpha1api.DataUploadPhaseFailed, updated.Status.Phase)
-	assert.Nil(t, updated.Status.RetainedCSIStorageSnapshot, "the record is cleared after the release")
-	_, getErr := getBackupVSC(t, r, du)
-	assert.True(t, apierrors.IsNotFound(getErr), "the backup content is deleted, so the driver deletes the snapshot")
+	assert.Empty(t, fallbackReasonOf(datapath.BackupResult{}))
+	assert.Equal(t, "base snapshot gone: not found", fallbackReasonOf(datapath.BackupResult{FallbackFull: true, FallbackReason: "base snapshot gone: not found"}))
+	assert.Equal(t, "fallen back to a full read", fallbackReasonOf(datapath.BackupResult{FallbackFull: true}))
 }

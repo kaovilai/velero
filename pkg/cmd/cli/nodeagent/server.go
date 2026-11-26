@@ -443,8 +443,8 @@ func (s *nodeAgentServer) run() {
 		s.logger.WithError(err).Fatal("Unable to create the pod volume restore controller")
 	}
 
-	// The release of a retained base snapshot and the patch-back are bounded
-	// by the CSI operation timeout.
+	// The release of a retained base snapshot is bounded by the CSI operation
+	// timeout.
 	if s.config.resourceTimeout > 0 {
 		csi.RetainedSnapshotDeletionTimeout = s.config.resourceTimeout
 	}

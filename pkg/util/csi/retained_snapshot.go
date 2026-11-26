@@ -338,142 +338,14 @@ func waitGone(ctx context.Context, reader crclient.Reader, key crclient.ObjectKe
 }
 
 // PatchVSCDeletionPolicy patches the deletion policy of the named
-// VolumeSnapshotContent through the typed snapshot client, with a
-// resourceVersion precondition: the patch carries the captured
-// resourceVersion, so a concurrent write to the content in between makes this
-// operation fail instead of landing after it, where the sidecar would
-// otherwise remove the finalizer under Retain with no DeleteSnapshot, and a
-// vanished content would read as released. A resourceVersion of "" skips the
-// precondition. A NotFound is tolerated, the caller decides what that means.
-// The patched object the API server returned is handed back, because the
-// write bumps the resourceVersion: the caller's next preconditioned
-// operation on the same content must be built on the returned object, not on
-// the object its own resourceVersion was captured from, or it fails with a
-// self-inflicted conflict on every call against a real API server.
-func PatchVSCDeletionPolicy(
-	ctx context.Context,
-	snapshotClient snapshotter.SnapshotV1Interface,
-	vscName string,
-	policy snapshotv1api.DeletionPolicy,
-	resourceVersion string,
-) (*snapshotv1api.VolumeSnapshotContent, error) {
-	// The precondition must sit under metadata.resourceVersion: that is the
-	// only placement the API server honors as an optimistic-concurrency check
-	// on a merge patch. A top-level resourceVersion key is not part of the
-	// object's schema and is silently dropped when the patched JSON is
-	// decoded, which would make the patch unconditional.
-	patch := map[string]any{
-		"spec": map[string]any{"deletionPolicy": string(policy)},
-	}
-	if resourceVersion != "" {
-		patch["metadata"] = map[string]any{"resourceVersion": resourceVersion}
-	}
-	patchBytes, err := json.Marshal(patch)
+// VolumeSnapshotContent through the typed snapshot client.
+func PatchVSCDeletionPolicy(ctx context.Context, snapshotClient snapshotter.SnapshotV1Interface, vscName string, policy snapshotv1api.DeletionPolicy) error {
+	patchBytes, err := json.Marshal(map[string]any{"spec": map[string]any{"deletionPolicy": string(policy)}})
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshaling deletion policy patch")
+		return errors.Wrap(err, "error marshaling deletion policy patch")
 	}
-	patched, err := snapshotClient.VolumeSnapshotContents().Patch(ctx, vscName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
-	if err != nil {
-		return nil, errors.Wrapf(err, "error patching the deletion policy of VolumeSnapshotContent %s", vscName)
-	}
-	return patched, nil
-}
-
-// DeleteVSCWithResourceVersion deletes the named VolumeSnapshotContent with a
-// resourceVersion precondition, so a raced write makes the deletion fail and
-// be retried instead of slipping between a confirm and a delete. A
-// resourceVersion of "" skips the precondition. A NotFound is tolerated, the
-// caller decides what that means.
-func DeleteVSCWithResourceVersion(
-	ctx context.Context,
-	snapshotClient snapshotter.SnapshotV1Interface,
-	vscName string,
-	resourceVersion string,
-) error {
-	deleteOptions := metav1.DeleteOptions{}
-	if resourceVersion != "" {
-		deleteOptions.Preconditions = &metav1.Preconditions{ResourceVersion: &resourceVersion}
-	}
-	if err := snapshotClient.VolumeSnapshotContents().Delete(ctx, vscName, deleteOptions); err != nil && !apierrors.IsNotFound(err) {
-		return errors.Wrapf(err, "error deleting VolumeSnapshotContent %s", vscName)
+	if _, err := snapshotClient.VolumeSnapshotContents().Patch(ctx, vscName, types.MergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
+		return errors.Wrapf(err, "error patching the deletion policy of VolumeSnapshotContent %s", vscName)
 	}
 	return nil
-}
-
-// DeleteVSWithResourceVersion deletes the named VolumeSnapshot with a
-// resourceVersion precondition. A resourceVersion of "" skips the
-// precondition. A NotFound is tolerated, the caller decides what that means.
-func DeleteVSWithResourceVersion(
-	ctx context.Context,
-	snapshotClient snapshotter.SnapshotV1Interface,
-	vsNamespace string,
-	vsName string,
-	resourceVersion string,
-) error {
-	deleteOptions := metav1.DeleteOptions{}
-	if resourceVersion != "" {
-		deleteOptions.Preconditions = &metav1.Preconditions{ResourceVersion: &resourceVersion}
-	}
-	if err := snapshotClient.VolumeSnapshots(vsNamespace).Delete(ctx, vsName, deleteOptions); err != nil && !apierrors.IsNotFound(err) {
-		return errors.Wrapf(err, "error deleting VolumeSnapshot %s/%s", vsNamespace, vsName)
-	}
-	return nil
-}
-
-// SeedVSCStatusSnapshotHandle writes the given handle into the content's
-// status.snapshotHandle through the status subresource, unless it is already
-// set. It returns the object the API server holds after the write, because
-// the status update bumps the resourceVersion: the caller's next
-// preconditioned operation on the same content must be built on the returned
-// object, not on the one passed in, or it fails with a self-inflicted
-// conflict on every call against a real API server. On an early return the
-// passed object is handed back unchanged. A content that vanished before the
-// write is reported as an error, not tolerated: a content that disappears
-// under Retain releases nothing, and the caller must keep its record instead
-// of reading the disappearance as release.
-//
-// The CSI snapshotter sidecar only issues DeleteSnapshot for a content being
-// deleted when its DeletionPolicy is Delete and status.snapshotHandle is set;
-// with a nil status it removes the bound-protection finalizer without the CSI
-// call, so a patch-back that treated the content's disappearance as release
-// would clear the record while the snapshot leaks in the storage. The same
-// rule applies to the temp content of the retained-snapshot deletion, which is
-// why DeleteRetainedSnapshot seeds its status itself. A conflict from the
-// sidecar's own status write is tolerated: the fresh status is re-read, and
-// any handle in it satisfies the requirement.
-func SeedVSCStatusSnapshotHandle(
-	ctx context.Context,
-	snapshotClient snapshotter.SnapshotV1Interface,
-	vsc *snapshotv1api.VolumeSnapshotContent,
-	handle string,
-) (*snapshotv1api.VolumeSnapshotContent, error) {
-	if handle == "" {
-		return vsc, nil
-	}
-	if vsc.Status != nil && vsc.Status.SnapshotHandle != nil && *vsc.Status.SnapshotHandle != "" {
-		return vsc, nil
-	}
-
-	updated := vsc.DeepCopy()
-	if updated.Status == nil {
-		updated.Status = &snapshotv1api.VolumeSnapshotContentStatus{}
-	}
-	updated.Status.SnapshotHandle = &handle
-	current, err := snapshotClient.VolumeSnapshotContents().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-	if err != nil {
-		if !apierrors.IsConflict(err) {
-			return nil, errors.Wrapf(err, "error writing the status of VolumeSnapshotContent %s", vsc.Name)
-		}
-		// The sidecar wrote the status concurrently; any handle in the fresh
-		// status satisfies the requirement.
-		fresh, getErr := snapshotClient.VolumeSnapshotContents().Get(ctx, vsc.Name, metav1.GetOptions{})
-		if getErr != nil {
-			return nil, errors.Wrap(getErr, "error re-reading the status of the VolumeSnapshotContent after a conflict")
-		}
-		if fresh.Status == nil || fresh.Status.SnapshotHandle == nil || *fresh.Status.SnapshotHandle == "" {
-			return nil, errors.Wrap(err, "error writing the status of VolumeSnapshotContent after a conflict")
-		}
-		return fresh, nil
-	}
-	return current, nil
 }

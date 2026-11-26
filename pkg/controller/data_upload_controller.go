@@ -66,14 +66,10 @@ const (
 
 // DataUploadReconciler reconciles a DataUpload object
 type DataUploadReconciler struct {
-	client            client.Client
-	kubeClient        kubernetes.Interface
-	csiSnapshotClient snapshotter.SnapshotV1Interface
-	mgr               manager.Manager
-	// apiReader reads from the API server instead of the cache, for the
-	// persisted-record verification and the lease re-check of base snapshot
-	// retention.
-	apiReader                      client.Reader
+	client                         client.Client
+	kubeClient                     kubernetes.Interface
+	csiSnapshotClient              snapshotter.SnapshotV1Interface
+	mgr                            manager.Manager
 	Clock                          clocks.WithTickerAndDelayedExecution
 	nodeName                       string
 	logger                         logrus.FieldLogger
@@ -224,34 +220,6 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// remove finalizer no matter whether the cr is being deleted or not for it is no longer needed when internal resources are all cleaned up
 		// also in final status cr won't block the direct delete of the velero namespace
 		if controllerutil.ContainsFinalizer(du, DataUploadDownloadFinalizer) {
-			// A DataUpload deleted through the API -- a common support action
-			// for a stuck one -- runs the patch-back before its finalizer goes,
-			// unless it completed: the finalizer is dropped only after the
-			// snapshot was released or the patch-back reached its bound.
-			if !du.DeletionTimestamp.IsZero() && du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI &&
-				du.Status.Phase != velerov2alpha1api.DataUploadPhaseCompleted &&
-				du.Status.RetainedCSIStorageSnapshot != nil && !du.Status.RetainedCSIStorageSnapshot.Released {
-				if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
-					var refused *leaseRefusedError
-					var bound *retainedSnapshotReleaseTimeoutError
-					switch {
-					case errors.As(releaseErr, &refused):
-						requeueAfter := refused.retryAfter
-						if requeueAfter <= 0 {
-							requeueAfter = dataUploadLeaseDuration
-						}
-						return ctrl.Result{RequeueAfter: requeueAfter + time.Second}, nil
-					case errors.As(releaseErr, &bound):
-						log.WithError(releaseErr).Error("The snapshot of the deleted DataUpload was not released within the bound; its content is left being deleted")
-						r.events().Event(du, true, "RetainedSnapshotReleaseTimedOut",
-							"the snapshot of the deleted DataUpload was not released within the bound; its content is left being deleted: %v", releaseErr)
-					default:
-						log.WithError(releaseErr).Warn("Failed to release the snapshot of the deleted DataUpload, will retry")
-						return ctrl.Result{}, releaseErr
-					}
-				}
-			}
-
 			if err := UpdateDataUploadWithRetry(ctx, r.client, req.NamespacedName, log, func(du *velerov2alpha1api.DataUpload) bool {
 				if !controllerutil.ContainsFinalizer(du, DataUploadDownloadFinalizer) {
 					return false
@@ -292,65 +260,6 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
 	if !ok {
 		return r.errorOut(ctx, du, errors.Errorf("%s type of snapshot exposer is not exist", du.Spec.SnapshotType), "not exist type of exposer", log)
-	}
-
-	// A hard kill of the node-agent inside the retention switch window leaves
-	// no in-process retry, so the patch-back is owned by the reconcile, not
-	// only by the failing code path. The backup VolumeSnapshotContent is named
-	// after the DataUpload, so any reconciler can run it and the node gate
-	// below buys nothing for this path: the Prepared and InProgress branches
-	// return early when status.node names a different node, and the velero
-	// server never runs the exposer cleanup, so a DataUpload whose node is gone
-	// is otherwise acted on by nobody.
-	// The gate is the record, not the phase: the record is persisted before
-	// the content is switched to Retain (design section 2), so every DataUpload
-	// whose snapshot may need releasing carries one, in every phase the switch
-	// window can be observed from. A DataUpload without a record has nothing
-	// to release -- its content was never switched to Retain -- so it skips
-	// the release and its uncached reads entirely, progress-update-driven
-	// reconciles and file system data mover DataUploads included.
-	// A DataUpload in a final phase is not retried here: the cancel, error
-	// and prepare-timeout paths run the patch-back themselves when they mark
-	// it Canceled or Failed, a Failed one at the bound keeps its record for
-	// the backup deletion, and one deleted through the API is handled by the
-	// finalizer branch above.
-	if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI && !isDataUploadInFinalState(du) &&
-		du.Status.RetainedCSIStorageSnapshot != nil && !du.Status.RetainedCSIStorageSnapshot.Released {
-		if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
-			var refused *leaseRefusedError
-			if errors.As(releaseErr, &refused) {
-				// A refused lease mark carries its own retry: nothing else
-				// re-enqueues the DataUpload for this, the node-agent has no
-				// sync period, so the hook requeues until the blocking mark
-				// has expired -- its parsed remaining time, which a renewed
-				// retention mark holds far beyond the lease duration -- plus a
-				// second of scheduling slack; an unknown remaining time falls
-				// back to the lease duration.
-				requeueAfter := refused.retryAfter
-				if requeueAfter <= 0 {
-					requeueAfter = dataUploadLeaseDuration
-				}
-				log.WithError(releaseErr).Info("The release of the retained snapshot waits for the retention lease to expire")
-				return ctrl.Result{RequeueAfter: requeueAfter + time.Second}, nil
-			}
-			var bound *retainedSnapshotReleaseTimeoutError
-			if errors.As(releaseErr, &bound) {
-				// At the bound the DataUpload fails and the record stays in
-				// place, so the backup deletion's read-any-record rule owns
-				// the snapshot (design section 3): the bound is terminal, the
-				// hook must not requeue forever.
-				log.WithError(releaseErr).Error("The retained snapshot of the unfinished DataUpload was not released in time, failing the DataUpload; its record is kept and the backup deletion owns the snapshot")
-				r.events().Event(du, true, "RetainedSnapshotReleaseTimedOut",
-					"the snapshot of the unfinished DataUpload was not released within the bound; its content is left being deleted and the record is kept for the backup deletion: %v", releaseErr)
-				_ = r.updateStatusToFailed(ctx, du, releaseErr, "timeout releasing the retained snapshot of the unfinished data upload", log)
-				return ctrl.Result{}, nil
-			}
-			log.WithError(releaseErr).Warn("Failed to release the retained snapshot of the unfinished DataUpload, will retry")
-			// Any other failure is retried by the controller runtime's
-			// backoff; the release's own waits are bounded by the deletion
-			// timeout.
-			return ctrl.Result{}, releaseErr
-		}
 	}
 
 	if du.Status.Phase == "" || du.Status.Phase == velerov2alpha1api.DataUploadPhaseNew {
@@ -587,47 +496,15 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 		return
 	}
 
-	// Retention is applied only when the data movement finishes. The snapshot
-	// is recorded, and only after the record is verified persisted is the backup
-	// VolumeSnapshotContent switched to Retain, so the snapshot survives the
-	// cleanup below. Any failure here must fail the DataUpload and release the
-	// snapshot instead of leaving it in the storage untracked.
-	retainErr := r.retainSnapshotOnCompletion(ctx, &du, result.Backup.FallbackFull, log)
+	// With base snapshot retention, Completed and the record are written
+	// first, in one update, and the cleanup follows.
+	if shouldRetainSnapshot(&du) {
+		r.completeWithRetention(ctx, &du, result, log)
+		return
+	}
 
 	// cleans up any objects generated during the snapshot expose
-	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
-	if !ok {
-		log.WithError(fmt.Errorf("%v type of snapshot exposer is not exist", du.Spec.SnapshotType)).
-			Warn("Failed to clean up resources on completion")
-	} else {
-		var volumeSnapshotName string
-		if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI { // Other exposer should have another condition
-			volumeSnapshotName = du.Spec.CSISnapshot.VolumeSnapshot
-		}
-		ep.CleanUp(ctx, getOwnerObject(&du), volumeSnapshotName, du.Spec.SourceNamespace)
-	}
-
-	if retainErr != nil {
-		log.WithError(retainErr).Error("Failed to retain the volume snapshot for the next incremental backup, releasing it")
-		r.errorOutAfterUpload(ctx, &du, retainErr, "failed to retain the volume snapshot for the next incremental backup", result.Backup.SnapshotID, log)
-		return
-	}
-
-	// On the retention path the cleanup must also delete the backup
-	// VolumeSnapshotContent explicitly, after the VolumeSnapshot, because a
-	// VolumeSnapshot deletion cascades to its content only when the content's
-	// policy is Delete. The Completed mark is held until the cleanup has
-	// confirmed the intended end state.
-	if err := r.confirmRetainedSnapshotCleanup(ctx, &du, log); err != nil {
-		log.WithError(err).Error("Failed to clean up the retained volume snapshot exposure")
-		r.errorOutAfterUpload(ctx, &du, err, "failed to clean up the retained volume snapshot exposure", result.Backup.SnapshotID, log)
-		return
-	}
-
-	// The fall back to a full read is otherwise silent; the reason is recorded
-	// on the DataUpload, refined with what the node-agent can see of the
-	// previous backup's retention (design, Implementation: diagnostics).
-	fallbackReason := r.fallbackReasonOf(ctx, &du, result.Backup, log)
+	r.cleanUpExposure(ctx, &du, log)
 
 	// Update status to Completed with path & snapshot ID.
 	if err := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(du *velerov2alpha1api.DataUpload) bool {
@@ -635,31 +512,7 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 			return false
 		}
 
-		du.Status.Path = result.Backup.Source.ByPath
-		du.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
-		du.Status.SnapshotID = result.Backup.SnapshotID
-		du.Status.IncrementalBytes = result.Backup.IncrementalBytes
-		du.Status.SourceSize = result.Backup.SourceSize
-		du.Status.FallbackFull = result.Backup.FallbackFull
-		du.Status.FallbackReason = fallbackReason
-
-		du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
-		if result.Backup.EmptySnapshot {
-			du.Status.Message = "volume was empty so no data was upload"
-		}
-		clearDataUploadLeaseAnnotations(du)
-
-		// A retention that was requested but did not hold must not degrade
-		// silently: the completion and the rollback path can race inside the
-		// switch window, and the next incremental backup falls back to a full
-		// read when the base snapshot is gone. Record the reason on the
-		// DataUpload instead.
-		if shouldRetainSnapshot(du) && du.Status.RetainedCSIStorageSnapshot == nil {
-			log.Warn("Base snapshot retention was requested but the snapshot was not retained; the next incremental backup of this volume falls back to a full backup")
-			du.Status.Message = "base snapshot retention was requested but the snapshot was not retained; the next incremental backup of this volume falls back to a full backup"
-		}
-
-		delete(du.Labels, exposer.ExposeOnGoingLabel)
+		r.setDataUploadCompleted(du, result)
 
 		return true
 	}); err != nil {
@@ -667,37 +520,40 @@ func (r *DataUploadReconciler) OnDataUploadCompleted(ctx context.Context, namesp
 	} else {
 		log.Info("Data upload completed")
 		r.metrics.RegisterDataUploadSuccess(r.nodeName)
-
-		// The completed DataUpload holds the newer base of its volume, so the
-		// older retained snapshots of the chain are released now, by the
-		// exposer, synchronously. A failed or canceled DataUpload never gets
-		// here, so its parent stays untouched.
-		r.releaseOlderRetainedSnapshots(ctx, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log)
 	}
 }
 
-// errorOutAfterUpload fails a DataUpload whose data path already finished and
-// uploaded the repository snapshot. The SnapshotID is persisted with the
-// failure, before the Failed phase is written: updateStatusToFailed only
-// copies a SnapshotID out of a datapath.DataPathError, so without this the
-// repository snapshot of these failure paths would be recorded nowhere and
-// the backup deletion could neither delete the repository data nor resolve a
-// retained snapshot handle from its tag.
-func (r *DataUploadReconciler) errorOutAfterUpload(ctx context.Context, du *velerov2alpha1api.DataUpload, err error, msg string, snapshotID string, log logrus.FieldLogger) {
-	if snapshotID != "" {
-		if updateErr := UpdateDataUploadWithRetry(ctx, r.client, types.NamespacedName{Namespace: du.Namespace, Name: du.Name}, log, func(current *velerov2alpha1api.DataUpload) bool {
-			if isDataUploadInFinalState(current) {
-				return false
-			}
-			if current.Status.SnapshotID == "" {
-				current.Status.SnapshotID = snapshotID
-			}
-			return true
-		}); updateErr != nil {
-			log.WithError(updateErr).Error("error persisting the snapshot ID of the failed upload")
-		}
+// cleanUpExposure cleans up the objects generated during the snapshot expose.
+func (r *DataUploadReconciler) cleanUpExposure(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) {
+	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
+	if !ok {
+		log.WithError(fmt.Errorf("%v type of snapshot exposer is not exist", du.Spec.SnapshotType)).
+			Warn("Failed to clean up resources on completion")
+		return
 	}
-	_, _ = r.errorOut(ctx, du, err, msg, log)
+	var volumeSnapshotName string
+	if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI { // Other exposer should have another condition
+		volumeSnapshotName = du.Spec.CSISnapshot.VolumeSnapshot
+	}
+	ep.CleanUp(ctx, getOwnerObject(du), volumeSnapshotName, du.Spec.SourceNamespace)
+}
+
+// setDataUploadCompleted sets the Completed status with path & snapshot ID.
+func (r *DataUploadReconciler) setDataUploadCompleted(du *velerov2alpha1api.DataUpload, result datapath.Result) {
+	du.Status.Path = result.Backup.Source.ByPath
+	du.Status.Phase = velerov2alpha1api.DataUploadPhaseCompleted
+	du.Status.SnapshotID = result.Backup.SnapshotID
+	du.Status.IncrementalBytes = result.Backup.IncrementalBytes
+	du.Status.SourceSize = result.Backup.SourceSize
+	du.Status.FallbackFull = result.Backup.FallbackFull
+	du.Status.FallbackReason = fallbackReasonOf(result.Backup)
+
+	du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
+	if result.Backup.EmptySnapshot {
+		du.Status.Message = "volume was empty so no data was upload"
+	}
+
+	delete(du.Labels, exposer.ExposeOnGoingLabel)
 }
 
 func (r *DataUploadReconciler) OnDataUploadFailed(ctx context.Context, namespace, duName string, err error) {
@@ -740,7 +596,6 @@ func (r *DataUploadReconciler) OnDataUploadCancelled(ctx context.Context, namesp
 			du.Status.StartTimestamp = &metav1.Time{Time: r.Clock.Now()}
 		}
 		du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
-		clearDataUploadLeaseAnnotations(du)
 
 		delete(du.Labels, exposer.ExposeOnGoingLabel)
 
@@ -761,7 +616,6 @@ func (r *DataUploadReconciler) tryCancelDataUpload(ctx context.Context, du *vele
 			dataUpload.Status.StartTimestamp = &metav1.Time{Time: r.Clock.Now()}
 		}
 		dataUpload.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
-		clearDataUploadLeaseAnnotations(dataUpload)
 
 		if message != "" {
 			dataUpload.Status.Message = message
@@ -789,12 +643,6 @@ func (r *DataUploadReconciler) tryCancelDataUpload(ctx context.Context, du *vele
 }
 
 func (r *DataUploadReconciler) cleanUp(ctx context.Context, du *velerov2alpha1api.DataUpload, log logrus.FieldLogger) {
-	// A canceled DataUpload never retains; the patch-back reclaims its snapshot
-	// before the exposer cleanup.
-	if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
-		log.WithError(releaseErr).Error("Failed to release the volume snapshot of the canceled DataUpload, its record is kept and the backup deletion owns it")
-	}
-
 	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
 	if !ok {
 		log.WithError(fmt.Errorf("%v type of snapshot exposer is not exist", du.Spec.SnapshotType)).
@@ -838,10 +686,6 @@ func (r *DataUploadReconciler) OnDataUploadProgress(ctx context.Context, namespa
 // re-enqueue the previous related request once the related pod is in running status to keep going on the rest logic. and below logic will avoid handling the unwanted
 // pod status and also avoid block others CR handling
 func (r *DataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.apiReader == nil {
-		r.apiReader = mgr.GetAPIReader()
-	}
-
 	gp := kube.NewGenericEventPredicate(func(object client.Object) bool {
 		du := object.(*velerov2alpha1api.DataUpload)
 		if du.Status.Phase == velerov2alpha1api.DataUploadPhaseAccepted {
@@ -967,16 +811,6 @@ func (r *DataUploadReconciler) prepareDataUpload(du *velerov2alpha1api.DataUploa
 }
 
 func (r *DataUploadReconciler) errorOut(ctx context.Context, du *velerov2alpha1api.DataUpload, err error, msg string, log logrus.FieldLogger) (ctrl.Result, error) {
-	// A DataUpload that did not complete never retains: its snapshot is
-	// reclaimed by the patch-back before the exposer cleanup, also when the
-	// retention attempt itself failed above. Logging and moving on is not
-	// acceptable: the real risk is the window where the content is already
-	// switched to Retain and the DataUpload dies before the record is
-	// serialized into the backup tarball.
-	if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
-		log.WithError(releaseErr).Error("Failed to release the volume snapshot of the unfinished DataUpload, its record is kept and the backup deletion owns it")
-	}
-
 	if se, ok := r.snapshotExposerList[du.Spec.SnapshotType]; ok {
 		var volumeSnapshotName string
 		if du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI { // Other exposer should have another condition
@@ -1008,7 +842,6 @@ func (r *DataUploadReconciler) updateStatusToFailed(ctx context.Context, du *vel
 			du.Status.SnapshotID = dataPathError.GetSnapshotID()
 		}
 		du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
-		clearDataUploadLeaseAnnotations(du)
 
 		delete(du.Labels, exposer.ExposeOnGoingLabel)
 
@@ -1064,7 +897,6 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 	succeeded, err := funcExclusiveUpdateDataUpload(ctx, r.client, du, func(du *velerov2alpha1api.DataUpload) {
 		du.Status.Phase = velerov2alpha1api.DataUploadPhaseFailed
 		du.Status.Message = "timeout on preparing data upload"
-		clearDataUploadLeaseAnnotations(du)
 
 		delete(du.Labels, exposer.ExposeOnGoingLabel)
 	})
@@ -1077,13 +909,6 @@ func (r *DataUploadReconciler) onPrepareTimeout(ctx context.Context, du *velerov
 	if !succeeded {
 		log.Warn("Dataupload has been updated by others")
 		return
-	}
-
-	// A DataUpload that timed out preparing never retains: the patch-back
-	// reclaims its snapshot before the exposer cleanup, as on the other
-	// unfinished paths.
-	if releaseErr := r.releaseRetainedSnapshot(ctx, du, log); releaseErr != nil {
-		log.WithError(releaseErr).Error("Failed to release the volume snapshot of the timed-out DataUpload, its record is kept and the backup deletion owns it")
 	}
 
 	ep, ok := r.snapshotExposerList[du.Spec.SnapshotType]
