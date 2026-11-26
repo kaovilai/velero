@@ -273,30 +273,19 @@ spec:
                 description: |-
                   RetainedCSIStorageSnapshot records the volume snapshot that Velero keeps in the
                   storage after the DataUpload completes, so that the next incremental backup of the
-                  volume can compute its changed blocks against it. It is set only when the DataUpload
-                  opted into base snapshot retention and the record was verified to be persisted.
-                  Backup deletion uses it to delete the snapshot from the storage when the backup is
-                  deleted. The name deliberately differs from the RetainedSnapshot field of VolumeInfo,
+                  volume can compute its changed blocks against it. It is written with the Completed
+                  phase, in one update, when the DataUpload opted into base snapshot retention. Backup
+                  deletion uses it to delete the snapshot from the storage when the backup is deleted;
+                  a snapshot that was not retained, or that a later backup already released, is gone,
+                  and deleting it again succeeds. The name deliberately differs from the RetainedSnapshot field of VolumeInfo,
                   which holds the VolumeSnapshot name of a data mover backup and would otherwise
                   surface side by side with this record under the same name but a different meaning.
                 nullable: true
                 properties:
-                  baseCSISnapshotHandle:
-                    description: |-
-                      BaseCSISnapshotHandle is the handle of the retained snapshot this DataUpload's
-                      changed blocks were computed against; empty when the DataUpload read the volume
-                      in full.
-                    type: string
                   csiSnapshotHandle:
                     description: |-
                       CSISnapshotHandle is the CSI snapshot handle of the retained snapshot, as the
                       CSI driver reports it.
-                    type: string
-                  csiVolumeHandle:
-                    description: |-
-                      CSIVolumeHandle is the CSI volume handle of the source volume the snapshot was
-                      taken of. With the driver it keys the volume's chain: one retained snapshot per
-                      chain is kept as the rolling base, and a newer one releases the older ones.
                     type: string
                   deletionSecretRef:
                     description: |-
@@ -324,16 +313,6 @@ spec:
                       label of the backup VolumeSnapshotContent the snapshot came from. A distributed CSI
                       snapshotter only handles the VolumeSnapshotContents carrying the label of its node,
                       so the temporary content rebuilt to delete the snapshot must carry it too.
-                    type: string
-                  released:
-                    description: |-
-                      Released reports that the snapshot was deleted from the storage because a newer
-                      DataUpload of the same chain completed and became the rolling base. A released
-                      record no longer owns a snapshot: backup deletion skips it.
-                    type: boolean
-                  releasedBy:
-                    description: ReleasedBy is the UID of the backup whose DataUpload
-                      released the snapshot.
                     type: string
                 required:
                 - csiSnapshotHandle

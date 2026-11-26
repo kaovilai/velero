@@ -720,15 +720,6 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 			if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
 				d.Printf("\t\t\t\tRetained Snapshot Handle: %s\n", info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle)
 			}
-			if info.SnapshotDataMovementInfo.RetainedCSIVolumeHandle != "" {
-				d.Printf("\t\t\t\tRetained Snapshot Volume Handle: %s\n", info.SnapshotDataMovementInfo.RetainedCSIVolumeHandle)
-			}
-			if info.SnapshotDataMovementInfo.BaseCSISnapshotHandle != "" {
-				d.Printf("\t\t\t\tBase Snapshot Handle: %s\n", info.SnapshotDataMovementInfo.BaseCSISnapshotHandle)
-			}
-			if info.SnapshotDataMovementInfo.RetainedSnapshotReleased {
-				d.Printf("\t\t\t\tRetained Snapshot Released: true, by backup %s\n", info.SnapshotDataMovementInfo.RetainedSnapshotReleasedBy)
-			}
 		}
 
 		d.Printf("\t\t\t\tUploader Type: %s\n", info.SnapshotDataMovementInfo.UploaderType)

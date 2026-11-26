@@ -214,21 +214,6 @@ type BackupSnapshotDataMovementInfo struct {
 	// RetainedCSISnapshotHandle is the handle of the storage snapshot Velero retained as
 	// the base of the next incremental backup; empty when none was retained.
 	RetainedCSISnapshotHandle string `json:"retainedCSISnapshotHandle,omitempty"`
-
-	// RetainedCSIVolumeHandle is the CSI volume handle that keys the retained
-	// snapshot's chain with the driver.
-	RetainedCSIVolumeHandle string `json:"csiVolumeHandle,omitempty"`
-
-	// BaseCSISnapshotHandle is the retained snapshot this backup's changed blocks were
-	// computed against; empty on a full read.
-	BaseCSISnapshotHandle string `json:"baseCSISnapshotHandle,omitempty"`
-
-	// RetainedSnapshotReleased and RetainedSnapshotReleasedBy report the rolling-base
-	// release of the retained snapshot. They are not part of the backup metadata:
-	// `velero backup describe` fills them from the local DataUpload, which a later
-	// backup of the same chain updates after this backup's metadata was written.
-	RetainedSnapshotReleased   bool   `json:"released,omitempty"`
-	RetainedSnapshotReleasedBy string `json:"releasedBy,omitempty"`
 }
 
 // RestoreSnapshotDataMovementInfo is used for displaying the restore snapshot data mover status.
@@ -843,8 +828,6 @@ func (v *BackupVolumesInformation) generateVolumeInfoFromDataUpload() {
 			volumeInfo.SnapshotDataMovementInfo.RetainSnapshotPolicy = dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey]
 			if record := dataUpload.Status.RetainedCSIStorageSnapshot; record != nil {
 				volumeInfo.SnapshotDataMovementInfo.RetainedCSISnapshotHandle = record.CSISnapshotHandle
-				volumeInfo.SnapshotDataMovementInfo.RetainedCSIVolumeHandle = record.CSIVolumeHandle
-				volumeInfo.SnapshotDataMovementInfo.BaseCSISnapshotHandle = record.BaseCSISnapshotHandle
 			}
 
 			tmpVolumeInfos = append(tmpVolumeInfos, volumeInfo)

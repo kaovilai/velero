@@ -441,16 +441,6 @@ func describeDataMovementInSF(details bool, info *volume.BackupVolumeInfo, snaps
 			if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
 				dataMovement["retainedSnapshotHandle"] = info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle
 			}
-			if info.SnapshotDataMovementInfo.RetainedCSIVolumeHandle != "" {
-				dataMovement["retainedSnapshotVolumeHandle"] = info.SnapshotDataMovementInfo.RetainedCSIVolumeHandle
-			}
-			if info.SnapshotDataMovementInfo.BaseCSISnapshotHandle != "" {
-				dataMovement["baseSnapshotHandle"] = info.SnapshotDataMovementInfo.BaseCSISnapshotHandle
-			}
-			if info.SnapshotDataMovementInfo.RetainedSnapshotReleased {
-				dataMovement["retainedSnapshotReleased"] = true
-				dataMovement["retainedSnapshotReleasedBy"] = info.SnapshotDataMovementInfo.RetainedSnapshotReleasedBy
-			}
 		}
 
 		dataMover := "velero"
