@@ -221,9 +221,10 @@ type RetainedSnapshotDeletionOptions struct {
 // deletionPolicy is Delete and status.snapshotHandle is set, and the sidecar's
 // own status update runs ListSnapshots first, which fails for an already-gone
 // snapshot. So the handle is seeded from the record through the status
-// subresource, the seed is confirmed by a read showing a handle -- a conflict
-// means the sidecar wrote status concurrently, and any handle satisfies it --
-// and only then is the content deleted, with no readyToUse wait. The deletion
+// subresource, the seed is confirmed from the object the write returned -- a
+// conflict means the sidecar wrote status concurrently, and any handle
+// satisfies it -- and only then is the content deleted, with no readyToUse
+// wait. The deletion
 // is polled every two seconds until the content is gone or the bound expires.
 //
 // A create that finds the content already there is an earlier attempt: a
@@ -282,24 +283,28 @@ func DeleteRetainedSnapshot(
 		log.Infof("Created static VolumeSnapshotContent %s with DeletionPolicy=Delete for snapshot %s", tempVSC.Name, record.CSISnapshotHandle)
 	}
 
-	// Seed status.snapshotHandle; a conflict means the sidecar wrote the status
-	// concurrently, and any handle in the fresh status satisfies it.
-	statusVSC := current.DeepCopy()
-	if statusVSC.Status == nil {
-		statusVSC.Status = &snapshotv1api.VolumeSnapshotContentStatus{}
-	}
-	if statusVSC.Status.SnapshotHandle == nil || *statusVSC.Status.SnapshotHandle == "" {
-		statusVSC.Status.SnapshotHandle = &record.CSISnapshotHandle
-		if err := crClient.Status().Update(ctx, statusVSC); err != nil && !apierrors.IsConflict(err) {
-			return errors.Wrapf(err, "error writing the status of static VolumeSnapshotContent %s", tempVSC.Name)
-		}
-	}
-	// The seed is confirmed by a read showing a handle, not merely ordered:
+	// Seed status.snapshotHandle. The seed is confirmed before the delete --
 	// deleting the content before the sidecar sees status.snapshotHandle would
-	// remove it with no DeleteSnapshot call.
-	confirmed := &snapshotv1api.VolumeSnapshotContent{}
-	if err := reader.Get(ctx, key, confirmed); err != nil {
-		return errors.Wrapf(err, "error reading back the status of static VolumeSnapshotContent %s", tempVSC.Name)
+	// remove it with no DeleteSnapshot call -- from the object the status write
+	// returned, not from a read, which a cached reader can answer with the
+	// object as it was before the write. A conflict means the sidecar wrote the
+	// status concurrently; then the content is read, and any handle in it
+	// satisfies the seed.
+	confirmed := current.DeepCopy()
+	if confirmed.Status == nil {
+		confirmed.Status = &snapshotv1api.VolumeSnapshotContentStatus{}
+	}
+	if confirmed.Status.SnapshotHandle == nil || *confirmed.Status.SnapshotHandle == "" {
+		confirmed.Status.SnapshotHandle = &record.CSISnapshotHandle
+		if err := crClient.Status().Update(ctx, confirmed); err != nil {
+			if !apierrors.IsConflict(err) {
+				return errors.Wrapf(err, "error writing the status of static VolumeSnapshotContent %s", tempVSC.Name)
+			}
+			confirmed = &snapshotv1api.VolumeSnapshotContent{}
+			if err := reader.Get(ctx, key, confirmed); err != nil {
+				return errors.Wrapf(err, "error reading static VolumeSnapshotContent %s after a status conflict", tempVSC.Name)
+			}
+		}
 	}
 	if confirmed.Status == nil || confirmed.Status.SnapshotHandle == nil || *confirmed.Status.SnapshotHandle == "" {
 		return errors.Errorf("the status of static VolumeSnapshotContent %s does not carry the snapshot handle", tempVSC.Name)

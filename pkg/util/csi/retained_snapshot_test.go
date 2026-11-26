@@ -441,3 +441,33 @@ func TestDeleteRetainedSnapshotInvalidRecord(t *testing.T) {
 	require.NoError(t, c.List(t.Context(), list))
 	assert.Empty(t, list.Items)
 }
+
+// staleReader answers every read of a VolumeSnapshotContent with the object as
+// a cache that has not seen the status write yet would: no status.
+type staleReader struct {
+	crclient.Reader
+}
+
+func (s staleReader) Get(ctx context.Context, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
+	err := s.Reader.Get(ctx, key, obj, opts...)
+	if vsc, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok && err == nil {
+		vsc.Status = nil
+	}
+	return err
+}
+
+// TestDeleteRetainedSnapshotConfirmsSeedFromTheWrite proves the seed is
+// confirmed from the object the status write returned, not from a read: a
+// cached reader that has not seen the write yet does not fail the deletion,
+// and the content is still deleted only with its handle seeded.
+func TestDeleteRetainedSnapshotConfirmsSeedFromTheWrite(t *testing.T) {
+	timeout := shortenRetainedSnapshotWaits(t)
+	record := retainedTestRecord()
+	backend := &fakeSnapshotterBackend{snapshots: map[string]bool{retainedTestHandle: true}}
+	c := backend.client(t)
+
+	require.NoError(t, DeleteRetainedSnapshot(t.Context(), c, staleReader{Reader: c}, record, retainedTestBackupUID, RetainedSnapshotDeletionOptions{Timeout: timeout}, velerotest.NewLogger()))
+	assert.Equal(t, []string{retainedTestHandle}, backend.deleteCallsTo)
+	assert.Zero(t, backend.silentDrops, "the content is never deleted without a seeded handle")
+	assert.False(t, backend.snapshots[retainedTestHandle])
+}
