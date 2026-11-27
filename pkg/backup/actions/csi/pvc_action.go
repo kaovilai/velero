@@ -407,13 +407,23 @@ func (p *pvcBackupItemAction) Execute(
 
 		// Base snapshot retention is decided here, once, server-side: the policy
 		// ConfigMap is not guaranteed to be readable from the node-agent, so the
-		// decision travels on the DataUpload instead. Retention applies to the
-		// block data mover only; for any other data mover the parameter is
-		// ignored with a warning.
-		requireBaseSnapshotForDelta := vh.GetRequireBaseSnapshotForDeltaFromActionParameters(item, kuberesource.PersistentVolumeClaims)
+		// decision travels on the DataUpload instead. An explicit
+		// requireBaseSnapshotForDelta of the volume policy wins; otherwise the
+		// CSI driver's SnapshotMetadataService decides. Retention applies to
+		// the block data mover only; for any other data mover the parameter is
+		// ignored with a warning, and no driver is asked.
+		policyRequiresBaseSnapshot := vh.GetRequireBaseSnapshotForDeltaFromActionParameters(item, kuberesource.PersistentVolumeClaims)
 		effectiveDataMover := backup.Spec.DataMover
 		if dataMoverFromVolumePolicy != "" {
 			effectiveDataMover = dataMoverFromVolumePolicy
+		}
+		var driverRequiresBaseSnapshot *bool
+		if policyRequiresBaseSnapshot == nil && effectiveDataMover == datamover.DataMoverTypeVeleroBlock && vsc != nil {
+			driverRequiresBaseSnapshot = driverRequiresBaseSnapshotForDelta(context.Background(), p.crClient, vsc.Spec.Driver, dataUploadLog)
+		}
+		requireBaseSnapshotForDelta, decidedBy := decideBaseSnapshotRetention(policyRequiresBaseSnapshot, driverRequiresBaseSnapshot)
+		if effectiveDataMover == datamover.DataMoverTypeVeleroBlock {
+			dataUploadLog.Infof("Base snapshot retention: %t, decided by %s", requireBaseSnapshotForDelta, decidedBy)
 		}
 		if requireBaseSnapshotForDelta && effectiveDataMover != datamover.DataMoverTypeVeleroBlock {
 			dataUploadLog.Warnf(
@@ -425,12 +435,12 @@ func (p *pvcBackupItemAction) Execute(
 		// and is released only with the VolumeGroupSnapshotContent: the
 		// sidecar never issues DeleteSnapshot for a member content, so the
 		// retained-snapshot deletion could not delete it on its own. The
-		// policy is ignored, with a warning, and the member keeps the
+		// retention is ignored, with a warning, and the member keeps the
 		// VolumeGroupSnapshot lifecycle it has today (design, Non Goals).
 		if requireBaseSnapshotForDelta && isVolumeGroupSnapshotMember(vs, vsc) {
 			dataUploadLog.Warnf(
-				"The %q parameter of the volume policy is ignored for VolumeSnapshot %s/%s, which is a member of VolumeGroupSnapshot %s; a group member's snapshot is released with the group and cannot be retained on its own",
-				"requireBaseSnapshotForDelta", vs.Namespace, vs.Name, ptr.Deref(vs.Status.VolumeGroupSnapshotName, ""))
+				"Base snapshot retention is ignored for VolumeSnapshot %s/%s, which is a member of VolumeGroupSnapshot %s; a group member's snapshot is released with the group and cannot be retained on its own",
+				vs.Namespace, vs.Name, ptr.Deref(vs.Status.VolumeGroupSnapshotName, ""))
 			requireBaseSnapshotForDelta = false
 		}
 

@@ -268,6 +268,10 @@ func getLastSuccessBySchedule(backups []velerov1api.Backup) map[string]time.Time
 	return lastSuccessBySchedule
 }
 
+// The DataUpload of a velero-block backup asks the CSI driver's
+// SnapshotMetadataService whether it needs the base snapshot retained.
+// +kubebuilder:rbac:groups=cbt.storage.k8s.io,resources=snapshotmetadataservices,verbs=get
+
 func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := b.logger.WithFields(logrus.Fields{
 		"controller":    constant.ControllerBackup,

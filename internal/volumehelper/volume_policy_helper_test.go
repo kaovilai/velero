@@ -2271,7 +2271,7 @@ func TestGetRequireBaseSnapshotForDeltaFromActionParameters(t *testing.T) {
 		inputObj         runtime.Object
 		groupResource    schema.GroupResource
 		resourcePolicies *resourcepolicies.ResourcePolicies
-		expected         bool
+		expected         *bool
 	}{
 		{
 			name:          "VolumePolicy match with requireBaseSnapshotForDelta true, returns true",
@@ -2294,10 +2294,33 @@ func TestGetRequireBaseSnapshotForDeltaFromActionParameters(t *testing.T) {
 					},
 				},
 			},
-			expected: true,
+			expected: ptr.To(true),
 		},
 		{
-			name:          "VolumePolicy match without requireBaseSnapshotForDelta, returns false",
+			name:          "VolumePolicy match with requireBaseSnapshotForDelta false, returns false",
+			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp2-csi").ClaimRef("ns", "pvc-1").Result(),
+			groupResource: kuberesource.PersistentVolumes,
+			resourcePolicies: &resourcepolicies.ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []resourcepolicies.VolumePolicy{
+					{
+						Conditions: map[string]any{
+							"storageClass": []string{"gp2-csi"},
+						},
+						Action: resourcepolicies.Action{
+							Type: resourcepolicies.Snapshot,
+							Parameters: map[string]any{
+								resourcepolicies.DataMoverParameter:                   "velero-block",
+								resourcepolicies.RequireBaseSnapshotForDeltaParameter: false,
+							},
+						},
+					},
+				},
+			},
+			expected: ptr.To(false),
+		},
+		{
+			name:          "VolumePolicy match without requireBaseSnapshotForDelta, returns unset",
 			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp2-csi").ClaimRef("ns", "pvc-1").Result(),
 			groupResource: kuberesource.PersistentVolumes,
 			resourcePolicies: &resourcepolicies.ResourcePolicies{
@@ -2316,10 +2339,10 @@ func TestGetRequireBaseSnapshotForDeltaFromActionParameters(t *testing.T) {
 					},
 				},
 			},
-			expected: false,
+			expected: nil,
 		},
 		{
-			name:          "VolumePolicy not match, returns false",
+			name:          "VolumePolicy not match, returns unset",
 			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp3-csi").ClaimRef("ns", "pvc-1").Result(),
 			groupResource: kuberesource.PersistentVolumes,
 			resourcePolicies: &resourcepolicies.ResourcePolicies{
@@ -2338,7 +2361,7 @@ func TestGetRequireBaseSnapshotForDeltaFromActionParameters(t *testing.T) {
 					},
 				},
 			},
-			expected: false,
+			expected: nil,
 		},
 	}
 

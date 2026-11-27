@@ -23,6 +23,12 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - cbt.storage.k8s.io
+  resources:
+  - snapshotmetadataservices
+  verbs:
+  - get
+- apiGroups:
   - velero.io
   resources:
   - backuprepositories

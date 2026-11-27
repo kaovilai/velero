@@ -535,12 +535,13 @@ func (v *volumeHelperImpl) GetDataMoverFromActionParameters(obj runtime.Unstruct
 	return ""
 }
 
-// GetRequireBaseSnapshotForDeltaFromActionParameters returns whether the matched volume policy
-// action opts the volume into base snapshot retention for the block data mover.
-// It returns false when no volume policy matches or the parameter is absent;
-// the parameter value itself is validated at policy load time, so a value that
-// fails to read here is logged and read as false.
-func (v *volumeHelperImpl) GetRequireBaseSnapshotForDeltaFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) bool {
+// GetRequireBaseSnapshotForDeltaFromActionParameters returns the
+// requireBaseSnapshotForDelta parameter of the matched volume policy action,
+// nil when no volume policy matches or the action does not set it, so the
+// caller can fall back to the CSI driver's guidance. The parameter value
+// itself is validated at policy load time, so a value that fails to read here
+// is logged and read as unset.
+func (v *volumeHelperImpl) GetRequireBaseSnapshotForDeltaFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) *bool {
 	name := groupResource.String()
 	if metadata, metaErr := meta.Accessor(obj); metaErr == nil {
 		name += ": " + metadata.GetNamespace() + "/" + metadata.GetName()
@@ -548,14 +549,15 @@ func (v *volumeHelperImpl) GetRequireBaseSnapshotForDeltaFromActionParameters(ob
 
 	action, _, err := v.getPVAndMatchAction(obj, groupResource)
 	if err != nil || action == nil {
-		v.logger.Infof("no matching volume policy for %s, base snapshot retention is off", name)
-		return false
+		return nil
+	}
+	if _, set := action.Parameters[resourcepolicies.RequireBaseSnapshotForDeltaParameter]; !set {
+		return nil
 	}
 	requireBaseSnapshotForDelta, err := action.GetRequireBaseSnapshotForDelta()
 	if err != nil {
-		v.logger.WithError(err).Warnf("fail to get the requireBaseSnapshotForDelta parameter for %s, reading it as false", name)
-		return false
+		v.logger.WithError(err).Warnf("fail to get the requireBaseSnapshotForDelta parameter for %s, reading it as unset", name)
+		return nil
 	}
-	v.logger.Infof("base snapshot retention for %s: %t", name, requireBaseSnapshotForDelta)
-	return requireBaseSnapshotForDelta
+	return &requireBaseSnapshotForDelta
 }

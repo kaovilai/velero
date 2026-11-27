@@ -36,8 +36,8 @@ type VolumeHelper interface {
 	GetActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, string, map[string]any, error)
 	GetSnapshotClass(obj runtime.Unstructured, groupResource schema.GroupResource) (string, error)
 	GetDataMoverFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) string
-	// GetRequireBaseSnapshotForDeltaFromActionParameters returns whether the matched volume policy
-	// action opts the volume into base snapshot retention for the block data mover;
-	// false when no volume policy matches or the parameter is absent.
-	GetRequireBaseSnapshotForDeltaFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) bool
+	// GetRequireBaseSnapshotForDeltaFromActionParameters returns the
+	// requireBaseSnapshotForDelta parameter of the matched volume policy action, nil
+	// when no volume policy matches or the action does not set it.
+	GetRequireBaseSnapshotForDeltaFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) *bool
 }
