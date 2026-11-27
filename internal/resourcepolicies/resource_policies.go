@@ -59,26 +59,26 @@ const (
 	// VolumeSnapshotClass to use for CSI snapshots when the action type is snapshot.
 	SnapshotClassParameter = "snapshotClass"
 
-	// RetainSnapshotParameter is the key of the snapshot action parameter that opts
+	// RequireBaseSnapshotForDeltaParameter is the key of the snapshot action parameter that opts
 	// the matched volumes into base snapshot retention for the block data mover:
 	// Velero keeps the volume snapshot in the storage after the backup completes and
 	// deletes it when the backup is deleted. It is only read for volumes backed up
 	// by the block data mover; it is ignored, with a warning, for any other data
 	// mover. It defaults to false, which is the behavior of a snapshot that is
 	// deleted when the backup completes.
-	RetainSnapshotParameter = "retainSnapshot"
+	RequireBaseSnapshotForDeltaParameter = "requireBaseSnapshotForDelta"
 )
 
 // validSnapshotActionParameters is the closed list of parameter names accepted for
-// the snapshot action. A typo such as "retainSnapshots" would otherwise read as
+// the snapshot action. A typo such as "requireBaseSnapshotForDeltas" would otherwise read as
 // false and silently turn every incremental back into a full backup, a data-volume
 // change no log line at backup time makes visible, so unknown parameter names fail
 // validation instead. The custom action keeps accepting arbitrary parameters,
 // because it passes them to plugins.
 var validSnapshotActionParameters = map[string]struct{}{
-	DataMoverParameter:      {},
-	SnapshotClassParameter:  {},
-	RetainSnapshotParameter: {},
+	DataMoverParameter:                   {},
+	SnapshotClassParameter:               {},
+	RequireBaseSnapshotForDeltaParameter: {},
 }
 
 // validDataMovers is the set of data mover values accepted in the snapshot
@@ -158,21 +158,21 @@ func (a *Action) GetSnapshotClass() (string, error) {
 	return snapshotClass, nil
 }
 
-// GetRetainSnapshot returns whether the snapshot action's retainSnapshot parameter
+// GetRequireBaseSnapshotForDelta returns whether the snapshot action's requireBaseSnapshotForDelta parameter
 // opts the matched volumes into base snapshot retention. The parameter is only
 // meaningful for the snapshot action, so it returns an error when the action is nil
 // or its type is not snapshot. The value is validated strictly: a YAML boolean or
 // exactly "true"/"false"; anything else fails with the received and the allowed
 // values, so a typo cannot silently read as false. When the parameter is absent it
 // returns false, today's behavior.
-func (a *Action) GetRetainSnapshot() (bool, error) {
+func (a *Action) GetRequireBaseSnapshotForDelta() (bool, error) {
 	if a == nil || a.Type != Snapshot {
-		return false, fmt.Errorf("the %q parameter is only supported for the %q action", RetainSnapshotParameter, Snapshot)
+		return false, fmt.Errorf("the %q parameter is only supported for the %q action", RequireBaseSnapshotForDeltaParameter, Snapshot)
 	}
 	if len(a.Parameters) == 0 {
 		return false, nil
 	}
-	raw, ok := a.Parameters[RetainSnapshotParameter]
+	raw, ok := a.Parameters[RequireBaseSnapshotForDeltaParameter]
 	if !ok {
 		return false, nil
 	}
@@ -189,7 +189,7 @@ func (a *Action) GetRetainSnapshot() (bool, error) {
 		}
 	}
 	return false, fmt.Errorf("invalid %q value %v, it must be a boolean or exactly %q or %q",
-		RetainSnapshotParameter, raw, "true", "false")
+		RequireBaseSnapshotForDeltaParameter, raw, "true", "false")
 }
 
 // PolicyLabelSelector mirrors metav1.LabelSelector with yaml tags for ConfigMap decode.

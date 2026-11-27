@@ -845,7 +845,7 @@ func TestValidateForRestore(t *testing.T) {
 
 // TestActionValidateSnapshotParameterClosedList checks that the snapshot action
 // validates its parameter names against a closed list: a typo such as
-// "retainSnapshots" must fail validation instead of silently reading as false,
+// "requireBaseSnapshotForDeltas" must fail validation instead of silently reading as false,
 // while the custom action keeps accepting arbitrary parameters.
 func TestActionValidateSnapshotParameterClosedList(t *testing.T) {
 	testCases := []struct {
@@ -856,15 +856,15 @@ func TestActionValidateSnapshotParameterClosedList(t *testing.T) {
 		{
 			name: "snapshot action with all known parameters",
 			action: &Action{Type: Snapshot, Parameters: map[string]any{
-				"dataMover":      "velero-block",
-				"snapshotClass":  "rbd-class",
-				"retainSnapshot": true,
+				"dataMover":                   "velero-block",
+				"snapshotClass":               "rbd-class",
+				"requireBaseSnapshotForDelta": true,
 			}},
 		},
 		{
-			name:    "snapshot action with a typoed retainSnapshot parameter fails",
-			action:  &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshots": true}},
-			wantErr: `unknown parameter "retainSnapshots" for the "snapshot" action`,
+			name:    "snapshot action with a typoed requireBaseSnapshotForDelta parameter fails",
+			action:  &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDeltas": true}},
+			wantErr: `unknown parameter "requireBaseSnapshotForDeltas" for the "snapshot" action`,
 		},
 		{
 			name:    "snapshot action with an unknown parameter fails",
@@ -873,7 +873,7 @@ func TestActionValidateSnapshotParameterClosedList(t *testing.T) {
 		},
 		{
 			name:   "custom action keeps accepting arbitrary parameters",
-			action: &Action{Type: Custom, Parameters: map[string]any{"anything": "goes", "retainSnapshots": true}},
+			action: &Action{Type: Custom, Parameters: map[string]any{"anything": "goes", "requireBaseSnapshotForDeltas": true}},
 		},
 		{
 			name:   "skip action keeps accepting arbitrary parameters",
@@ -897,9 +897,9 @@ func TestActionValidateSnapshotParameterClosedList(t *testing.T) {
 	}
 }
 
-// TestActionValidateRetainSnapshot checks the strict validation of the
-// retainSnapshot parameter's value: a YAML boolean or exactly "true"/"false".
-func TestActionValidateRetainSnapshot(t *testing.T) {
+// TestActionValidateRequireBaseSnapshotForDelta checks the strict validation of the
+// requireBaseSnapshotForDelta parameter's value: a YAML boolean or exactly "true"/"false".
+func TestActionValidateRequireBaseSnapshotForDelta(t *testing.T) {
 	testCases := []struct {
 		name    string
 		action  *Action
@@ -907,38 +907,38 @@ func TestActionValidateRetainSnapshot(t *testing.T) {
 	}{
 		{
 			name:   "boolean true",
-			action: &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": true}},
+			action: &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": true}},
 		},
 		{
 			name:   "boolean false",
-			action: &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": false}},
+			action: &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": false}},
 		},
 		{
 			name:   "string true",
-			action: &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "true"}},
+			action: &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "true"}},
 		},
 		{
 			name:   "string false",
-			action: &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "false"}},
+			action: &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "false"}},
 		},
 		{
 			name:    "typoed value fails with the received and the allowed values",
-			action:  &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "treu"}},
-			wantErr: `invalid "retainSnapshot" value treu`,
+			action:  &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "treu"}},
+			wantErr: `invalid "requireBaseSnapshotForDelta" value treu`,
 		},
 		{
 			name:    "yes is not accepted",
-			action:  &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "yes"}},
-			wantErr: `invalid "retainSnapshot" value yes`,
+			action:  &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "yes"}},
+			wantErr: `invalid "requireBaseSnapshotForDelta" value yes`,
 		},
 		{
 			name:    "integer is not accepted",
-			action:  &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": 1}},
-			wantErr: `invalid "retainSnapshot" value 1`,
+			action:  &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": 1}},
+			wantErr: `invalid "requireBaseSnapshotForDelta" value 1`,
 		},
 		{
-			name:    "retainSnapshot on a non-snapshot action fails",
-			action:  &Action{Type: FSBackup, Parameters: map[string]any{"retainSnapshot": true}},
+			name:    "requireBaseSnapshotForDelta on a non-snapshot action fails",
+			action:  &Action{Type: FSBackup, Parameters: map[string]any{"requireBaseSnapshotForDelta": true}},
 			wantErr: `is only supported for the "snapshot" action`,
 		},
 	}
@@ -952,16 +952,16 @@ func TestActionValidateRetainSnapshot(t *testing.T) {
 			}
 			require.NoError(t, err)
 			// The accessor agrees with the validator on the valid values.
-			_, err = tc.action.GetRetainSnapshot()
+			_, err = tc.action.GetRequireBaseSnapshotForDelta()
 			require.NoError(t, err)
 		})
 	}
 }
 
-// TestActionGetRetainSnapshot checks the accessor for the retainSnapshot
+// TestActionGetRequireBaseSnapshotForDelta checks the accessor for the requireBaseSnapshotForDelta
 // parameter, which the backup action uses to carry the retention decision on
 // the DataUpload.
-func TestActionGetRetainSnapshot(t *testing.T) {
+func TestActionGetRequireBaseSnapshotForDelta(t *testing.T) {
 	testCases := []struct {
 		name      string
 		action    *Action
@@ -979,51 +979,51 @@ func TestActionGetRetainSnapshot(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "snapshot action without retainSnapshot returns false",
+			name:     "snapshot action without requireBaseSnapshotForDelta returns false",
 			action:   &Action{Type: Snapshot, Parameters: map[string]any{"dataMover": "velero-block"}},
 			expected: false,
 		},
 		{
 			name:     "boolean true",
-			action:   &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": true}},
+			action:   &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": true}},
 			expected: true,
 		},
 		{
 			name:     "boolean false",
-			action:   &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": false}},
+			action:   &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": false}},
 			expected: false,
 		},
 		{
 			name:     "string true",
-			action:   &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "true"}},
+			action:   &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "true"}},
 			expected: true,
 		},
 		{
 			name:     "string false",
-			action:   &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "false"}},
+			action:   &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "false"}},
 			expected: false,
 		},
 		{
 			name:      "non-snapshot action returns error",
-			action:    &Action{Type: FSBackup, Parameters: map[string]any{"retainSnapshot": true}},
+			action:    &Action{Type: FSBackup, Parameters: map[string]any{"requireBaseSnapshotForDelta": true}},
 			expectErr: true,
 		},
 		{
 			name:      "invalid value returns error",
-			action:    &Action{Type: Snapshot, Parameters: map[string]any{"retainSnapshot": "maybe"}},
+			action:    &Action{Type: Snapshot, Parameters: map[string]any{"requireBaseSnapshotForDelta": "maybe"}},
 			expectErr: true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			retainSnapshot, err := tc.action.GetRetainSnapshot()
+			requireBaseSnapshotForDelta, err := tc.action.GetRequireBaseSnapshotForDelta()
 			if tc.expectErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tc.expected, retainSnapshot)
+			assert.Equal(t, tc.expected, requireBaseSnapshotForDelta)
 		})
 	}
 }

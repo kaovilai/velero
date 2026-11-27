@@ -23,14 +23,14 @@ import (
 	"github.com/velero-io/velero/pkg/apis/velero/shared"
 )
 
-// RetainSnapshotDataMoverConfigKey is the key of the DataMoverConfig entry that
+// RequireBaseSnapshotForDeltaDataMoverConfigKey is the key of the DataMoverConfig entry that
 // carries the base snapshot retention decision for the DataUpload. The volume
 // policy is evaluated once, server-side, where the DataUpload is created; the
 // node-agent never re-evaluates it, because the policy ConfigMap is not
 // guaranteed to be readable from the node-agent. DataMoverConfig is documented
 // for mover-specific configuration and is forwarded to the data path, which
 // ignores unknown keys, so this controller-owned key in that map is safe.
-const RetainSnapshotDataMoverConfigKey = "retainSnapshot"
+const RequireBaseSnapshotForDeltaDataMoverConfigKey = "requireBaseSnapshotForDelta"
 
 // DataUploadSpec is the specification for a DataUpload.
 type DataUploadSpec struct {

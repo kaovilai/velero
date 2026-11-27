@@ -410,16 +410,16 @@ func (p *pvcBackupItemAction) Execute(
 		// decision travels on the DataUpload instead. Retention applies to the
 		// block data mover only; for any other data mover the parameter is
 		// ignored with a warning.
-		retainSnapshot := vh.GetRetainSnapshotFromActionParameters(item, kuberesource.PersistentVolumeClaims)
+		requireBaseSnapshotForDelta := vh.GetRequireBaseSnapshotForDeltaFromActionParameters(item, kuberesource.PersistentVolumeClaims)
 		effectiveDataMover := backup.Spec.DataMover
 		if dataMoverFromVolumePolicy != "" {
 			effectiveDataMover = dataMoverFromVolumePolicy
 		}
-		if retainSnapshot && effectiveDataMover != datamover.DataMoverTypeVeleroBlock {
+		if requireBaseSnapshotForDelta && effectiveDataMover != datamover.DataMoverTypeVeleroBlock {
 			dataUploadLog.Warnf(
 				"The %q parameter of the volume policy is only supported for the %q data mover, but the volume is backed up by %q; ignoring it",
-				"retainSnapshot", datamover.DataMoverTypeVeleroBlock, effectiveDataMover)
-			retainSnapshot = false
+				"requireBaseSnapshotForDelta", datamover.DataMoverTypeVeleroBlock, effectiveDataMover)
+			requireBaseSnapshotForDelta = false
 		}
 		// A VolumeGroupSnapshot member's backend snapshot belongs to the group
 		// and is released only with the VolumeGroupSnapshotContent: the
@@ -427,11 +427,11 @@ func (p *pvcBackupItemAction) Execute(
 		// retained-snapshot deletion could not delete it on its own. The
 		// policy is ignored, with a warning, and the member keeps the
 		// VolumeGroupSnapshot lifecycle it has today (design, Non Goals).
-		if retainSnapshot && isVolumeGroupSnapshotMember(vs, vsc) {
+		if requireBaseSnapshotForDelta && isVolumeGroupSnapshotMember(vs, vsc) {
 			dataUploadLog.Warnf(
 				"The %q parameter of the volume policy is ignored for VolumeSnapshot %s/%s, which is a member of VolumeGroupSnapshot %s; a group member's snapshot is released with the group and cannot be retained on its own",
-				"retainSnapshot", vs.Namespace, vs.Name, ptr.Deref(vs.Status.VolumeGroupSnapshotName, ""))
-			retainSnapshot = false
+				"requireBaseSnapshotForDelta", vs.Namespace, vs.Name, ptr.Deref(vs.Status.VolumeGroupSnapshotName, ""))
+			requireBaseSnapshotForDelta = false
 		}
 
 		dataUploadLog.Info("Starting data upload of backup")
@@ -446,7 +446,7 @@ func (p *pvcBackupItemAction) Execute(
 			vsc,
 			fsType,
 			dataMoverFromVolumePolicy,
-			retainSnapshot,
+			requireBaseSnapshotForDelta,
 		)
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -589,7 +589,7 @@ func newDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
-	retainSnapshot bool,
+	requireBaseSnapshotForDelta bool,
 ) *velerov2alpha1.DataUpload {
 	parentSnapshot := ""
 
@@ -663,11 +663,11 @@ func newDataUpload(
 	// on the uploader-config branch above that initializes the map today. The
 	// key is written only when a policy opted the volume in; a DataUpload
 	// without it is not retained, whatever its class says.
-	if retainSnapshot && datamover.IsVeleroBlockDataMover(dataMover) {
+	if requireBaseSnapshotForDelta && datamover.IsVeleroBlockDataMover(dataMover) {
 		if dataUpload.Spec.DataMoverConfig == nil {
 			dataUpload.Spec.DataMoverConfig = make(map[string]string)
 		}
-		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] = "true"
+		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RequireBaseSnapshotForDeltaDataMoverConfigKey] = "true"
 	}
 
 	return dataUpload
@@ -696,9 +696,9 @@ func createDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
-	retainSnapshot bool,
+	requireBaseSnapshotForDelta bool,
 ) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, retainSnapshot)
+	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, requireBaseSnapshotForDelta)
 
 	err := crClient.Create(ctx, dataUpload)
 	if err != nil {

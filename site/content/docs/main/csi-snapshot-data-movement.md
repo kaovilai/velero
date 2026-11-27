@@ -136,28 +136,26 @@ volumePolicies:
     type: snapshot
     parameters:
       dataMover: velero-block
-      retainSnapshot: true
+      requireBaseSnapshotForDelta: true
 ```
 
-The parameter defaults to `false`, which is today's behavior: the snapshot is deleted when the backup completes. The file system data mover never retains snapshots.
+The parameter defaults to `false`, which is today's behavior: the snapshot is deleted when the backup completes. The file system data mover never retains snapshots, and neither does a volume snapshotted as a member of a VolumeGroupSnapshot.
 
 When retention applies, Velero owns the retained snapshot's lifecycle:
 
-- Velero records the snapshot on the `DataUpload` and only then keeps it in the storage, so the record survives Velero restarts and travels with backup sync to another cluster.
-- The retained snapshot is deleted when its backup is deleted, after the backup's repository data and `DataUpload`s, and only if every earlier step succeeded. Any earlier failure leaves the snapshot and its record in place, and the backup deletion can be retried. This is also how superseded snapshots are reclaimed: a retained snapshot that a newer backup of the same volume replaces is deleted when its own backup is deleted, not eagerly.
-- A failed, canceled or interrupted data movement never retains; its snapshot is reclaimed.
-- Before enabling `retainSnapshot`, the cluster's `DataUpload` CRD must carry the `retainedCSIStorageSnapshot` status field. On clusters that ship the CRD separately (for example OADp), upgrade the CRD first: while it predates the field, the API server prunes the record on write and every data movement that opts into retention fails.
-- Every `velero-block` `DataUpload` carries the retention decision in `spec.dataMoverConfig.retainSnapshot`, `"true"` or `"false"`, whether or not a policy matched, and `spec.dataMoverConfig.retainSnapshotPolicy` names the matching policy entry (for example `volumePolicies[1]`) when retention applies.
-- `velero backup describe --details` reports, per volume, whether retention was applied, which policy entry matched and the retained snapshot handle, and names the orphan-snapshot ConfigMap for records the deletion skipped or escalated.
-- A `DataUpload` deleted through the API while its backup still exists keeps its finalizer until the record is handed to the backup's `retained-snapshots-<backup-UID>-<n>` ConfigMap family, so the snapshot stays deletable with the backup; when the Backup is already gone, the record goes to the orphan-snapshot ConfigMap.
+- When the data movement completes, Velero records the snapshot on the `DataUpload` (`status.retainedCSIStorageSnapshot`) in the same update that marks it `Completed`, then keeps the snapshot in the storage. The record travels with the backup, so backup sync carries it to another cluster.
+- After the backup completes, Velero requests the deletion of the snapshot the backup's changed blocks were computed against, so one snapshot per volume stays in the storage between backups.
+- When a backup is deleted, Velero requests the deletion of the snapshot its record names. A snapshot that is already gone is deleted successfully.
+- A failed, canceled or interrupted data movement never retains; its snapshot is deleted with the rest of the data movement's resources.
+- Before enabling `requireBaseSnapshotForDelta`, the cluster's `DataUpload` CRD must carry the `retainedCSIStorageSnapshot` status field. On clusters that ship the CRD separately, upgrade the CRD first: while it predates the field, the record cannot be written, and the backups complete without retention, so every later backup of the volume reads in full.
+- The retention decision travels on the `DataUpload` as `spec.dataMoverConfig.requireBaseSnapshotForDelta: "true"`, written only when a policy opts the volume in.
+- `velero backup describe --details` reports the retained snapshot handle per volume.
 
-Some CSI drivers need a secret to delete a snapshot. The secret is recorded with the retained snapshot; for a backup synced to another cluster, the secret must exist in that cluster too, or the backup deletion fails and can be retried once the secret is recreated.
+Some CSI drivers need a secret to delete a snapshot. The secret is recorded with the retained snapshot; for a backup synced to another cluster, the secret must exist in that cluster too.
 
-To delete a retained snapshot, Velero rebuilds a temporary `VolumeSnapshotContent` named `vsc-<hash>` and deletes it, so that the CSI driver deletes the snapshot. If the driver persistently fails the deletion, the record is moved to a `orphan-snapshots-<n>` ConfigMap in the Velero namespace after a bounded number of attempts, the backup deletion proceeds, and the snapshot needs manual cleanup. The ConfigMap's entries are keyed by `<backup-UID>.<DataUpload-name>`; after the Backup object is gone, the ConfigMap's name and namespace are the lookup, and removing an entry whose snapshot was cleaned up by hand is the operator's action.
+To delete a retained snapshot, Velero creates a temporary `VolumeSnapshotContent` named `vsc-<hash>` for it and deletes it, so that the CSI snapshotter asks the driver to delete the snapshot; Velero does not wait for the driver. If the driver keeps failing the deletion, the `VolumeSnapshotContent` stays in deletion, carrying the snapshot handle in `spec.source.snapshotHandle`, and the snapshot needs manual cleanup. A record that names a CSI driver the cluster does not run is skipped with a warning.
 
-A block data mover backup taken by a Velero version that did not record retained snapshots has no record. For such a backup, Velero reads the snapshot handle from the backup data in the backup repository before deleting that data, if the `VolumeSnapshotClass` of the backup still exists in the cluster where the deletion runs and has `deletionPolicy: Retain`. That is not possible for the vSphere CSI driver, for the file system data mover, for a `DataUpload` that did not complete, for a class that was deleted or changed since, or for a backup whose tarball is gone; delete such snapshots from the storage manually.
-
-Deleting the most recent backup of a volume also deletes its snapshot; the next backup then uses the new most recent backup as its parent, and falls back to a full backup only when no usable base snapshot remains.
+Deleting the most recent backup of a volume also deletes its snapshot; the next backup of the volume then reads in full and starts a new chain.
 
 ### Install Velero Node Agent
 

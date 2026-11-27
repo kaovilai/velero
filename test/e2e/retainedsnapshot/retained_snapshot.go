@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package retainedsnapshot covers base-snapshot retention of the block data
-// mover: a volume policy with retainSnapshot: true keeps the storage snapshot
+// mover: a volume policy with requireBaseSnapshotForDelta: true keeps the storage snapshot
 // of a velero-block DataUpload alive past the backup, records it on the
 // DataUpload, and the backup deletion deletes it again.
 //
@@ -100,7 +100,7 @@ volumePolicies:
     type: snapshot
     parameters:
       dataMover: velero-block
-      retainSnapshot: true
+      requireBaseSnapshotForDelta: true
 `, velerotest.StorageClassName)
 
 var RetainedSnapshotLifecycleTest = func() {
@@ -425,7 +425,7 @@ func (r *retainedSnapshotCase) expectBackupSnapshotObjectsGone(duName string) er
 // expectRetained asserts the API side of a completed, retaining DataUpload.
 func (r *retainedSnapshotCase) expectRetained(du *velerov2alpha1api.DataUpload, obs *dataUploadObservation) string {
 	Expect(du.Status.Phase).To(Equal(velerov2alpha1api.DataUploadPhaseCompleted))
-	Expect(du.Spec.DataMoverConfig).To(HaveKeyWithValue(velerov2alpha1api.RetainSnapshotDataMoverConfigKey, "true"))
+	Expect(du.Spec.DataMoverConfig).To(HaveKeyWithValue(velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey, "true"))
 	Expect(du.Status.RetainedCSIStorageSnapshot).NotTo(BeNil(), "DataUpload %s has no retained snapshot record", du.Name)
 	record := du.Status.RetainedCSIStorageSnapshot
 	Expect(record.Driver).To(Equal(hostpathDriver))
@@ -1124,7 +1124,7 @@ func (c *releaseCase) cancelDataUpload() error {
 		return errors.Wrapf(err, "wait for DataUpload %s to end Canceled or Failed", duName)
 	}
 	fmt.Fprintf(GinkgoWriter, "Canceled DataUpload %s ended %s: %s\n", du.Name, du.Status.Phase, du.Status.Message)
-	Expect(du.Spec.DataMoverConfig).To(HaveKeyWithValue(velerov2alpha1api.RetainSnapshotDataMoverConfigKey, "true"))
+	Expect(du.Spec.DataMoverConfig).To(HaveKeyWithValue(velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey, "true"))
 	Expect(du.Status.RetainedCSIStorageSnapshot).To(BeNil(), "the canceled DataUpload %s kept a retained snapshot record", du.Name)
 
 	By("The backup finishes, the backup snapshot objects are gone, and the storage snapshot was released")
@@ -1143,9 +1143,9 @@ func (c *releaseCase) backupWithoutPolicy() error {
 	if err != nil {
 		return err
 	}
-	By("The DataUpload was not opted in: no retainSnapshot key, no record, snapshot deleted with the backup content")
+	By("The DataUpload was not opted in: no requireBaseSnapshotForDelta key, no record, snapshot deleted with the backup content")
 	Expect(du.Status.Phase).To(Equal(velerov2alpha1api.DataUploadPhaseCompleted))
-	Expect(du.Spec.DataMoverConfig).NotTo(HaveKey(velerov2alpha1api.RetainSnapshotDataMoverConfigKey))
+	Expect(du.Spec.DataMoverConfig).NotTo(HaveKey(velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey))
 	Expect(du.Status.RetainedCSIStorageSnapshot).To(BeNil(), "DataUpload %s without the policy carries a record", du.Name)
 	Expect(obs.retainSeen).To(BeFalse(), "the backup content of a non-retaining DataUpload was switched to Retain")
 	Expect(c.expectBackupSnapshotObjectsGone(du.Name)).To(Succeed())

@@ -2265,7 +2265,7 @@ func TestGetPVAndMatchAction(t *testing.T) {
 	}
 }
 
-func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
+func TestGetRequireBaseSnapshotForDeltaFromActionParameters(t *testing.T) {
 	testCases := []struct {
 		name             string
 		inputObj         runtime.Object
@@ -2274,7 +2274,7 @@ func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
 		expected         bool
 	}{
 		{
-			name:          "VolumePolicy match with retainSnapshot true, returns true",
+			name:          "VolumePolicy match with requireBaseSnapshotForDelta true, returns true",
 			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp2-csi").ClaimRef("ns", "pvc-1").Result(),
 			groupResource: kuberesource.PersistentVolumes,
 			resourcePolicies: &resourcepolicies.ResourcePolicies{
@@ -2287,8 +2287,8 @@ func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
 						Action: resourcepolicies.Action{
 							Type: resourcepolicies.Snapshot,
 							Parameters: map[string]any{
-								resourcepolicies.DataMoverParameter:      "velero-block",
-								resourcepolicies.RetainSnapshotParameter: true,
+								resourcepolicies.DataMoverParameter:                   "velero-block",
+								resourcepolicies.RequireBaseSnapshotForDeltaParameter: true,
 							},
 						},
 					},
@@ -2297,7 +2297,7 @@ func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:          "VolumePolicy match without retainSnapshot, returns false",
+			name:          "VolumePolicy match without requireBaseSnapshotForDelta, returns false",
 			inputObj:      builder.ForPersistentVolume("example-pv").StorageClass("gp2-csi").ClaimRef("ns", "pvc-1").Result(),
 			groupResource: kuberesource.PersistentVolumes,
 			resourcePolicies: &resourcepolicies.ResourcePolicies{
@@ -2332,7 +2332,7 @@ func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
 						Action: resourcepolicies.Action{
 							Type: resourcepolicies.Snapshot,
 							Parameters: map[string]any{
-								resourcepolicies.RetainSnapshotParameter: true,
+								resourcepolicies.RequireBaseSnapshotForDeltaParameter: true,
 							},
 						},
 					},
@@ -2366,7 +2366,7 @@ func TestGetRetainSnapshotFromActionParameters(t *testing.T) {
 			obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(tc.inputObj)
 			require.NoError(t, err)
 
-			actual := vh.GetRetainSnapshotFromActionParameters(&unstructured.Unstructured{Object: obj}, tc.groupResource)
+			actual := vh.GetRequireBaseSnapshotForDeltaFromActionParameters(&unstructured.Unstructured{Object: obj}, tc.groupResource)
 			assert.Equal(t, tc.expected, actual)
 		})
 	}

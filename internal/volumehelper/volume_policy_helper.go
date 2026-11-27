@@ -535,12 +535,12 @@ func (v *volumeHelperImpl) GetDataMoverFromActionParameters(obj runtime.Unstruct
 	return ""
 }
 
-// GetRetainSnapshotFromActionParameters returns whether the matched volume policy
+// GetRequireBaseSnapshotForDeltaFromActionParameters returns whether the matched volume policy
 // action opts the volume into base snapshot retention for the block data mover.
 // It returns false when no volume policy matches or the parameter is absent;
 // the parameter value itself is validated at policy load time, so a value that
 // fails to read here is logged and read as false.
-func (v *volumeHelperImpl) GetRetainSnapshotFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) bool {
+func (v *volumeHelperImpl) GetRequireBaseSnapshotForDeltaFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) bool {
 	name := groupResource.String()
 	if metadata, metaErr := meta.Accessor(obj); metaErr == nil {
 		name += ": " + metadata.GetNamespace() + "/" + metadata.GetName()
@@ -551,11 +551,11 @@ func (v *volumeHelperImpl) GetRetainSnapshotFromActionParameters(obj runtime.Uns
 		v.logger.Infof("no matching volume policy for %s, base snapshot retention is off", name)
 		return false
 	}
-	retainSnapshot, err := action.GetRetainSnapshot()
+	requireBaseSnapshotForDelta, err := action.GetRequireBaseSnapshotForDelta()
 	if err != nil {
-		v.logger.WithError(err).Warnf("fail to get the retainSnapshot parameter for %s, reading it as false", name)
+		v.logger.WithError(err).Warnf("fail to get the requireBaseSnapshotForDelta parameter for %s, reading it as false", name)
 		return false
 	}
-	v.logger.Infof("base snapshot retention for %s: %t", name, retainSnapshot)
-	return retainSnapshot
+	v.logger.Infof("base snapshot retention for %s: %t", name, requireBaseSnapshotForDelta)
+	return requireBaseSnapshotForDelta
 }

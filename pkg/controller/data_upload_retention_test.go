@@ -60,7 +60,7 @@ const (
 func retentionDataUploadBuilder() *builder.DataUploadBuilder {
 	return dataUploadBuilder().
 		DataMover("velero-block").
-		DataMoverConfig(map[string]string{velerov2alpha1api.RetainSnapshotDataMoverConfigKey: "true"}).
+		DataMoverConfig(map[string]string{velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey: "true"}).
 		Labels(map[string]string{velerov1api.BackupUIDLabel: "backup-uid"})
 }
 

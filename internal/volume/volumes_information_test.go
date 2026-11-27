@@ -1039,7 +1039,7 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 				du := builder.ForDataUpload("velero", "testDU").
 					DataMover("velero-block").
 					DataMoverConfig(map[string]string{
-						velerov2alpha1.RetainSnapshotDataMoverConfigKey: "true",
+						velerov2alpha1.RequireBaseSnapshotForDeltaDataMoverConfigKey: "true",
 					}).
 					CSISnapshot(&velerov2alpha1.CSISnapshotSpec{VolumeSnapshot: "vs-01", SnapshotClass: "testClass", Driver: "rbd.csi.ceph.com"}).
 					SnapshotID("testSnapshotHandle").

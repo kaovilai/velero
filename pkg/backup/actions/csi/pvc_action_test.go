@@ -2359,14 +2359,14 @@ func TestGetOrCreateVolumeHelper(t *testing.T) {
 
 func TestNewDataUpload(t *testing.T) {
 	tests := []struct {
-		name                      string
-		backupType                velerov1api.BackupType
-		vsClassName               *string
-		uploaderConfig            *velerov1api.UploaderConfigForBackup
-		dataMoverFromVolumePolicy string
-		retainSnapshot            bool
-		expectedParentSnap        string
-		expectedDataMoverCfg      map[string]string
+		name                        string
+		backupType                  velerov1api.BackupType
+		vsClassName                 *string
+		uploaderConfig              *velerov1api.UploaderConfigForBackup
+		dataMoverFromVolumePolicy   string
+		requireBaseSnapshotForDelta bool
+		expectedParentSnap          string
+		expectedDataMoverCfg        map[string]string
 	}{
 		{
 			name:                 "Full backup type, no uploader config, no vs class name",
@@ -2395,10 +2395,10 @@ func TestNewDataUpload(t *testing.T) {
 			expectedDataMoverCfg: map[string]string{},
 		},
 		{
-			// The retainSnapshot key is written only when a policy opted the
+			// The requireBaseSnapshotForDelta key is written only when a policy opted the
 			// volume in; a velero-block DataUpload without retention carries
 			// no key.
-			name:                      "velero-block without retention carries no retainSnapshot key",
+			name:                      "velero-block without retention carries no requireBaseSnapshotForDelta key",
 			backupType:                "",
 			vsClassName:               ptr.To("test-vs-class"),
 			uploaderConfig:            &velerov1api.UploaderConfigForBackup{ParallelFilesUpload: 0},
@@ -2416,7 +2416,7 @@ func TestNewDataUpload(t *testing.T) {
 		{
 			// Retention is a velero-block contract; the file system data
 			// mover's DataUploads are unchanged.
-			name:                 "file system data mover carries no retainSnapshot key",
+			name:                 "file system data mover carries no requireBaseSnapshotForDelta key",
 			vsClassName:          ptr.To("test-vs-class"),
 			uploaderConfig:       nil,
 			expectedDataMoverCfg: nil,
@@ -2431,13 +2431,13 @@ func TestNewDataUpload(t *testing.T) {
 		{
 			// The retention decision must not depend on the uploader-config
 			// branch that initializes the map today.
-			name:                      "retention without uploader config initializes the map",
-			vsClassName:               ptr.To("test-vs-class"),
-			uploaderConfig:            nil,
-			dataMoverFromVolumePolicy: "velero-block",
-			retainSnapshot:            true,
+			name:                        "retention without uploader config initializes the map",
+			vsClassName:                 ptr.To("test-vs-class"),
+			uploaderConfig:              nil,
+			dataMoverFromVolumePolicy:   "velero-block",
+			requireBaseSnapshotForDelta: true,
 			expectedDataMoverCfg: map[string]string{
-				velerov2alpha1.RetainSnapshotDataMoverConfigKey: "true",
+				velerov2alpha1.RequireBaseSnapshotForDeltaDataMoverConfigKey: "true",
 			},
 		},
 		{
@@ -2447,14 +2447,14 @@ func TestNewDataUpload(t *testing.T) {
 			expectedDataMoverCfg:      nil,
 		},
 		{
-			name:                      "retention with uploader config keeps the concurrency settings",
-			vsClassName:               ptr.To("test-vs-class"),
-			uploaderConfig:            &velerov1api.UploaderConfigForBackup{ParallelBlocksUpload: 7},
-			dataMoverFromVolumePolicy: "velero-block",
-			retainSnapshot:            true,
+			name:                        "retention with uploader config keeps the concurrency settings",
+			vsClassName:                 ptr.To("test-vs-class"),
+			uploaderConfig:              &velerov1api.UploaderConfigForBackup{ParallelBlocksUpload: 7},
+			dataMoverFromVolumePolicy:   "velero-block",
+			requireBaseSnapshotForDelta: true,
 			expectedDataMoverCfg: map[string]string{
-				uploaderUtil.ParallelBlocksUpload:               "7",
-				velerov2alpha1.RetainSnapshotDataMoverConfigKey: "true",
+				uploaderUtil.ParallelBlocksUpload:                            "7",
+				velerov2alpha1.RequireBaseSnapshotForDeltaDataMoverConfigKey: "true",
 			},
 		},
 		{
@@ -2511,7 +2511,7 @@ func TestNewDataUpload(t *testing.T) {
 			operationID := "test-op-id"
 			fsType := "ext4"
 
-			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, tc.retainSnapshot)
+			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, tc.requireBaseSnapshotForDelta)
 
 			require.NotNil(t, du)
 			assert.Equal(t, velerov2alpha1.SchemeGroupVersion.String(), du.APIVersion)
@@ -2562,7 +2562,7 @@ func TestNewDataUpload(t *testing.T) {
 }
 
 // TestIsVolumeGroupSnapshotMember covers the member detection the retention
-// decision uses: a retainSnapshot policy is ignored for a DataUpload whose
+// decision uses: a requireBaseSnapshotForDelta policy is ignored for a DataUpload whose
 // backup snapshot is a VolumeGroupSnapshot member (design, Non Goals).
 func TestIsVolumeGroupSnapshotMember(t *testing.T) {
 	tests := []struct {

@@ -39,7 +39,7 @@ import (
 func shouldRetainSnapshot(du *velerov2alpha1api.DataUpload) bool {
 	return du.Spec.SnapshotType == velerov2alpha1api.SnapshotTypeCSI &&
 		datamover.IsVeleroBlockDataMover(du.Spec.DataMover) &&
-		du.Spec.DataMoverConfig[velerov2alpha1api.RetainSnapshotDataMoverConfigKey] == "true"
+		du.Spec.DataMoverConfig[velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey] == "true"
 }
 
 // completeWithRetention completes a DataUpload that opted into base snapshot
