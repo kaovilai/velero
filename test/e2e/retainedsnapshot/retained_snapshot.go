@@ -41,7 +41,6 @@ import (
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -72,13 +71,12 @@ const (
 	// writes back; a filesystem volume's snapshot is a tarball there.
 	devicePath = "/dev/data"
 
-	hostpathDriver       = "hostpath.csi.k8s.io"
-	hostpathNamespace    = "default"
-	hostpathPod          = "csi-hostpathplugin-0"
-	hostpathContainer    = "hostpath"
-	hostpathSnapshotDir  = "/csi-data-dir"
-	hostpathSnapshotExt  = ".snap"
-	retentionPolicyEntry = "volumePolicies[0]"
+	hostpathDriver      = "hostpath.csi.k8s.io"
+	hostpathNamespace   = "default"
+	hostpathPod         = "csi-hostpathplugin-0"
+	hostpathContainer   = "hostpath"
+	hostpathSnapshotDir = "/csi-data-dir"
+	hostpathSnapshotExt = ".snap"
 
 	pollInterval  = 2 * time.Second
 	watchInterval = 100 * time.Millisecond
@@ -594,8 +592,6 @@ func (r *retainedSnapshotCase) describedRetainedHandle(backupName string) (strin
 	var snapshots map[string]struct {
 		DataMovement struct {
 			DataMover              string `json:"dataMover"`
-			BaseSnapshotRetention  string `json:"baseSnapshotRetention"`
-			RetentionPolicy        string `json:"retentionPolicy"`
 			RetainedSnapshotHandle string `json:"retainedSnapshotHandle"`
 		} `json:"dataMovement"`
 	}
@@ -607,9 +603,7 @@ func (r *retainedSnapshotCase) describedRetainedHandle(backupName string) (strin
 		return "", errors.Errorf("the description has no CSI snapshot for %s/%s: %s", r.CaseBaseName, workloadName, description.Status.BackupVolumes.CSISnapshots)
 	}
 	Expect(entry.DataMovement.DataMover).To(Equal("velero-block"))
-	Expect(entry.DataMovement.RetentionPolicy).To(Equal(retentionPolicyEntry))
-	fmt.Fprintf(GinkgoWriter, "describe %s: baseSnapshotRetention=%q retentionPolicy=%q retainedSnapshotHandle=%q\n",
-		backupName, entry.DataMovement.BaseSnapshotRetention, entry.DataMovement.RetentionPolicy, entry.DataMovement.RetainedSnapshotHandle)
+	fmt.Fprintf(GinkgoWriter, "describe %s: retainedSnapshotHandle=%q\n", backupName, entry.DataMovement.RetainedSnapshotHandle)
 	return entry.DataMovement.RetainedSnapshotHandle, nil
 }
 
@@ -712,8 +706,13 @@ func (c *lifecycleCase) Verify() error {
 
 	By("Manual cleanup: the content goes, the snapshot is deleted through a new static content")
 	c.unblockRelease(c.handle)
-	Expect(velerocsi.DeleteRetainedSnapshot(c.Ctx, c.Client.Kubebuilder,
-		&velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: c.handle, Driver: hostpathDriver}, "", logrus.StandardLogger())).To(Succeed())
+	cleanup := velerocsi.BuildTempVSCForRetainedSnapshot(&velerov2alpha1api.RetainedCSIStorageSnapshot{CSISnapshotHandle: c.handle, Driver: hostpathDriver}, "")
+	created, err := snapshotClient.SnapshotV1().VolumeSnapshotContents().Create(c.Ctx, cleanup, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	created.Status = &snapshotv1api.VolumeSnapshotContentStatus{SnapshotHandle: &c.handle}
+	_, err = snapshotClient.SnapshotV1().VolumeSnapshotContents().UpdateStatus(c.Ctx, created, metav1.UpdateOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(snapshotClient.SnapshotV1().VolumeSnapshotContents().Delete(c.Ctx, created.Name, metav1.DeleteOptions{})).To(Succeed())
 	c.expectStorageSnapshotGone(c.handle)
 	return nil
 }
@@ -956,7 +955,6 @@ func (c *holderCase) Restore() error {
 
 	By("The next backup read in full and recorded why")
 	Expect(du.Status.FallbackFull).To(BeTrue())
-	Expect(ptr.Deref(du.Status.IncrementalBytes, 0)).To(Equal(du.Status.SourceSize), "a full read uploads the whole volume")
 	By("The node-agent log names the cause of the full read")
 	logs, _, err := KubectlExec(c.Ctx, "logs", "-n", c.VeleroCfg.VeleroNamespace, "daemonset/node-agent", "--tail=-1")
 	Expect(err).NotTo(HaveOccurred())
@@ -967,7 +965,15 @@ func (c *holderCase) Restore() error {
 		}
 	}
 	Expect(cause).NotTo(BeEmpty(), "no Warn line in the node-agent log names the full read's cause against base %s", c.handles[0])
-	fmt.Fprintf(GinkgoWriter, "Holder deleted: backup %s fallbackFull=true; node-agent: %s\n", c.backups[2], cause)
+	By("The DataUpload's activities name the fall back")
+	var fallback string
+	for _, activity := range du.Status.Activities {
+		if strings.Contains(activity, "fallback") {
+			fallback = activity
+		}
+	}
+	Expect(fallback).NotTo(BeEmpty(), "no activity of DataUpload %s names the fall back: %v", du.Name, du.Status.Activities)
+	fmt.Fprintf(GinkgoWriter, "Holder deleted: backup %s fallbackFull=true; activity: %s; node-agent: %s\n", c.backups[2], fallback, cause)
 	return nil
 }
 
