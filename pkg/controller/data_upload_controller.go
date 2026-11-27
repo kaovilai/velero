@@ -87,9 +87,6 @@ type DataUploadReconciler struct {
 	podAnnotations                 map[string]string
 	snapshotMetadataServiceConfigs *velerotypes.CSISnapshotMetadataService
 	tolerations                    []corev1api.Toleration
-
-	eventRecorderOnce sync.Once
-	eventRecorder     kube.EventRecorder
 }
 
 func NewDataUploadReconciler(

@@ -24,7 +24,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
@@ -32,7 +31,6 @@ import (
 	"github.com/velero-io/velero/pkg/exposer"
 	"github.com/velero-io/velero/pkg/util/csi"
 	"github.com/velero-io/velero/pkg/util/datamover"
-	"github.com/velero-io/velero/pkg/util/kube"
 )
 
 // shouldRetainSnapshot reports whether the DataUpload opted into base snapshot
@@ -61,13 +59,14 @@ func shouldRetainSnapshot(du *velerov2alpha1api.DataUpload) bool {
 //  3. The exposer cleanup, unchanged, and a best-effort deletion of the
 //     content object, which a VolumeSnapshot deletion does not cascade to
 //     under Retain.
-//  4. Best effort: the base this backup's changed blocks were computed
-//     against is released.
+//  4. Best effort: when this backup retained its snapshot, the deletion of
+//     the parent's snapshot is issued, without waiting for the driver.
 //
 // Nothing after the data path fails the DataUpload: a step that does not
 // succeed leaves the backup completed without retention, the content Delete,
 // and the next backup of the volume reads in full. A record whose snapshot
-// was not retained is harmless: deleting a gone snapshot succeeds.
+// was not retained is harmless: deleting a gone snapshot succeeds. Nothing
+// writes the DataUpload after the Completed update; the outcome is logged.
 func (r *DataUploadReconciler) completeWithRetention(ctx context.Context, du *velerov2alpha1api.DataUpload, result datapath.Result, log logrus.FieldLogger) {
 	record := r.backupSnapshotRecord(ctx, du, log)
 
@@ -117,12 +116,9 @@ func (r *DataUploadReconciler) completeWithRetention(ctx context.Context, du *ve
 	log.Info("Data upload completed")
 	r.metrics.RegisterDataUploadSuccess(r.nodeName)
 
-	if retained && !result.Backup.FallbackFull && result.Backup.ParentChangeID != "" && result.Backup.ParentChangeID != record.CSISnapshotHandle {
-		// The data movement is over: the node's data path slot is given back
-		// before the release, which can wait up to the CSI operation timeout,
-		// so the next DataUpload of the node does not wait on it. The
-		// callback's deferred removal is then a no-op.
-		r.dataPathMgr.RemoveAsyncBR(du.Name)
+	// The parent is released only when this backup retained its own
+	// snapshot, which becomes the next backup's base.
+	if retained && result.Backup.ParentChangeID != "" && result.Backup.ParentChangeID != record.CSISnapshotHandle {
 		r.releaseBase(ctx, completed, record, result.Backup.ParentChangeID, log)
 	}
 }
@@ -139,54 +135,30 @@ func (r *DataUploadReconciler) backupSnapshotRecord(ctx context.Context, du *vel
 	return csi.GetRetainedSnapshotFromVSC(vsc)
 }
 
-// releaseBase releases the base snapshot this backup's changed blocks were
-// computed against: the handle the data path reported from the parent
-// repository snapshot's change ID, deleted with the driver, deletion secret
-// and managed-by label of this backup's own record, which the base shares.
-// Best effort: a failure emits RetainedSnapshotReleaseFailed and leaves the
-// snapshot to the deletion of the backup that recorded it.
-func (r *DataUploadReconciler) releaseBase(ctx context.Context, du *velerov2alpha1api.DataUpload, record *velerov2alpha1api.RetainedCSIStorageSnapshot, baseHandle string, log logrus.FieldLogger) {
-	base := &velerov2alpha1api.RetainedCSIStorageSnapshot{
-		CSISnapshotHandle:   baseHandle,
+// releaseBase issues the deletion of the parent's snapshot: the handle the
+// data path reported from the parent repository snapshot's change ID, deleted
+// with the driver, deletion secret and managed-by label of this backup's own
+// record, which the parent shares. Best effort and logged only: a snapshot
+// whose deletion is not issued stays until the deletion of the backup that
+// recorded it.
+func (r *DataUploadReconciler) releaseBase(ctx context.Context, du *velerov2alpha1api.DataUpload, record *velerov2alpha1api.RetainedCSIStorageSnapshot, parentHandle string, log logrus.FieldLogger) {
+	parent := &velerov2alpha1api.RetainedCSIStorageSnapshot{
+		CSISnapshotHandle:   parentHandle,
 		Driver:              record.Driver,
 		DeletionSecretRef:   record.DeletionSecretRef,
 		ManagedByLabelValue: record.ManagedByLabelValue,
 	}
-	baseLog := log.WithField("baseSnapshot", baseHandle)
-	if err := exposer.ReleaseRetainedSnapshot(ctx, r.client, r.apiReader(), base, types.UID(du.Labels[velerov1api.BackupUIDLabel]), csi.RetainedSnapshotDeletionTimeout, baseLog); err != nil {
-		baseLog.WithError(err).Warn("Failed to release the base snapshot, the deletion of the backup that recorded it deletes it")
-		r.events().Event(du, true, "RetainedSnapshotReleaseFailed",
-			"the base snapshot %s was not released: %v; the deletion of the backup that recorded it deletes it", baseHandle, err)
+	if err := exposer.ReleaseRetainedSnapshot(ctx, r.client, parent, types.UID(du.Labels[velerov1api.BackupUIDLabel]), log); err != nil {
+		log.WithError(err).Warnf("Failed to issue the deletion of the parent's snapshot %s of driver %s; the deletion of the backup that recorded it deletes it", parentHandle, record.Driver)
 		return
 	}
-	baseLog.Info("Released the base snapshot")
-	r.events().Event(du, false, "RetainedSnapshotReleased", "the base snapshot %s was released", baseHandle)
+	log.Infof("Issued the deletion of the parent's snapshot %s of driver %s", parentHandle, record.Driver)
 }
 
-// apiReader returns a reader of the API server: the manager's client reads
-// from its cache. Without a manager, as in tests, the client itself.
-func (r *DataUploadReconciler) apiReader() client.Reader {
-	if r.mgr != nil {
-		return r.mgr.GetAPIReader()
-	}
-	return r.client
-}
-
-// warnNotRetained records why a completed DataUpload's snapshot was not
-// retained; the next backup of the volume reads in full.
+// warnNotRetained logs why a completed DataUpload's snapshot was not retained;
+// the next backup of the volume reads in full.
 func (r *DataUploadReconciler) warnNotRetained(du *velerov2alpha1api.DataUpload, reason string) {
 	r.logger.WithField("dataupload", du.Name).Warnf("The snapshot is not retained, the next backup of the volume reads in full: %s", reason)
-	r.events().Event(du, true, "RetainedSnapshotSkipped", "the snapshot is not retained, the next backup of the volume reads in full: %s", reason)
-}
-
-// events returns the reconciler's event recorder, built on first use.
-func (r *DataUploadReconciler) events() kube.EventRecorder {
-	r.eventRecorderOnce.Do(func() {
-		if r.eventRecorder == nil {
-			r.eventRecorder = kube.NewEventRecorder(r.kubeClient, r.client.Scheme(), "velero-data-upload", r.nodeName, r.logger)
-		}
-	})
-	return r.eventRecorder
 }
 
 // fallbackReasonOf returns why the incremental fell back to a full read, as the

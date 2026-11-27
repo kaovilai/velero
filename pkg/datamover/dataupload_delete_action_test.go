@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
@@ -42,7 +42,6 @@ import (
 	"github.com/velero-io/velero/pkg/builder"
 	"github.com/velero-io/velero/pkg/plugin/velero"
 	velerotest "github.com/velero-io/velero/pkg/test"
-	"github.com/velero-io/velero/pkg/util/csi"
 )
 
 func toUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) runtime.Unstructured {
@@ -81,7 +80,7 @@ func newCompletedDataUpload(name, ownerBackup string) *velerov2alpha1.DataUpload
 }
 
 func TestDataUploadDeleteActionAppliesTo(t *testing.T) {
-	a := NewDataUploadDeleteAction(logrus.StandardLogger(), nil, 0)
+	a := NewDataUploadDeleteAction(logrus.StandardLogger(), nil)
 	selector, err := a.AppliesTo()
 	require.NoError(t, err)
 	require.Equal(t, velero.ResourceSelector{IncludedResources: []string{"datauploads.velero.io"}}, selector)
@@ -127,7 +126,7 @@ func TestDataUploadDeleteActionExecute(t *testing.T) {
 			crClient := velerotest.NewFakeControllerRuntimeClient(t)
 			logger, hook := logrustest.NewNullLogger()
 			logger.SetLevel(logrus.DebugLevel)
-			action := NewDataUploadDeleteAction(logger, crClient, 0)
+			action := NewDataUploadDeleteAction(logger, crClient)
 
 			du := newCompletedDataUpload(tc.duName, tc.duOwnerBackup)
 			backup := builder.ForBackup("velero", tc.executingBackup).StorageLocation("default").Result()
@@ -179,13 +178,16 @@ func TestDataUploadDeleteActionExecute(t *testing.T) {
 const deleteTestHandle = "0001-0009-rook-ceph-0000000000000001-snap"
 
 // fakeSidecar plays the CSI snapshotter sidecar for the static
-// VolumeSnapshotContent of a retained snapshot: on every read of a content
-// being deleted with a seeded handle it calls DeleteSnapshot, which deletes the
-// snapshot and drops the finalizer unless the driver fails.
+// VolumeSnapshotContent of a retained snapshot: process() handles every
+// content being deleted with a seeded handle -- DeleteSnapshot, which deletes
+// the snapshot and drops the finalizer unless the driver fails -- as the
+// sidecar does after the action returned.
 type fakeSidecar struct {
 	snapshots   map[string]bool
 	driverFails bool
 	deleteCalls []string
+	createErr   error
+	c           crclient.Client
 }
 
 func (f *fakeSidecar) client(t *testing.T, objs ...runtime.Object) crclient.Client {
@@ -195,88 +197,98 @@ func (f *fakeSidecar) client(t *testing.T, objs ...runtime.Object) crclient.Clie
 		WithRuntimeObjects(objs...).
 		WithStatusSubresource(&snapshotv1api.VolumeSnapshotContent{}).
 		Build()
-	return interceptor.NewClient(base.(crclient.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, c crclient.WithWatch, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
-			if _, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok {
-				vsc := &snapshotv1api.VolumeSnapshotContent{}
-				if err := c.Get(ctx, key, vsc); err == nil && vsc.DeletionTimestamp != nil && vsc.Status != nil && vsc.Status.SnapshotHandle != nil {
-					f.deleteCalls = append(f.deleteCalls, *vsc.Status.SnapshotHandle)
-					if !f.driverFails {
-						f.snapshots[*vsc.Status.SnapshotHandle] = false
-						vsc.Finalizers = nil
-						_ = c.Update(ctx, vsc)
-					}
-				}
+	f.c = interceptor.NewClient(base.(crclient.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c crclient.WithWatch, obj crclient.Object, opts ...crclient.CreateOption) error {
+			if _, ok := obj.(*snapshotv1api.VolumeSnapshotContent); ok && f.createErr != nil {
+				return f.createErr
 			}
-			return c.Get(ctx, key, obj, opts...)
+			return c.Create(ctx, obj, opts...)
 		},
 	})
+	return f.c
+}
+
+func (f *fakeSidecar) process(t *testing.T) {
+	t.Helper()
+	contents := &snapshotv1api.VolumeSnapshotContentList{}
+	require.NoError(t, f.c.List(t.Context(), contents))
+	for i := range contents.Items {
+		vsc := &contents.Items[i]
+		if vsc.DeletionTimestamp == nil || vsc.Status == nil || vsc.Status.SnapshotHandle == nil {
+			continue
+		}
+		f.deleteCalls = append(f.deleteCalls, *vsc.Status.SnapshotHandle)
+		if f.driverFails {
+			continue
+		}
+		f.snapshots[*vsc.Status.SnapshotHandle] = false
+		vsc.Finalizers = nil
+		require.NoError(t, f.c.Update(t.Context(), vsc))
+	}
 }
 
 func retainedRecord(handle, driver string) *velerov2alpha1.RetainedCSIStorageSnapshot {
 	return &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: handle, Driver: driver}
 }
 
-func shortenDeletionBound(t *testing.T) {
+func staticContents(t *testing.T, c crclient.Client) []snapshotv1api.VolumeSnapshotContent {
 	t.Helper()
-	orig := csi.RetainedSnapshotDeletionTimeout
-	csi.RetainedSnapshotDeletionTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { csi.RetainedSnapshotDeletionTimeout = orig })
+	contents := &snapshotv1api.VolumeSnapshotContentList{}
+	require.NoError(t, c.List(t.Context(), contents))
+	return contents.Items
 }
 
-// TestDataUploadDeleteActionDeletesRetainedSnapshot proves the synchronous
-// deletion of a retained snapshot with its backup: the record of every
-// DataUpload in the tarball is deleted through the static content before the
-// repository data; no DataUpload in the cluster is read; a snapshot that is
-// already gone -- released by a later backup, or never retained -- deletes
-// successfully.
-func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
-	shortenDeletionBound(t)
+// TestDataUploadDeleteActionIssuesRetainedSnapshotDeletion proves the action
+// issues the deletion of the snapshot the record of every DataUpload in the
+// tarball names and returns without waiting: the static content is seeded and
+// being deleted when it returns, and the sidecar then deletes the snapshot,
+// also one already gone. No DataUpload in the cluster is read.
+func TestDataUploadDeleteActionIssuesRetainedSnapshotDeletion(t *testing.T) {
 	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
 	backup.UID = "daily-uid"
 
 	tests := []struct {
-		name        string
-		tarball     func(*velerov2alpha1.DataUpload)
-		local       bool
-		gone        bool
-		wantDeleted bool
+		name       string
+		tarball    func(*velerov2alpha1.DataUpload)
+		local      bool
+		gone       bool
+		wantIssued bool
 	}{
 		{
 			// Also the Completed DataUpload deleted through the API: the
 			// tarball still carries its record.
-			name: "a record from the tarball is deleted",
+			name: "a record from the tarball",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
 			},
-			wantDeleted: true,
+			wantIssued: true,
 		},
 		{
-			name: "a failed DataUpload's record is deleted too",
+			name: "a failed DataUpload's record",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.Phase = velerov2alpha1.DataUploadPhaseFailed
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
 			},
-			wantDeleted: true,
+			wantIssued: true,
 		},
 		{
 			name: "the local DataUpload is not read: its missing record changes nothing",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
 			},
-			local:       true,
-			wantDeleted: true,
+			local:      true,
+			wantIssued: true,
 		},
 		{
-			name: "a snapshot already gone deletes successfully",
+			name: "a snapshot already gone",
 			tarball: func(du *velerov2alpha1.DataUpload) {
 				du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
 			},
-			gone:        true,
-			wantDeleted: true,
+			gone:       true,
+			wantIssued: true,
 		},
 		{
-			name:    "a DataUpload without a record deletes nothing",
+			name:    "a DataUpload without a record",
 			tarball: func(*velerov2alpha1.DataUpload) {},
 		},
 	}
@@ -294,145 +306,88 @@ func TestDataUploadDeleteActionDeletesRetainedSnapshot(t *testing.T) {
 			}
 			sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: !tc.gone}}
 			crClient := sidecar.client(t, objs...)
-			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
+			action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient)
 
 			require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, tarball), Backup: backup}))
 
-			if tc.wantDeleted {
-				assert.Equal(t, []string{deleteTestHandle}, sidecar.deleteCalls)
-				assert.False(t, sidecar.snapshots[deleteTestHandle])
-			} else {
-				assert.Empty(t, sidecar.deleteCalls)
-				assert.True(t, sidecar.snapshots[deleteTestHandle])
+			contents := staticContents(t, crClient)
+			if !tc.wantIssued {
+				assert.Empty(t, contents)
+				return
 			}
-			contents := &snapshotv1api.VolumeSnapshotContentList{}
-			require.NoError(t, crClient.List(t.Context(), contents))
-			assert.Empty(t, contents.Items, "no static content is left behind")
+			require.Len(t, contents, 1, "the static content is left to the sidecar")
+			assert.NotNil(t, contents[0].DeletionTimestamp, "its deletion is issued")
+			require.NotNil(t, contents[0].Status.SnapshotHandle)
+			assert.Equal(t, deleteTestHandle, *contents[0].Status.SnapshotHandle, "seeded, so the sidecar calls DeleteSnapshot")
+			sidecar.process(t)
+			assert.Equal(t, []string{deleteTestHandle}, sidecar.deleteCalls)
+			assert.False(t, sidecar.snapshots[deleteTestHandle])
+			assert.Empty(t, staticContents(t, crClient), "no static content is left behind")
 		})
 	}
 }
 
+// TestDataUploadDeleteActionDoesNotWaitOnTheDriver proves the backup deletion
+// does not wait for a snapshot the driver cannot delete: the action succeeds,
+// and the static content stays in deletion carrying the handle -- the trace
+// for manual cleanup. A re-issued deletion finds it in flight and succeeds.
+func TestDataUploadDeleteActionDoesNotWaitOnTheDriver(t *testing.T) {
+	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
+	backup.UID = "daily-uid"
+	du := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
+	du.Spec.DataMover = "velero-block"
+	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}, driverFails: true}
+	crClient := sidecar.client(t)
+
+	require.NoError(t, NewDataUploadDeleteAction(velerotest.NewLogger(), crClient).Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+	sidecar.process(t)
+	contents := staticContents(t, crClient)
+	require.Len(t, contents, 1)
+	assert.NotNil(t, contents[0].DeletionTimestamp)
+	require.NotNil(t, contents[0].Spec.Source.SnapshotHandle)
+	assert.Equal(t, deleteTestHandle, *contents[0].Spec.Source.SnapshotHandle, "the content left in deletion names the snapshot")
+	assert.True(t, sidecar.snapshots[deleteTestHandle])
+
+	require.NoError(t, NewDataUploadDeleteAction(velerotest.NewLogger(), crClient).Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}),
+		"a re-issued deletion finds the request in flight")
+	assert.Len(t, staticContents(t, crClient), 1)
+}
+
+// TestDataUploadDeleteActionIssueFailure proves a deletion that cannot be
+// issued fails the action, so the backup deletion request fails before the
+// tarball goes and a retry still has the handle.
+func TestDataUploadDeleteActionIssueFailure(t *testing.T) {
+	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
+	backup.UID = "daily-uid"
+	du := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
+	du.Spec.DataMover = "velero-block"
+	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
+	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}, createErr: errors.New("the API server is unavailable")}
+	crClient := sidecar.client(t)
+
+	err := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient).Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup})
+	require.ErrorContains(t, err, "the API server is unavailable")
+}
+
 // TestDataUploadDeleteActionUnknownDriver proves a record naming a driver the
-// cluster does not run is skipped with a Warning event on the Backup: no
-// static content is created and the deletion proceeds.
+// cluster does not run is skipped with a warning: no static content is
+// created and the deletion proceeds.
 func TestDataUploadDeleteActionUnknownDriver(t *testing.T) {
 	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
 	backup.UID = "daily-uid"
 	du := newCompletedDataUpload("daily-backup-abcde", "daily-backup")
 	du.Spec.DataMover = "velero-block"
 	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "unknown.csi.example.com")
-
 	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}}
 	crClient := sidecar.client(t)
-	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
+	logger, hook := logrustest.NewNullLogger()
 
-	require.NoError(t, action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
-	contents := &snapshotv1api.VolumeSnapshotContentList{}
-	require.NoError(t, crClient.List(t.Context(), contents))
-	assert.Empty(t, contents.Items)
-	events := &corev1api.EventList{}
-	require.NoError(t, crClient.List(t.Context(), events))
-	require.Len(t, events.Items, 1)
-	assert.Equal(t, "RetainedSnapshotDriverUnknown", events.Items[0].Reason)
-	assert.Equal(t, corev1api.EventTypeWarning, events.Items[0].Type)
-	assert.Equal(t, "Backup", events.Items[0].InvolvedObject.Kind)
-}
-
-// TestDataUploadDeleteActionRetainedSnapshotFailure proves the failure path
-// and the one-wait rule: a deletion that does not finish within the bound
-// returns the helper's error unchanged, which fails the request before the
-// repository data, the DataUploads and the tarball are touched, and leaves the
-// static content being deleted; the next record of the same request is
-// deleted without waiting and returns an error at once; a retry of the backup
-// deletion resumes the deletions in progress.
-func TestDataUploadDeleteActionRetainedSnapshotFailure(t *testing.T) {
-	shortenDeletionBound(t)
-	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
-	backup.UID = "daily-uid"
-	first := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
-	first.Spec.DataMover = "velero-block"
-	first.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-	second := newCompletedDataUpload("daily-backup-bbbbb", "daily-backup")
-	second.Spec.DataMover = "velero-block"
-	second.Status.RetainedCSIStorageSnapshot = retainedRecord("second-snap", "rbd.csi.ceph.com")
-
-	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true, "second-snap": true}, driverFails: true}
-	crClient := sidecar.client(t)
-	action := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
-
-	var pending *csi.RetainedSnapshotDeletionPendingError
-	err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, first), Backup: backup})
-	require.ErrorAs(t, err, &pending, "the helper's error is returned unchanged")
-	assert.Positive(t, pending.Waited, "the first timeout waits out the bound")
-
-	start := time.Now()
-	err = action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, second), Backup: backup})
-	require.ErrorAs(t, err, &pending)
-	assert.Zero(t, pending.Waited, "after the first timeout the request does not wait again")
-	assert.Less(t, time.Since(start), csi.RetainedSnapshotDeletionTimeout)
-	contents := &snapshotv1api.VolumeSnapshotContentList{}
-	require.NoError(t, crClient.List(t.Context(), contents))
-	require.Len(t, contents.Items, 2, "both static contents are left being deleted for the sidecar")
-	for i := range contents.Items {
-		assert.NotNil(t, contents.Items[i].DeletionTimestamp)
+	require.NoError(t, NewDataUploadDeleteAction(logger, crClient).Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
+	assert.Empty(t, staticContents(t, crClient))
+	warned := false
+	for _, entry := range hook.AllEntries() {
+		warned = warned || entry.Level == logrus.WarnLevel && strings.Contains(entry.Message, "unknown.csi.example.com")
 	}
-
-	// A retry of the backup deletion is a new request, a new action.
-	sidecar.driverFails = false
-	retry := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, 0)
-	require.NoError(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, first), Backup: backup}))
-	require.NoError(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, second), Backup: backup}))
-	assert.False(t, sidecar.snapshots[deleteTestHandle])
-	assert.False(t, sidecar.snapshots["second-snap"])
-}
-
-// TestDataUploadDeleteActionBoundIsTheResourceTimeout proves the wait for a
-// retained snapshot's deletion is bounded by the server's --resource-timeout
-// handed to the action, not the helper's ten-minute default.
-func TestDataUploadDeleteActionBoundIsTheResourceTimeout(t *testing.T) {
-	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
-	backup.UID = "daily-uid"
-	du := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
-	du.Spec.DataMover = "velero-block"
-	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}, driverFails: true}
-	resourceTimeout := 300 * time.Millisecond
-	action := NewDataUploadDeleteAction(velerotest.NewLogger(), sidecar.client(t), resourceTimeout)
-
-	start := time.Now()
-	err := action.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup})
-	var pending *csi.RetainedSnapshotDeletionPendingError
-	require.ErrorAs(t, err, &pending)
-	assert.Equal(t, resourceTimeout, pending.Waited)
-	assert.Less(t, time.Since(start), 30*time.Second)
-	assert.Contains(t, err.Error(), "300ms")
-}
-
-// TestDataUploadDeleteActionWaitsAgainOnContentInDeletion proves a re-issued
-// backup deletion waits again on a static content an earlier request left
-// being deleted -- unlike the release, which checks it once -- so the retry
-// confirms the snapshot is gone, and succeeds once the driver deletes it.
-func TestDataUploadDeleteActionWaitsAgainOnContentInDeletion(t *testing.T) {
-	backup := builder.ForBackup("velero", "daily-backup").StorageLocation("default").Result()
-	backup.UID = "daily-uid"
-	du := newCompletedDataUpload("daily-backup-aaaaa", "daily-backup")
-	du.Spec.DataMover = "velero-block"
-	du.Status.RetainedCSIStorageSnapshot = retainedRecord(deleteTestHandle, "rbd.csi.ceph.com")
-	sidecar := &fakeSidecar{snapshots: map[string]bool{deleteTestHandle: true}, driverFails: true}
-	crClient := sidecar.client(t)
-	resourceTimeout := 300 * time.Millisecond
-	var pending *csi.RetainedSnapshotDeletionPendingError
-
-	first := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, resourceTimeout)
-	require.ErrorAs(t, first.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}), &pending)
-
-	// A re-issued deletion is a new request, a new action.
-	retry := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, resourceTimeout)
-	require.ErrorAs(t, retry.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}), &pending)
-	assert.Equal(t, resourceTimeout, pending.Waited, "the content left in deletion is waited on again")
-
-	sidecar.driverFails = false
-	again := NewDataUploadDeleteAction(velerotest.NewLogger(), crClient, resourceTimeout)
-	require.NoError(t, again.Execute(&velero.DeleteItemActionExecuteInput{Item: toUnstructured(t, du), Backup: backup}))
-	assert.False(t, sidecar.snapshots[deleteTestHandle])
+	assert.True(t, warned, "the skip is logged as a warning")
 }

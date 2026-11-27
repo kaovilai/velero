@@ -529,49 +529,15 @@ func getVolumeModeByAccessMode(accessMode string, dataMover string) (corev1api.P
 	}
 }
 
-// releaseAttempts bounds the attempts of a release; releaseRetryInterval
-// separates them.
-var (
-	releaseAttempts      = 3
-	releaseRetryInterval = 5 * time.Second
-)
-
-// ReleaseRetainedSnapshot deletes the base snapshot a completed backup's
-// changed blocks were computed against, which no later backup needs: restores
-// read the repository, never a storage snapshot. No parent VolumeSnapshot or
-// content exists during the backup -- the changed-block call takes the base as
-// a bare CSI handle -- so a static content is created here purely as the
-// deletion vehicle (csi.DeleteRetainedSnapshot). A failed attempt is retried a
-// few times within the timeout; a content an earlier release left being
-// deleted is checked once and not waited on again. reader must read from the
-// API server, not a cache: a cache that has not seen the static content yet
-// would answer NotFound for it. An error means the snapshot stays until the
-// deletion of the backup that recorded it.
-func ReleaseRetainedSnapshot(ctx context.Context, crClient client.Client, reader client.Reader, base *velerov2alpha1api.RetainedCSIStorageSnapshot,
-	ownerBackupUID types.UID, timeout time.Duration, log logrus.FieldLogger) error {
-	deadline := time.Now().Add(timeout)
-	var err error
-	for attempt := 1; attempt <= releaseAttempts; attempt++ {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		err = csi.DeleteRetainedSnapshot(ctx, crClient, reader, base, ownerBackupUID,
-			csi.RetainedSnapshotDeletionOptions{Timeout: remaining, CheckInProgressOnce: true}, log)
-		var pending *csi.RetainedSnapshotDeletionPendingError
-		if err == nil || errors.As(err, &pending) {
-			return err
-		}
-		log.WithError(err).Warnf("Release attempt %d of the base snapshot failed", attempt)
-		if attempt < releaseAttempts && time.Until(deadline) > releaseRetryInterval {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(releaseRetryInterval):
-			}
-		}
-	}
-	return err
+// ReleaseRetainedSnapshot issues the deletion of the base snapshot a completed
+// backup was taken against, which no later backup needs: restores read the
+// repository, never a storage snapshot. No parent VolumeSnapshot or content
+// exists during the backup -- the changed-block call takes the base as a bare
+// CSI handle -- so a static content is created here purely as the deletion
+// vehicle (csi.DeleteRetainedSnapshot). It does not wait for the driver.
+func ReleaseRetainedSnapshot(ctx context.Context, crClient client.Client, base *velerov2alpha1api.RetainedCSIStorageSnapshot,
+	ownerBackupUID types.UID, log logrus.FieldLogger) error {
+	return csi.DeleteRetainedSnapshot(ctx, crClient, base, ownerBackupUID, log)
 }
 
 func (e *csiSnapshotExposer) createBackupVS(ctx context.Context, ownerObject corev1api.ObjectReference, snapshotVS *snapshotv1api.VolumeSnapshot) (*snapshotv1api.VolumeSnapshot, error) {

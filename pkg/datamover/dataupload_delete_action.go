@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
@@ -14,7 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -29,17 +26,6 @@ import (
 type DataUploadDeleteAction struct {
 	logger logrus.FieldLogger
 	client client.Client
-	// resourceTimeout bounds the wait for a retained snapshot's deletion: the
-	// --resource-timeout of the server that runs the action.
-	resourceTimeout time.Duration
-
-	// timedOut records the backups whose deletion already waited out the
-	// bound once: the action runs inside the backup-deletion controller's
-	// reconcile, which handles one request at a time, so after the first
-	// record that times out, the remaining records of the same request are
-	// deleted without waiting.
-	mu       sync.Mutex
-	timedOut map[types.UID]bool
 }
 
 func (d *DataUploadDeleteAction) AppliesTo() (velero.ResourceSelector, error) {
@@ -111,14 +97,15 @@ func (d *DataUploadDeleteAction) Execute(input *velero.DeleteItemActionExecuteIn
 	return nil
 }
 
-// deleteRetainedSnapshot deletes the retained snapshot a DataUpload of the
-// backup tarball records. The tarball is the only source: no DataUpload in the
-// cluster is read. A snapshot a later backup already released is gone, and
-// deleting it again succeeds -- the helper seeds the content status, the CSI
-// snapshotter issues DeleteSnapshot, and the CSI spec requires success for a
-// snapshot that does not exist. A record naming a driver the cluster does not run is skipped with
-// a Warning event on the Backup, and its handle stays in the tarball for
-// manual cleanup. The helper's error is returned unchanged.
+// deleteRetainedSnapshot issues the deletion of the retained snapshot a
+// DataUpload of the backup tarball records, and does not wait for the CSI
+// driver. The tarball is the only source: no DataUpload in the cluster is
+// read. A snapshot a later backup already released is gone, and deleting it
+// again succeeds by the CSI spec. A record naming a driver the cluster does
+// not run is skipped with a warning; its handle stays in the tarball for
+// manual cleanup. An error means the deletion could not be issued, which
+// fails the backup deletion request before the tarball goes, so a retry still
+// has the handle.
 func (d *DataUploadDeleteAction) deleteRetainedSnapshot(bak *velerov1.Backup, du *velerov2alpha1.DataUpload) error {
 	ctx := context.Background()
 	record := du.Status.RetainedCSIStorageSnapshot
@@ -132,55 +119,11 @@ func (d *DataUploadDeleteAction) deleteRetainedSnapshot(bak *velerov1.Backup, du
 		if !apierrors.IsNotFound(err) {
 			return errors.Wrapf(err, "error getting CSIDriver %s", record.Driver)
 		}
-		message := fmt.Sprintf("the cluster does not run CSI driver %s; the retained snapshot %s of DataUpload %s is left for manual cleanup", record.Driver, record.CSISnapshotHandle, du.Name)
-		log.Warn(message)
-		d.warnOnBackup(ctx, bak, "RetainedSnapshotDriverUnknown", message, log)
+		log.Warnf("The cluster does not run CSI driver %s; the retained snapshot %s is left for manual cleanup", record.Driver, record.CSISnapshotHandle)
 		return nil
 	}
 
-	d.mu.Lock()
-	noWait := d.timedOut[bak.UID]
-	d.mu.Unlock()
-	log.Infof("Deleting the retained snapshot %s of driver %s", record.CSISnapshotHandle, record.Driver)
-	// The plugin process's client (client.Factory.KubebuilderClient) is a
-	// direct client, so the helper's existence reads go to the API server.
-	err := csi.DeleteRetainedSnapshot(ctx, d.client, d.client, record, bak.UID, csi.RetainedSnapshotDeletionOptions{Timeout: d.resourceTimeout, NoWait: noWait}, log)
-	var pending *csi.RetainedSnapshotDeletionPendingError
-	if errors.As(err, &pending) && !noWait {
-		d.mu.Lock()
-		if d.timedOut == nil {
-			d.timedOut = map[types.UID]bool{}
-		}
-		d.timedOut[bak.UID] = true
-		d.mu.Unlock()
-	}
-	return err
-}
-
-// warnOnBackup records a Warning event on the Backup; a failure to record it
-// is logged only.
-func (d *DataUploadDeleteAction) warnOnBackup(ctx context.Context, bak *velerov1.Backup, reason, message string, log logrus.FieldLogger) {
-	now := metav1.Now()
-	event := &corev1api.Event{
-		ObjectMeta: metav1.ObjectMeta{Namespace: bak.Namespace, GenerateName: bak.Name + "."},
-		InvolvedObject: corev1api.ObjectReference{
-			APIVersion: velerov1.SchemeGroupVersion.String(),
-			Kind:       "Backup",
-			Namespace:  bak.Namespace,
-			Name:       bak.Name,
-			UID:        bak.UID,
-		},
-		Reason:         reason,
-		Message:        message,
-		Type:           corev1api.EventTypeWarning,
-		Source:         corev1api.EventSource{Component: "velero"},
-		FirstTimestamp: now,
-		LastTimestamp:  now,
-		Count:          1,
-	}
-	if err := d.client.Create(ctx, event); err != nil {
-		log.WithError(err).Warn("Failed to record the event on the Backup")
-	}
+	return csi.DeleteRetainedSnapshot(ctx, d.client, record, bak.UID, log)
 }
 
 // generate the configmap which is to be created and used as a way to communicate the snapshot info to the backup deletion controller
@@ -225,13 +168,9 @@ func genConfigmap(bak *velerov1.Backup, du velerov2alpha1.DataUpload) *corev1api
 	}
 }
 
-// NewDataUploadDeleteAction returns the DataUpload delete item action; a
-// retained snapshot's deletion is bounded by resourceTimeout, the server's
-// --resource-timeout, or the helper's default when zero.
-func NewDataUploadDeleteAction(logger logrus.FieldLogger, client client.Client, resourceTimeout time.Duration) *DataUploadDeleteAction {
+func NewDataUploadDeleteAction(logger logrus.FieldLogger, client client.Client) *DataUploadDeleteAction {
 	return &DataUploadDeleteAction{
-		logger:          logger,
-		client:          client,
-		resourceTimeout: resourceTimeout,
+		logger: logger,
+		client: client,
 	}
 }
