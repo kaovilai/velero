@@ -2365,7 +2365,6 @@ func TestNewDataUpload(t *testing.T) {
 		uploaderConfig            *velerov1api.UploaderConfigForBackup
 		dataMoverFromVolumePolicy string
 		retainSnapshot            bool
-		retainSnapshotPolicy      string
 		expectedParentSnap        string
 		expectedDataMoverCfg      map[string]string
 	}{
@@ -2442,21 +2441,9 @@ func TestNewDataUpload(t *testing.T) {
 			},
 		},
 		{
-			name:                      "retention carries the matched policy entry for describe",
+			name:                      "a matched policy without retention leaves no retention key",
 			vsClassName:               ptr.To("test-vs-class"),
 			dataMoverFromVolumePolicy: "velero-block",
-			retainSnapshot:            true,
-			retainSnapshotPolicy:      "volumePolicies[2]",
-			expectedDataMoverCfg: map[string]string{
-				velerov2alpha1.RetainSnapshotDataMoverConfigKey:       "true",
-				velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey: "volumePolicies[2]",
-			},
-		},
-		{
-			name:                      "a matched policy without retention leaves no retention keys",
-			vsClassName:               ptr.To("test-vs-class"),
-			dataMoverFromVolumePolicy: "velero-block",
-			retainSnapshotPolicy:      "volumePolicies[0]",
 			expectedDataMoverCfg:      nil,
 		},
 		{
@@ -2524,7 +2511,7 @@ func TestNewDataUpload(t *testing.T) {
 			operationID := "test-op-id"
 			fsType := "ext4"
 
-			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, tc.retainSnapshot, tc.retainSnapshotPolicy)
+			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, tc.retainSnapshot)
 
 			require.NotNil(t, du)
 			assert.Equal(t, velerov2alpha1.SchemeGroupVersion.String(), du.APIVersion)

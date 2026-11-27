@@ -428,19 +428,10 @@ func describeDataMovementInSF(details bool, info *volume.BackupVolumeInfo, snaps
 			}
 
 			dataMovement["backupType"] = backupType
-			if info.FallbackFull && info.FallbackReason != "" {
-				dataMovement["fallbackReason"] = info.FallbackReason
-			}
 		}
 
-		if retention := describeRetention(info.SnapshotDataMovementInfo); retention != "" {
-			dataMovement["baseSnapshotRetention"] = retention
-			if info.SnapshotDataMovementInfo.RetainSnapshotPolicy != "" {
-				dataMovement["retentionPolicy"] = info.SnapshotDataMovementInfo.RetainSnapshotPolicy
-			}
-			if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
-				dataMovement["retainedSnapshotHandle"] = info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle
-			}
+		if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
+			dataMovement["retainedSnapshotHandle"] = info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle
 		}
 
 		dataMover := "velero"

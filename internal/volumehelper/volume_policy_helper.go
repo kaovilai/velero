@@ -536,64 +536,26 @@ func (v *volumeHelperImpl) GetDataMoverFromActionParameters(obj runtime.Unstruct
 }
 
 // GetRetainSnapshotFromActionParameters returns whether the matched volume policy
-// action opts the volume into base snapshot retention for the block data mover,
-// and the policy entry the decision came from ("volumePolicies[n]"), so that
-// `velero backup describe` can report which entry matched. It returns false
-// when no volume policy matches or the parameter is absent; the parameter
-// value itself is validated at policy load time, so a value that fails to
-// read here is logged and read as false. The decision and its source are
-// logged either way.
-func (v *volumeHelperImpl) GetRetainSnapshotFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, string) {
+// action opts the volume into base snapshot retention for the block data mover.
+// It returns false when no volume policy matches or the parameter is absent;
+// the parameter value itself is validated at policy load time, so a value that
+// fails to read here is logged and read as false.
+func (v *volumeHelperImpl) GetRetainSnapshotFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) bool {
 	name := groupResource.String()
 	if metadata, metaErr := meta.Accessor(obj); metaErr == nil {
 		name += ": " + metadata.GetNamespace() + "/" + metadata.GetName()
 	}
 
-	action, index, err := v.getPVAndMatchActionWithIndex(obj, groupResource)
+	action, _, err := v.getPVAndMatchAction(obj, groupResource)
 	if err != nil || action == nil {
 		v.logger.Infof("no matching volume policy for %s, base snapshot retention is off", name)
-		return false, ""
+		return false
 	}
-	entry := resourcepolicies.MatchedPolicyEntry(index)
-
 	retainSnapshot, err := action.GetRetainSnapshot()
 	if err != nil {
-		v.logger.WithError(err).Warnf("fail to get the retainSnapshot parameter of %s for %s, reading it as false", entry, name)
-		return false, entry
+		v.logger.WithError(err).Warnf("fail to get the retainSnapshot parameter for %s, reading it as false", name)
+		return false
 	}
-	if retainSnapshot {
-		v.logger.Infof("found matching action %s for %s, base snapshot retention is on", entry, name)
-	} else {
-		v.logger.Infof("found matching action %s for %s without retainSnapshot: true, base snapshot retention is off", entry, name)
-	}
-	return retainSnapshot, entry
-}
-
-// getPVAndMatchActionWithIndex is getPVAndMatchAction with the index of the
-// matched policy entry.
-// The index is a diagnostic: when it cannot be resolved the action still
-// stands and the entry is reported as unknown (-1), never as an error.
-func (v *volumeHelperImpl) getPVAndMatchActionWithIndex(obj runtime.Unstructured, groupResource schema.GroupResource) (*resourcepolicies.Action, int, error) {
-	action, pv, err := v.getPVAndMatchAction(obj, groupResource)
-	if err != nil || action == nil || v.volumePolicy == nil {
-		return action, -1, err
-	}
-	return action, v.matchedPolicyIndex(obj, groupResource, pv), nil
-}
-
-func (v *volumeHelperImpl) matchedPolicyIndex(obj runtime.Unstructured, groupResource schema.GroupResource, pv *corev1api.PersistentVolume) int {
-	var pvc *corev1api.PersistentVolumeClaim
-	if groupResource == kuberesource.PersistentVolumeClaims {
-		pvc = new(corev1api.PersistentVolumeClaim)
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pvc); err != nil {
-			v.logger.WithError(err).Debug("fail to convert unstructured into PVC for the matched policy index")
-			return -1
-		}
-	}
-	_, index, err := v.volumePolicy.GetMatchActionWithIndex(resourcepolicies.NewVolumeFilterData(pv, nil, pvc))
-	if err != nil {
-		v.logger.WithError(err).Debug("fail to resolve the matched policy index")
-		return -1
-	}
-	return index
+	v.logger.Infof("base snapshot retention for %s: %t", name, retainSnapshot)
+	return retainSnapshot
 }

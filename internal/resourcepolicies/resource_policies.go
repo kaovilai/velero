@@ -602,14 +602,7 @@ func (p *Policies) BuildPolicy(resPolicies *ResourcePolicies) error {
 }
 
 func (p *Policies) match(res *structuredVolume) *Action {
-	action, _ := p.matchIndex(res)
-	return action
-}
-
-// matchIndex returns the first matching policy's action and its index in the
-// volumePolicies list, or nil and -1.
-func (p *Policies) matchIndex(res *structuredVolume) (*Action, int) {
-	for i, policy := range p.volumePolicies {
+	for _, policy := range p.volumePolicies {
 		isAllMatch := false
 		for _, con := range policy.conditions {
 			if !con.match(res) {
@@ -619,49 +612,10 @@ func (p *Policies) matchIndex(res *structuredVolume) (*Action, int) {
 			isAllMatch = true
 		}
 		if isAllMatch {
-			return &policy.action, i
+			return &policy.action
 		}
 	}
-	return nil, -1
-}
-
-// MatchedPolicyEntry names the volume policy entry at the given index as
-// `velero backup describe` reports it, e.g. "volumePolicies[1]".
-func MatchedPolicyEntry(index int) string {
-	if index < 0 {
-		return ""
-	}
-	return fmt.Sprintf("volumePolicies[%d]", index)
-}
-
-// GetMatchActionWithIndex returns the matched action and the index of the
-// policy entry it came from, or nil and -1 when no policy matches.
-func (p *Policies) GetMatchActionWithIndex(res any) (*Action, int, error) {
-	data, ok := res.(VolumeFilterData)
-	if !ok {
-		return nil, -1, errors.New("failed to convert input to VolumeFilterData")
-	}
-
-	volume := &structuredVolume{}
-	switch {
-	case data.PersistentVolume != nil:
-		volume.parsePV(data.PersistentVolume)
-		if data.PVC != nil {
-			volume.parsePVC(data.PVC)
-		}
-	case data.PodVolume != nil:
-		volume.parsePodVolume(data.PodVolume)
-		if data.PVC != nil {
-			volume.parsePVC(data.PVC)
-		}
-	case data.PVC != nil:
-		volume.parsePVC(data.PVC)
-	default:
-		return nil, -1, errors.New("failed to convert object")
-	}
-
-	action, index := p.matchIndex(volume)
-	return action, index, nil
+	return nil
 }
 
 func (p *Policies) GetMatchAction(res any) (*Action, error) {

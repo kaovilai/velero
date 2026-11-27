@@ -1032,15 +1032,14 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 			},
 		},
 		{
-			// The retention and fallback diagnostics of the block data mover
+			// The retained handle and the fall back of the block data mover
 			// travel from the DataUpload into the volume info describe reads.
 			name: "velero-block DataUpload with retention and fallback",
 			dataUpload: func() *velerov2alpha1.DataUpload {
 				du := builder.ForDataUpload("velero", "testDU").
 					DataMover("velero-block").
 					DataMoverConfig(map[string]string{
-						velerov2alpha1.RetainSnapshotDataMoverConfigKey:       "true",
-						velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey: "volumePolicies[1]",
+						velerov2alpha1.RetainSnapshotDataMoverConfigKey: "true",
 					}).
 					CSISnapshot(&velerov2alpha1.CSISnapshotSpec{VolumeSnapshot: "vs-01", SnapshotClass: "testClass", Driver: "rbd.csi.ceph.com"}).
 					SnapshotID("testSnapshotHandle").
@@ -1051,7 +1050,6 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 					Phase(velerov2alpha1.DataUploadPhaseCompleted).
 					Result()
 				du.Status.FallbackFull = true
-				du.Status.FallbackReason = "base snapshot gone: not found"
 				du.Status.RetainedCSIStorageSnapshot = &velerov2alpha1.RetainedCSIStorageSnapshot{CSISnapshotHandle: "0001-retained", Driver: "rbd.csi.ceph.com"}
 				return du
 			}(),
@@ -1091,7 +1089,6 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 					SnapshotDataMoved:   true,
 					BackupType:          velerov1api.BackupTypeIncremental,
 					FallbackFull:        true,
-					FallbackReason:      "base snapshot gone: not found",
 					Result:              VolumeResultSucceeded,
 					StartTimestamp:      &now,
 					CompletionTimestamp: &now,
@@ -1109,8 +1106,6 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 						SnapshotHandle:            "testSnapshotHandle",
 						Size:                      1024,
 						IncrementalSize:           ptr.To(int64(1024)),
-						RetainSnapshotRequested:   true,
-						RetainSnapshotPolicy:      "volumePolicies[1]",
 						RetainedCSISnapshotHandle: "0001-retained",
 					},
 					PVInfo: &PVInfo{ReclaimPolicy: string(corev1api.PersistentVolumeReclaimDelete)},
@@ -1158,7 +1153,6 @@ func TestGenerateVolumeInfoFromDataUpload(t *testing.T) {
 				require.Equal(t, tc.expectedVolumeInfos[0].CSISnapshotInfo, volumesInfo.volumeInfos[0].CSISnapshotInfo)
 				require.Equal(t, tc.expectedVolumeInfos[0].Result, volumesInfo.volumeInfos[0].Result)
 				require.Equal(t, tc.expectedVolumeInfos[0].FallbackFull, volumesInfo.volumeInfos[0].FallbackFull)
-				require.Equal(t, tc.expectedVolumeInfos[0].FallbackReason, volumesInfo.volumeInfos[0].FallbackReason)
 				if tc.expectedVolumeInfos[0].StartTimestamp != nil {
 					require.NotNil(t, volumesInfo.volumeInfos[0].StartTimestamp)
 					require.True(t, tc.expectedVolumeInfos[0].StartTimestamp.Equal(volumesInfo.volumeInfos[0].StartTimestamp))

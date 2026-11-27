@@ -126,22 +126,6 @@ func DescribeBackup(
 	})
 }
 
-// describeRetention summarizes the base snapshot retention of a data movement:
-// empty when retention was neither requested nor applied, so the line does not
-// appear for the file system data mover or for users who did not opt in.
-func describeRetention(info *volume.BackupSnapshotDataMovementInfo) string {
-	switch {
-	case info == nil:
-		return ""
-	case info.RetainedCSISnapshotHandle != "":
-		return "applied"
-	case info.RetainSnapshotRequested:
-		return "requested but not retained"
-	default:
-		return ""
-	}
-}
-
 // DescribeResourcePolicies describes resource policies in human-readable format
 func DescribeResourcePolicies(d *Describer, resPolicies *corev1api.TypedLocalObjectReference) {
 	d.Printf("Resource policies:\n")
@@ -703,23 +687,10 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 			}
 
 			d.Printf("\t\t\t\tBackup Type: %s\n", backupType)
-			if info.FallbackFull && info.FallbackReason != "" {
-				d.Printf("\t\t\t\tFallback Reason: %s\n", info.FallbackReason)
-			}
 		}
 
-		// Base snapshot retention is a velero-block decision; the line is
-		// printed whenever the policy asked for it or a snapshot was retained,
-		// so an operator can tell a missing policy from a retention that did
-		// not hold.
-		if retention := describeRetention(info.SnapshotDataMovementInfo); retention != "" {
-			d.Printf("\t\t\t\tBase Snapshot Retention: %s\n", retention)
-			if info.SnapshotDataMovementInfo.RetainSnapshotPolicy != "" {
-				d.Printf("\t\t\t\tRetention Policy: %s\n", info.SnapshotDataMovementInfo.RetainSnapshotPolicy)
-			}
-			if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
-				d.Printf("\t\t\t\tRetained Snapshot Handle: %s\n", info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle)
-			}
+		if info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle != "" {
+			d.Printf("\t\t\t\tRetained Snapshot Handle: %s\n", info.SnapshotDataMovementInfo.RetainedCSISnapshotHandle)
 		}
 
 		d.Printf("\t\t\t\tUploader Type: %s\n", info.SnapshotDataMovementInfo.UploaderType)

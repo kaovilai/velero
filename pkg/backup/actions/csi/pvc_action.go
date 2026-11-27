@@ -410,7 +410,7 @@ func (p *pvcBackupItemAction) Execute(
 		// decision travels on the DataUpload instead. Retention applies to the
 		// block data mover only; for any other data mover the parameter is
 		// ignored with a warning.
-		retainSnapshot, retainSnapshotPolicy := vh.GetRetainSnapshotFromActionParameters(item, kuberesource.PersistentVolumeClaims)
+		retainSnapshot := vh.GetRetainSnapshotFromActionParameters(item, kuberesource.PersistentVolumeClaims)
 		effectiveDataMover := backup.Spec.DataMover
 		if dataMoverFromVolumePolicy != "" {
 			effectiveDataMover = dataMoverFromVolumePolicy
@@ -433,13 +433,6 @@ func (p *pvcBackupItemAction) Execute(
 				"retainSnapshot", vs.Namespace, vs.Name, ptr.Deref(vs.Status.VolumeGroupSnapshotName, ""))
 			retainSnapshot = false
 		}
-		if !retainSnapshot && effectiveDataMover == datamover.DataMoverTypeVeleroBlock {
-			source := "no volume policy matched"
-			if retainSnapshotPolicy != "" {
-				source = "matched " + retainSnapshotPolicy + " without retainSnapshot: true"
-			}
-			dataUploadLog.Infof("Base snapshot retention is off for this volume: %s", source)
-		}
 
 		dataUploadLog.Info("Starting data upload of backup")
 
@@ -454,7 +447,6 @@ func (p *pvcBackupItemAction) Execute(
 			fsType,
 			dataMoverFromVolumePolicy,
 			retainSnapshot,
-			retainSnapshotPolicy,
 		)
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -598,7 +590,6 @@ func newDataUpload(
 	fsType string,
 	dataMoverFromVolumePolicy string,
 	retainSnapshot bool,
-	retainSnapshotPolicy string,
 ) *velerov2alpha1.DataUpload {
 	parentSnapshot := ""
 
@@ -677,11 +668,6 @@ func newDataUpload(
 			dataUpload.Spec.DataMoverConfig = make(map[string]string)
 		}
 		dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] = "true"
-		if retainSnapshotPolicy != "" {
-			// The matched entry travels with the decision so that
-			// `velero backup describe` can report which policy applied.
-			dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey] = retainSnapshotPolicy
-		}
 	}
 
 	return dataUpload
@@ -711,9 +697,8 @@ func createDataUpload(
 	fsType string,
 	dataMoverFromVolumePolicy string,
 	retainSnapshot bool,
-	retainSnapshotPolicy string,
 ) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, retainSnapshot, retainSnapshotPolicy)
+	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, retainSnapshot)
 
 	err := crClient.Create(ctx, dataUpload)
 	if err != nil {

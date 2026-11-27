@@ -96,9 +96,6 @@ type BackupVolumeInfo struct {
 	// FallbackFull indicates whether the incremental backup has fallen back to full backup
 	FallbackFull bool `json:"fallbackFull,omitempty"`
 
-	// FallbackReason says why the incremental backup fell back to a full read.
-	FallbackReason string `json:"fallbackReason,omitempty"`
-
 	CSISnapshotInfo          *CSISnapshotInfo                `json:"csiSnapshotInfo,omitempty"`
 	SnapshotDataMovementInfo *BackupSnapshotDataMovementInfo `json:"snapshotDataMovementInfo,omitempty"`
 	NativeSnapshotInfo       *NativeSnapshotInfo             `json:"nativeSnapshotInfo,omitempty"`
@@ -202,14 +199,6 @@ type BackupSnapshotDataMovementInfo struct {
 
 	// The DataUpload's Status.Phase value
 	Phase velerov2alpha1.DataUploadPhase `json:"phase"`
-
-	// RetainSnapshotRequested reports whether the volume policy opted the volume into
-	// base snapshot retention (velero-block data mover only).
-	RetainSnapshotRequested bool `json:"retainSnapshotRequested,omitempty"`
-
-	// RetainSnapshotPolicy names the volume policy entry the retention decision came
-	// from, e.g. "volumePolicies[1]".
-	RetainSnapshotPolicy string `json:"retainSnapshotPolicy,omitempty"`
 
 	// RetainedCSISnapshotHandle is the handle of the storage snapshot Velero retained as
 	// the base of the next incremental backup; empty when none was retained.
@@ -823,9 +812,6 @@ func (v *BackupVolumesInformation) generateVolumeInfoFromDataUpload() {
 			}
 
 			volumeInfo.FallbackFull = dataUpload.Status.FallbackFull
-			volumeInfo.FallbackReason = dataUpload.Status.FallbackReason
-			volumeInfo.SnapshotDataMovementInfo.RetainSnapshotRequested = dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotDataMoverConfigKey] == "true"
-			volumeInfo.SnapshotDataMovementInfo.RetainSnapshotPolicy = dataUpload.Spec.DataMoverConfig[velerov2alpha1.RetainSnapshotPolicyDataMoverConfigKey]
 			if record := dataUpload.Status.RetainedCSIStorageSnapshot; record != nil {
 				volumeInfo.SnapshotDataMovementInfo.RetainedCSISnapshotHandle = record.CSISnapshotHandle
 			}

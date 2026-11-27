@@ -936,24 +936,22 @@ func TestDescribeBackupItemOperation(t *testing.T) {
 	assert.Equal(t, expected, d.buf.String())
 }
 
-// TestDescribeDataMovementRetentionAndFallback covers the diagnostics the
-// retention design adds to `velero backup describe --details`: the fallback
-// reason next to the backup type, and the per-volume retention outcome with
-// the matching policy entry and the retained handle.
-func TestDescribeDataMovementRetentionAndFallback(t *testing.T) {
+// TestDescribeDataMovementRetainedHandle covers the line the retention design
+// adds to `velero backup describe --details`: the retained snapshot handle.
+func TestDescribeDataMovementRetainedHandle(t *testing.T) {
 	testcases := []struct {
 		name       string
 		volumeInfo *volume.BackupVolumeInfo
 		expect     string
 	}{
 		{
-			name: "retention applied with policy and handle",
+			name: "a retained snapshot prints its handle",
 			volumeInfo: &volume.BackupVolumeInfo{
 				BackupMethod: volume.CSISnapshot, PVCNamespace: "ns", PVCName: "pvc", Result: volume.VolumeResultSucceeded,
 				SnapshotDataMoved: true, BackupType: velerov1api.BackupTypeIncremental,
 				SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{
 					DataMover: "velero-block", UploaderType: "kopia", OperationID: "op", Size: 10,
-					RetainSnapshotRequested: true, RetainSnapshotPolicy: "volumePolicies[1]", RetainedCSISnapshotHandle: "0001-handle",
+					RetainedCSISnapshotHandle: "0001-handle",
 				},
 			},
 			expect: `  CSI Snapshots:
@@ -962,8 +960,6 @@ func TestDescribeDataMovementRetentionAndFallback(t *testing.T) {
         Operation ID: op
         Data Mover: velero-block
         Backup Type: Incremental
-        Base Snapshot Retention: applied
-        Retention Policy: volumePolicies[1]
         Retained Snapshot Handle: 0001-handle
         Uploader Type: kopia
         Moved data Size (bytes): 10
@@ -971,32 +967,7 @@ func TestDescribeDataMovementRetentionAndFallback(t *testing.T) {
 `,
 		},
 		{
-			name: "retention requested but not retained, fallback with reason",
-			volumeInfo: &volume.BackupVolumeInfo{
-				BackupMethod: volume.CSISnapshot, PVCNamespace: "ns", PVCName: "pvc", Result: volume.VolumeResultSucceeded,
-				SnapshotDataMoved: true, BackupType: velerov1api.BackupTypeIncremental, FallbackFull: true,
-				FallbackReason: "base snapshot not retained by the previous backup (DataUpload prev); driver error: rbd",
-				SnapshotDataMovementInfo: &volume.BackupSnapshotDataMovementInfo{
-					DataMover: "velero-block", UploaderType: "kopia", OperationID: "op", Size: 10,
-					RetainSnapshotRequested: true, RetainSnapshotPolicy: "volumePolicies[0]",
-				},
-			},
-			expect: `  CSI Snapshots:
-    ns/pvc:
-      Data Movement:
-        Operation ID: op
-        Data Mover: velero-block
-        Backup Type: Incremental (fallen back to Full)
-        Fallback Reason: base snapshot not retained by the previous backup (DataUpload prev); driver error: rbd
-        Base Snapshot Retention: requested but not retained
-        Retention Policy: volumePolicies[0]
-        Uploader Type: kopia
-        Moved data Size (bytes): 10
-        Result: succeeded
-`,
-		},
-		{
-			name: "no retention requested prints no retention lines",
+			name: "nothing retained prints no handle",
 			volumeInfo: &volume.BackupVolumeInfo{
 				BackupMethod: volume.CSISnapshot, PVCNamespace: "ns", PVCName: "pvc", Result: volume.VolumeResultSucceeded,
 				SnapshotDataMoved: true, BackupType: velerov1api.BackupTypeFull,
