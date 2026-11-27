@@ -543,7 +543,6 @@ func (r *DataUploadReconciler) setDataUploadCompleted(du *velerov2alpha1api.Data
 	du.Status.IncrementalBytes = result.Backup.IncrementalBytes
 	du.Status.SourceSize = result.Backup.SourceSize
 	du.Status.FallbackFull = result.Backup.FallbackFull
-	du.Status.FallbackReason = fallbackReasonOf(result.Backup)
 
 	du.Status.CompletionTimestamp = &metav1.Time{Time: r.Clock.Now()}
 	if result.Backup.EmptySnapshot {

@@ -160,15 +160,3 @@ func (r *DataUploadReconciler) releaseBase(ctx context.Context, du *velerov2alph
 func (r *DataUploadReconciler) warnNotRetained(du *velerov2alpha1api.DataUpload, reason string) {
 	r.logger.WithField("dataupload", du.Name).Warnf("The snapshot is not retained, the next backup of the volume reads in full: %s", reason)
 }
-
-// fallbackReasonOf returns why the incremental fell back to a full read, as the
-// uploader classified it from the driver's error; empty when it did not.
-func fallbackReasonOf(result datapath.BackupResult) string {
-	if !result.FallbackFull {
-		return ""
-	}
-	if result.FallbackReason == "" {
-		return "fallen back to a full read"
-	}
-	return result.FallbackReason
-}

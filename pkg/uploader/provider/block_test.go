@@ -337,7 +337,7 @@ func TestBlockProviderRunBackup(t *testing.T) {
 				log:           logrus.New(),
 			}
 
-			snapshotID, isEmpty, size, incrSize, sourceSize, fallback, _, _, err := bp.RunBackup(
+			snapshotID, isEmpty, size, incrSize, sourceSize, fallback, _, err := bp.RunBackup(
 				t.Context(),
 				tc.path,
 				tc.realSource,
@@ -405,7 +405,7 @@ func TestBlockProviderCancelThroughWrappedError(t *testing.T) {
 			log:           logrus.New(),
 		}
 
-		_, _, _, _, _, _, _, _, err := bp.RunBackup(
+		_, _, _, _, _, _, _, err := bp.RunBackup(
 			t.Context(), "/dev/sda", "ns/pvc", map[string]string{}, false, "",
 			CBTParam{}, uploader.PersistentVolumeBlock, map[string]string{},
 			&FakeBackupProgressUpdater{},

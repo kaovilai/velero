@@ -20,6 +20,7 @@ package block
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -31,8 +32,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"k8s.io/utils/ptr"
 
 	"github.com/velero-io/velero/pkg/cbtservice"
@@ -223,8 +222,14 @@ func TestSnapshotSource(t *testing.T) {
 		expectedSize         int64
 		expectedSnapshotSize int64
 		expectedFallback     bool
-		expectedBase         string
-		cbtService           func(t *testing.T) cbtservice.Service
+		// expectedParent is the parent repository snapshot's change ID the
+		// backup reports, set whenever it had a parent.
+		expectedParent string
+		// expectedWarn is the cause a Warn line names when the incremental
+		// falls back to a full read; the data mover pod's log reaches the
+		// node-agent log.
+		expectedWarn string
+		cbtService   func(t *testing.T) cbtservice.Service
 	}{
 		{
 			name: "uploader Backup error",
@@ -348,11 +353,10 @@ func TestSnapshotSource(t *testing.T) {
 			expectedSize:         1024,
 			expectedSnapshotSize: 1024,
 			expectedFallback:     true,
+			expectedWarn:         "parent not found",
 		},
 		{
-			// The delta was computed against the parent's change ID, which
-			// the uploader reports as the base the node-agent releases.
-			name:           "incremental backup reports the parent's change ID as its base",
+			name:           "an incremental reports the parent's change ID",
 			forceFull:      ptr.To(false),
 			parentSnapshot: "snap-parent",
 			cbtService: func(t *testing.T) cbtservice.Service {
@@ -382,7 +386,43 @@ func TestSnapshotSource(t *testing.T) {
 			expectedSnapID:       "snap-inc",
 			expectedSize:         512,
 			expectedSnapshotSize: 1024,
-			expectedBase:         "cid-parent",
+			expectedParent:       "cid-parent",
+		},
+		{
+			// The driver cannot compute the delta against the parent's base:
+			// the backup reads in full, still reports the parent's change ID,
+			// and one Warn line names the driver's error.
+			name:           "a full read with a parent reports the parent's change ID and logs the driver's error",
+			forceFull:      ptr.To(false),
+			parentSnapshot: "snap-parent",
+			cbtService: func(t *testing.T) cbtservice.Service {
+				t.Helper()
+				m := cbtservicemocks.NewService(t)
+				m.On("GetChangedBlocks", mock.Anything, "snap-1", "cid-parent", mock.Anything).
+					Return(errors.New("GetMetadataDelta: base snapshot cid-parent not found"))
+				m.On("GetAllocatedBlocks", mock.Anything, "snap-1", mock.Anything).Return(nil)
+				return m
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-parent")).
+					Return(udmrepo.Snapshot{
+						ID:         "snap-parent",
+						RootObject: udmrepo.ObjectMetadata{ID: "root-parent"},
+						Tags:       map[string]string{uploader.CBTChangeIDTag: "cid-parent", uploader.CBTVolumeIDTag: "vid-1"},
+					}, nil)
+				repo.On("ReadMetadata", mock.Anything, udmrepo.ID("root-parent")).
+					Return(&udmrepo.Metadata{SubObjects: []udmrepo.ObjectMetadata{{ID: "bdev-parent"}}}, nil)
+				blkup.On("Backup", mock.Anything, udmrepo.ID(""), mock.Anything, mock.Anything).
+					Return(udmrepo.Snapshot{TotalSize: 1024}, int64(1024), nil)
+				repo.On("SaveSnapshot", mock.Anything, mock.Anything).Return(udmrepo.ID("snap-full"), nil)
+				repo.On("Flush", mock.Anything).Return(nil)
+			},
+			expectedSnapID:       "snap-full",
+			expectedSize:         1024,
+			expectedSnapshotSize: 1024,
+			expectedFallback:     true,
+			expectedParent:       "cid-parent",
+			expectedWarn:         "GetMetadataDelta: base snapshot cid-parent not found",
 		},
 	}
 
@@ -407,13 +447,15 @@ func TestSnapshotSource(t *testing.T) {
 				forceFull = *tc.forceFull
 			}
 
-			snapID, size, snapshotSize, fallback, _, base, err := snapshotSource(
+			logger, hook := logrustest.NewNullLogger()
+			logger.SetLevel(logrus.DebugLevel)
+			snapID, size, snapshotSize, fallback, parent, err := snapshotSource(
 				ctx, mockRepo, mockBlkup,
 				baseSource,
 				forceFull, tc.parentSnapshot,
 				cbtSrc, cbtSvc,
 				snapshotTags, map[string]string{},
-				testLog(), "Block Uploader",
+				logger, "Block Uploader",
 			)
 
 			if tc.expectedErrStr != "" {
@@ -425,7 +467,20 @@ func TestSnapshotSource(t *testing.T) {
 				assert.Equal(t, tc.expectedSize, size)
 				assert.Equal(t, tc.expectedSnapshotSize, snapshotSize)
 				assert.Equal(t, tc.expectedFallback, fallback)
-				assert.Equal(t, tc.expectedBase, base, "only a delta reports its base")
+				assert.Equal(t, tc.expectedParent, parent)
+			}
+			if tc.expectedWarn != "" {
+				var warned []string
+				for _, entry := range hook.AllEntries() {
+					if entry.Level == logrus.WarnLevel {
+						warned = append(warned, fmt.Sprintf("%s %v", entry.Message, entry.Data[logrus.ErrorKey]))
+					}
+				}
+				named := false
+				for _, line := range warned {
+					named = named || strings.Contains(line, tc.expectedWarn) && strings.Contains(line, "fallback to full")
+				}
+				assert.True(t, named, "a Warn line names the cause of the fall back: %v", warned)
 			}
 
 			mockBlkup.AssertExpectations(t)
@@ -1122,36 +1177,6 @@ func TestRestore(t *testing.T) {
 			}
 
 			mockBlkup.AssertExpectations(t)
-		})
-	}
-}
-
-// TestClassifyFallbackReason covers the fallback reasons recorded on the
-// DataUpload (design, Implementation: diagnostics): a failed parent lookup,
-// an absent CBT service, a gone base snapshot and any other driver error.
-func TestClassifyFallbackReason(t *testing.T) {
-	tests := []struct {
-		name      string
-		parentErr error
-		cbtErr    error
-		wantHead  string
-	}{
-		{name: "no fallback", wantHead: ""},
-		{name: "parent lookup failed", parentErr: errors.New("error searching previous snapshot"), wantHead: FallbackReasonNoParent},
-		{name: "parent wins over cbt", parentErr: errors.New("no parent"), cbtErr: errors.New("x"), wantHead: FallbackReasonNoParent},
-		{name: "CBT service absent", cbtErr: errors.New("CBT service is absent, fallback to real full"), wantHead: FallbackReasonCBTUnavailable},
-		{name: "base gone (NotFound)", cbtErr: errors.Wrap(status.Error(codes.NotFound, "snapshot not found"), "error getting changed blocks"), wantHead: FallbackReasonBaseGone},
-		{name: "other driver error", cbtErr: errors.Wrap(status.Error(codes.Internal, "rbd: diff failed"), "error getting changed blocks"), wantHead: FallbackReasonDriverError},
-		{name: "plain error", cbtErr: errors.New("boom"), wantHead: FallbackReasonDriverError},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := classifyFallbackReason(tc.parentErr, tc.cbtErr)
-			if tc.wantHead == "" {
-				assert.Empty(t, got)
-				return
-			}
-			assert.True(t, strings.HasPrefix(got, tc.wantHead+": "), got)
 		})
 	}
 }

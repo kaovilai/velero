@@ -106,7 +106,7 @@ func TestRunBackup(t *testing.T) {
 				tc.volMode = uploader.PersistentVolumeFilesystem
 			}
 			kopiaBackupFunc = tc.hookBackupFunc
-			_, _, _, _, _, _, _, _, err := kp.RunBackup(t.Context(), "var", "", nil, false, "", CBTParam{}, tc.volMode, map[string]string{}, &updater)
+			_, _, _, _, _, _, _, err := kp.RunBackup(t.Context(), "var", "", nil, false, "", CBTParam{}, tc.volMode, map[string]string{}, &updater)
 			if tc.notError {
 				assert.NoError(t, err)
 			} else {
@@ -159,7 +159,7 @@ func TestRunBackupCancellation(t *testing.T) {
 			mockBRepo := udmrepomocks.NewBackupRepo(t)
 			mockBRepo.On("GetAdvancedFeatures").Return(udmrepo.AdvancedFeatureInfo{})
 			kp := &kopiaProvider{log: logrus.New(), bkRepo: mockBRepo}
-			id, _, _, _, _, fallback, _, _, err := kp.RunBackup(ctx, "/data", "", nil, false, "",
+			id, _, _, _, _, fallback, _, err := kp.RunBackup(ctx, "/data", "", nil, false, "",
 				CBTParam{}, uploader.PersistentVolumeFilesystem, nil, &FakeBackupProgressUpdater{})
 
 			assert.Equal(t, "snapshot-for-cleanup", id)

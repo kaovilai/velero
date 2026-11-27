@@ -18,17 +18,13 @@ package block
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"maps"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/velero-io/velero/pkg/cbtservice"
 	"github.com/velero-io/velero/pkg/repository/udmrepo"
@@ -87,14 +83,13 @@ func Backup(ctx context.Context, blkUp Uploader, repoWriter udmrepo.BackupRepo, 
 		return uploader.SnapshotInfo{}, false, errors.Wrapf(err, "error reset pos of block device %s", source)
 	}
 
-	snapID, backupSize, snapshotSize, fallback, fallbackReason, parentChangeID, err := snapshotSource(ctx, repoWriter, blkUp, sourceInfo, forceFull, parentSnapshot, cbtSource, cbtService, tags, uploaderCfg, log, "Block Uploader")
+	snapID, backupSize, snapshotSize, fallback, parentChangeID, err := snapshotSource(ctx, repoWriter, blkUp, sourceInfo, forceFull, parentSnapshot, cbtSource, cbtService, tags, uploaderCfg, log, "Block Uploader")
 	snapshotInfo := uploader.SnapshotInfo{
 		ID:              snapID,
 		SnapshotSize:    snapshotSize,
 		IncrementalSize: backupSize,
 		SourceSize:      sourceInfo.size,
 		Fallback:        fallback,
-		FallbackReason:  fallbackReason,
 		ParentChangeID:  parentChangeID,
 	}
 
@@ -114,39 +109,34 @@ func snapshotSource(
 	uploaderCfg map[string]string,
 	log logrus.FieldLogger,
 	description string,
-) (string, int64, int64, bool, string, string, error) {
+) (string, int64, int64, bool, string, error) {
 	log.Info("Start to snapshot...")
 	snapshotStartTime := time.Now()
 
 	bitmap := cbt.NewBitmap(blockSize, uint64(source.size), cbtSource.Snapshot, cbtSource.VolumeID)
 
-	parentBackup, parentErr := getParentBackupInfo(ctx, rep, forceFull, parentSnapshot, cbtSource.VolumeID, source.realSource, snapshotTags, log)
-	if parentErr != nil {
-		log.WithError(parentErr).Warn("Failed to get parent backup info, fallback to full backup")
-		bitmap.SetError(errors.Wrap(parentErr, "error getting parent backup info, fallback to full backup"))
+	parentBackup, err := getParentBackupInfo(ctx, rep, forceFull, parentSnapshot, cbtSource.VolumeID, source.realSource, snapshotTags, log)
+	if err != nil {
+		log.WithError(err).Warn("Failed to get parent backup info, fallback to full backup")
+		bitmap.SetError(errors.Wrap(err, "error getting parent backup info, fallback to full backup"))
 	} else {
 		bitmap.SetChangeID(parentBackup.changeID)
 	}
 
-	cbtErr := cbt.SetBitmapOrFull(ctx, cbtService, bitmap, false)
-	if cbtErr != nil {
+	err = cbt.SetBitmapOrFull(ctx, cbtService, bitmap, false)
+	if err != nil {
 		parentBackup.parentObject = ""
-		log.WithError(cbtErr).Warnf("Failed to create CBT with source %v", cbtSource)
+		log.WithError(err).Warnf("Failed to create CBT with source %v", cbtSource)
 	}
 
 	fallback := false
-	fallbackReason := ""
 	if !forceFull {
 		fallback = (len(bitmap.Errors()) > 0)
-		if fallback {
-			fallbackReason = classifyFallbackReason(parentErr, cbtErr)
-			log.Warnf("Incremental backup fell back to a full read: %s", fallbackReason)
-		}
 	}
 
 	snap, backupSize, err := u.Backup(source, parentBackup.parentObject, bitmap.Iterator(), uploaderCfg)
 	if err != nil {
-		return "", 0, 0, fallback, fallbackReason, "", errors.Wrapf(err, "failed to run uploader backup for si %v", source)
+		return "", 0, 0, fallback, "", errors.Wrapf(err, "failed to run uploader backup for si %v", source)
 	}
 
 	if snap.Tags == nil {
@@ -163,66 +153,16 @@ func snapshotSource(
 
 	snapID, err := rep.SaveSnapshot(ctx, snap)
 	if err != nil {
-		return "", 0, 0, fallback, fallbackReason, "", errors.Wrapf(err, "failed to save snapshot %v", snap)
+		return "", 0, 0, fallback, "", errors.Wrapf(err, "failed to save snapshot %v", snap)
 	}
 
 	if err = rep.Flush(ctx); err != nil {
-		return "", 0, 0, fallback, fallbackReason, "", errors.Wrapf(err, "failed to flush repository")
+		return "", 0, 0, fallback, "", errors.Wrapf(err, "failed to flush repository")
 	}
 
 	log.Infof("Created snapshot with root %v and ID %v in %v", snap.RootObject, snapID, time.Since(snapshotStartTime).Truncate(time.Second))
 
-	// The changed blocks were computed against the parent's change ID only
-	// when the backup did not read in full.
-	parentChangeID := ""
-	if !forceFull && !fallback && parentErr == nil {
-		parentChangeID = parentBackup.changeID
-	}
-
-	return string(snapID), backupSize, snap.TotalSize, fallback, fallbackReason, parentChangeID, nil
-}
-
-// Fallback reasons recorded on the DataUpload when an incremental backup falls
-// back to a full read. The reason is otherwise silent: the existing "fallen
-// back to Full" wording says what happened, not why, and on Case 2 storage
-// the why is the difference between a missing retention policy and a driver
-// fault.
-const (
-	// FallbackReasonNoParent: no usable parent backup was found in the
-	// repository, the first backup of a volume or a parent without CBT tags.
-	FallbackReasonNoParent = "no usable parent backup"
-	// FallbackReasonBaseGone: the driver reports the base snapshot the parent
-	// backup's changeId refers to as gone; on Case 2 storage this is the base
-	// not retained, or deleted with its backup.
-	FallbackReasonBaseGone = "base snapshot gone"
-	// FallbackReasonCBTUnavailable: no CBT service is configured for the
-	// driver, so no delta can be computed.
-	FallbackReasonCBTUnavailable = "CBT service unavailable"
-	// FallbackReasonDriverError: the CBT service failed to compute the delta
-	// for another reason.
-	FallbackReasonDriverError = "driver error"
-)
-
-// classifyFallbackReason names why the incremental fell back to a full read
-// from the parent lookup and the CBT errors. A gRPC NotFound from the CBT
-// service is the base-snapshot-gone signal; Ceph RBD answers a deleted base
-// with an internal error instead of a not-found code, so the driver-error
-// class also covers a gone base there, and the node-agent refines it from
-// the previous DataUpload's retention record (see the DataUpload controller).
-func classifyFallbackReason(parentErr, cbtErr error) string {
-	if parentErr != nil {
-		return fmt.Sprintf("%s: %v", FallbackReasonNoParent, parentErr)
-	}
-	if cbtErr == nil {
-		return ""
-	}
-	if strings.Contains(cbtErr.Error(), "CBT service is absent") {
-		return fmt.Sprintf("%s: %v", FallbackReasonCBTUnavailable, cbtErr)
-	}
-	if st, ok := status.FromError(errors.Cause(cbtErr)); ok && st.Code() == codes.NotFound {
-		return fmt.Sprintf("%s: %v", FallbackReasonBaseGone, cbtErr)
-	}
-	return fmt.Sprintf("%s: %v", FallbackReasonDriverError, cbtErr)
+	return string(snapID), backupSize, snap.TotalSize, fallback, parentBackup.changeID, nil
 }
 
 func getParentBackupInfo(ctx context.Context, rep udmrepo.BackupRepo, forceFull bool, parentSnapshot string, volumeID string,

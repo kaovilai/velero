@@ -199,9 +199,6 @@ func Backup(ctx context.Context, fsUploader SnapshotUploader, repoWriter repo.Re
 		SourceSize:   snapshotSize,
 		Fallback:     fallback,
 	}
-	if fallback {
-		snapshotInfo.FallbackReason = "no usable parent repository snapshot"
-	}
 
 	return snapshotInfo, false, err
 }
