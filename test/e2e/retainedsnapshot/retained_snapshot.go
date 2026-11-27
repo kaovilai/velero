@@ -103,6 +103,20 @@ volumePolicies:
       requireBaseSnapshotForDelta: true
 `, velerotest.StorageClassName)
 
+// policyOffYAML turns retention off explicitly, which wins over the CSI
+// driver's SnapshotMetadataService.
+var policyOffYAML = fmt.Sprintf(`version: v1
+volumePolicies:
+- conditions:
+    storageClass:
+    - %s
+  action:
+    type: snapshot
+    parameters:
+      dataMover: velero-block
+      requireBaseSnapshotForDelta: false
+`, velerotest.StorageClassName)
+
 var RetainedSnapshotLifecycleTest = func() {
 	Context("velero-block backup retains its snapshot and the backup deletion deletes it from the storage",
 		Label("CSI", "DataMover", "BlockDataMover", "RetainedSnapshot", "Lifecycle"),
@@ -131,6 +145,13 @@ var RetainedSnapshotDegradedTest = func() {
 	)
 }
 
+var RetainedSnapshotAutoDetectTest = func() {
+	Context("the CSI driver's SnapshotMetadataService decides retention when the volume policy does not",
+		Label("CSI", "DataMover", "BlockDataMover", "RetainedSnapshot", "AutoDetect"),
+		TestFunc(&autoDetectCase{}),
+	)
+}
+
 var RetainedSnapshotReleaseTest = func() {
 	Context("a canceled DataUpload leaves no record and no snapshot, a DataUpload without the policy never retains, and the parent is untouched",
 		Label("CSI", "DataMover", "BlockDataMover", "RetainedSnapshot", "Release"),
@@ -145,6 +166,7 @@ var RetainedSnapshotReleaseTest = func() {
 type retainedSnapshotCase struct {
 	TestCase
 	policyCM string
+	offCM    string
 }
 
 func (r *retainedSnapshotCase) init(prefix string) error {
@@ -156,6 +178,7 @@ func (r *retainedSnapshotCase) init(prefix string) error {
 	r.NSIncluded = &[]string{r.CaseBaseName}
 	r.VeleroCfg.UseNodeAgent = true
 	r.policyCM = r.CaseBaseName + "-policy"
+	r.offCM = r.CaseBaseName + "-policy-off"
 	return nil
 }
 
@@ -211,6 +234,39 @@ func (r *retainedSnapshotCase) createPolicy() error {
 	return WaitForConfigMapComplete(r.Client.ClientGo, r.VeleroCfg.VeleroNamespace, r.policyCM)
 }
 
+// createPolicyOff creates the policy ConfigMap that turns retention off.
+func (r *retainedSnapshotCase) createPolicyOff() error {
+	By(fmt.Sprintf("Create the volume policy ConfigMap %s turning retention off", r.offCM))
+	if err := CreateConfigMapFromYAMLData(r.Client.ClientGo, policyOffYAML, r.offCM, r.VeleroCfg.VeleroNamespace); err != nil {
+		return err
+	}
+	return WaitForConfigMapComplete(r.Client.ClientGo, r.VeleroCfg.VeleroNamespace, r.offCM)
+}
+
+// expectNotRetained asserts a completed DataUpload that did not retain: no
+// retention key, no record, no Retain, and its snapshot gone with the cleanup.
+func (r *retainedSnapshotCase) expectNotRetained(du *velerov2alpha1api.DataUpload, obs *dataUploadObservation) {
+	Expect(du.Status.Phase).To(Equal(velerov2alpha1api.DataUploadPhaseCompleted))
+	Expect(du.Spec.DataMoverConfig).NotTo(HaveKey(velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey))
+	Expect(du.Status.RetainedCSIStorageSnapshot).To(BeNil(), "DataUpload %s carries a record", du.Name)
+	Expect(obs.retainSeen).To(BeFalse(), "the backup content of DataUpload %s was switched to Retain", du.Name)
+	Expect(r.expectBackupSnapshotObjectsGone(du.Name)).To(Succeed())
+	Expect(obs.handle).NotTo(BeEmpty(), "the watcher never saw the backup VolumeSnapshotContent of %s", du.Name)
+	r.expectStorageSnapshotGone(obs.handle)
+}
+
+// setDriverRequiresBaseSnapshot sets spec.requireBaseSnapshotForDelta of the
+// hostpath driver's SnapshotMetadataService, or removes it when nil.
+func (r *retainedSnapshotCase) setDriverRequiresBaseSnapshot(value *bool) {
+	patch := `{"spec":{"requireBaseSnapshotForDelta":null}}`
+	if value != nil {
+		patch = fmt.Sprintf(`{"spec":{"requireBaseSnapshotForDelta":%t}}`, *value)
+	}
+	By(fmt.Sprintf("Set the SnapshotMetadataService %s: %s", hostpathDriver, patch))
+	_, stderr, err := KubectlExec(context.Background(), "patch", "snapshotmetadataservices.cbt.storage.k8s.io", hostpathDriver, "--type", "merge", "-p", patch)
+	Expect(err).NotTo(HaveOccurred(), stderr)
+}
+
 // writeData overwrites the first mebibytes of the block device with random
 // data and returns the checksum of the whole device.
 func (r *retainedSnapshotCase) writeData(mebibytes int) (string, error) {
@@ -243,14 +299,23 @@ func (r *retainedSnapshotCase) exec(script string) (string, error) {
 }
 
 func (r *retainedSnapshotCase) backupArgs(backupName string, withPolicy bool) []string {
+	cm := ""
+	if withPolicy {
+		cm = r.policyCM
+	}
+	return r.backupArgsWithPolicy(backupName, cm)
+}
+
+// backupArgsWithPolicy backs up with the policy ConfigMap cm, none when empty.
+func (r *retainedSnapshotCase) backupArgsWithPolicy(backupName, cm string) []string {
 	args := []string{
 		"backup", "create", backupName, "--namespace", r.VeleroCfg.VeleroNamespace,
 		"--include-namespaces", r.CaseBaseName, "--snapshot-volumes=true",
 		"--default-volumes-to-fs-backup=false", "--snapshot-move-data=true",
 		"--data-mover", "velero-block",
 	}
-	if withPolicy {
-		args = append(args, "--resource-policies-configmap", r.policyCM)
+	if cm != "" {
+		args = append(args, "--resource-policies-configmap", cm)
 	}
 	return args
 }
@@ -258,10 +323,19 @@ func (r *retainedSnapshotCase) backupArgs(backupName string, withPolicy bool) []
 // backup runs a backup to completion while a watcher follows its DataUpload,
 // and returns the completed DataUpload and what the watcher saw.
 func (r *retainedSnapshotCase) backup(backupName string, withPolicy bool) (*velerov2alpha1api.DataUpload, *dataUploadObservation, error) {
-	By(fmt.Sprintf("Back up namespace %s as %s with the velero-block data mover (retention policy: %t)", r.CaseBaseName, backupName, withPolicy))
+	cm := ""
+	if withPolicy {
+		cm = r.policyCM
+	}
+	return r.backupWithPolicy(backupName, cm)
+}
+
+// backupWithPolicy backs up under the policy ConfigMap cm, none when empty.
+func (r *retainedSnapshotCase) backupWithPolicy(backupName, cm string) (*velerov2alpha1api.DataUpload, *dataUploadObservation, error) {
+	By(fmt.Sprintf("Back up namespace %s as %s with the velero-block data mover (policy ConfigMap: %q)", r.CaseBaseName, backupName, cm))
 	watcher := r.watchDataUpload(backupName)
 	defer watcher.stop()
-	if err := VeleroBackupExec(r.Ctx, r.VeleroCfg.VeleroCLI, r.VeleroCfg.VeleroNamespace, backupName, append(r.backupArgs(backupName, withPolicy), "--wait")); err != nil {
+	if err := VeleroBackupExec(r.Ctx, r.VeleroCfg.VeleroCLI, r.VeleroCfg.VeleroNamespace, backupName, append(r.backupArgsWithPolicy(backupName, cm), "--wait")); err != nil {
 		RunDebug(context.Background(), r.VeleroCfg.VeleroCLI, r.VeleroCfg.VeleroNamespace, backupName, "")
 		return nil, nil, err
 	}
@@ -634,6 +708,9 @@ func (r *retainedSnapshotCase) restoreAndVerify(backupName, restoreName, checksu
 func (r *retainedSnapshotCase) Clean() error {
 	if !(CurrentSpecReport().Failed() && r.VeleroCfg.FailFast) {
 		if err := DeleteConfigMap(r.Client.ClientGo, r.VeleroCfg.VeleroNamespace, r.policyCM); err != nil && !apierrors.IsNotFound(err) {
+			fmt.Println("Fail to delete the policy ConfigMap: ", err)
+		}
+		if err := DeleteConfigMap(r.Client.ClientGo, r.VeleroCfg.VeleroNamespace, r.offCM); err != nil && !apierrors.IsNotFound(err) {
 			fmt.Println("Fail to delete the policy ConfigMap: ", err)
 		}
 	}
@@ -1021,6 +1098,9 @@ func (c *releaseCase) CreateResources() error {
 	if err := c.createPolicy(); err != nil {
 		return err
 	}
+	if err := c.createPolicyOff(); err != nil {
+		return err
+	}
 	// Large enough that the upload is in progress for a few seconds, so the
 	// cancel lands before the DataUpload completes.
 	if err := c.createWorkload(resource.MustParse("256Mi")); err != nil {
@@ -1139,22 +1219,14 @@ func (c *releaseCase) cancelDataUpload() error {
 }
 
 func (c *releaseCase) backupWithoutPolicy() error {
-	du, obs, err := c.backup(c.plainBackup, false)
+	// The policy turns retention off explicitly: without a policy the CSI
+	// driver's SnapshotMetadataService would decide.
+	du, obs, err := c.backupWithPolicy(c.plainBackup, c.offCM)
 	if err != nil {
 		return err
 	}
 	By("The DataUpload was not opted in: no requireBaseSnapshotForDelta key, no record, snapshot deleted with the backup content")
-	Expect(du.Status.Phase).To(Equal(velerov2alpha1api.DataUploadPhaseCompleted))
-	Expect(du.Spec.DataMoverConfig).NotTo(HaveKey(velerov2alpha1api.RequireBaseSnapshotForDeltaDataMoverConfigKey))
-	Expect(du.Status.RetainedCSIStorageSnapshot).To(BeNil(), "DataUpload %s without the policy carries a record", du.Name)
-	Expect(obs.retainSeen).To(BeFalse(), "the backup content of a non-retaining DataUpload was switched to Retain")
-	Expect(c.expectBackupSnapshotObjectsGone(du.Name)).To(Succeed())
-	Expect(obs.handle).NotTo(BeEmpty(), "the watcher never saw the backup VolumeSnapshotContent of %s, so the storage cannot be checked", du.Name)
-	// The sidecar deletes the snapshot after the content is gone; give it a moment.
-	Expect(wait.PollUntilContextTimeout(c.Ctx, pollInterval, cleanupTimeout, true, func(context.Context) (bool, error) {
-		exists, err := c.storageSnapshotExists(obs.handle)
-		return !exists, err
-	})).To(Succeed(), "storage snapshot %s of the non-retaining DataUpload %s was not deleted", obs.handle, du.Name)
+	c.expectNotRetained(du, obs)
 	return nil
 }
 
@@ -1347,5 +1419,96 @@ func (c *degradedCase) Verify() error {
 	By("Deleting the backups succeeds: their snapshots are already gone")
 	c.deleteBackup(c.deniedBackup)
 	c.deleteBackup(c.prunedBackup)
+	return nil
+}
+
+// autoDetectCase: no volume policy sets requireBaseSnapshotForDelta, and the
+// hostpath driver's SnapshotMetadataService sets it to true, so backups retain
+// and release as under the policy. An explicit policy false turns retention
+// off over the driver's flag, and removing the field turns it off too.
+type autoDetectCase struct {
+	retainedSnapshotCase
+	backups [4]string
+	handles [2]string
+}
+
+func (c *autoDetectCase) Init() error {
+	if err := c.init("retain-autodetect"); err != nil {
+		return err
+	}
+	for i := range c.backups {
+		c.backups[i] = fmt.Sprintf("backup-%d-%s", i+1, c.CaseBaseName)
+	}
+	c.TestMsg = &TestMSG{
+		Desc:      "retention decided by the CSI driver's SnapshotMetadataService",
+		Text:      "Without a policy parameter the driver's flag retains and releases; an explicit policy false or an unset flag turns retention off",
+		FailedMSG: "Retention did not follow the driver's SnapshotMetadataService or the policy's precedence",
+	}
+	return nil
+}
+
+func (c *autoDetectCase) CreateResources() error {
+	c.requireCBT()
+	stdout, _, err := KubectlExec(c.Ctx, "get", "crd", "snapshotmetadataservices.cbt.storage.k8s.io", "-o",
+		"jsonpath={.spec.versions[*].schema.openAPIV3Schema.properties.spec.properties.requireBaseSnapshotForDelta.type}")
+	if err != nil || strings.TrimSpace(stdout) == "" {
+		Skip("the SnapshotMetadataService CRD predates requireBaseSnapshotForDelta; install external-snapshot-metadata v1.2.0 or later")
+	}
+	c.setDriverRequiresBaseSnapshot(ptr.To(true))
+	DeferCleanup(func() { c.setDriverRequiresBaseSnapshot(ptr.To(true)) })
+	if err := c.createPolicyOff(); err != nil {
+		return err
+	}
+	return c.createWorkload(resource.MustParse("64Mi"))
+}
+
+func (c *autoDetectCase) Backup() error {
+	for i := 0; i < 2; i++ {
+		if _, err := c.writeData(8 * (i + 1)); err != nil {
+			return err
+		}
+		du, obs, err := c.backupWithPolicy(c.backups[i], "")
+		if err != nil {
+			return err
+		}
+		By("Without a policy parameter the driver's flag retains the snapshot")
+		c.handles[i] = c.expectRetained(du, obs)
+		if i == 1 {
+			c.expectIncremental(du)
+			c.expectReleased(c.handles[0], c.backups[1])
+		}
+	}
+
+	By("An explicit policy false wins over the driver's flag")
+	if _, err := c.writeData(24); err != nil {
+		return err
+	}
+	du, obs, err := c.backupWithPolicy(c.backups[2], c.offCM)
+	if err != nil {
+		return err
+	}
+	c.expectNotRetained(du, obs)
+	c.expectStorageSnapshot(c.handles[1], true)
+
+	By("Without the driver's flag nothing is retained")
+	c.setDriverRequiresBaseSnapshot(nil)
+	if _, err := c.writeData(32); err != nil {
+		return err
+	}
+	du, obs, err = c.backupWithPolicy(c.backups[3], "")
+	if err != nil {
+		return err
+	}
+	c.expectNotRetained(du, obs)
+	c.expectStorageSnapshot(c.handles[1], true)
+	return nil
+}
+
+func (c *autoDetectCase) Verify() error {
+	By("Every backup deletes cleanly; the retaining backup's deletion removes its snapshot")
+	c.deleteBackup(c.backups[0])
+	c.deleteBackup(c.backups[2])
+	c.deleteBackup(c.backups[3])
+	c.deleteBackup(c.backups[1], c.handles[1])
 	return nil
 }

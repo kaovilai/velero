@@ -39,7 +39,12 @@ HEALTH_MONITOR_VERSION="${HEALTH_MONITOR_VERSION:-v0.18.0}"
 # so the velero-block data mover can compute changed blocks against a base
 # snapshot instead of reading every backup in full.
 ENABLE_SNAPSHOT_METADATA="${ENABLE_SNAPSHOT_METADATA:-false}"
-SNAPSHOT_METADATA_VERSION="${SNAPSHOT_METADATA_VERSION:-v1.0.0}"
+SNAPSHOT_METADATA_VERSION="${SNAPSHOT_METADATA_VERSION:-v1.2.0}"
+# The driver's guidance on retaining the base snapshot, written to
+# spec.requireBaseSnapshotForDelta of its SnapshotMetadataService (v1.2.0 and
+# later); empty leaves the field unset. csi-driver-host-path computes a delta
+# by comparing against the base snapshot, so it needs it.
+SNAPSHOT_METADATA_REQUIRE_BASE_SNAPSHOT="${SNAPSHOT_METADATA_REQUIRE_BASE_SNAPSHOT-true}"
 
 # The StorageClass the tests can be pointed at with --storage-class.
 STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-csi-hostpath-sc}"
@@ -118,9 +123,19 @@ EOF
   for component in csi-snapshot-metadata-tls-secret snapshotmetadataservice csi-snapshot-metadata-service; do
     $KUBECTL apply -f "${metadata_raw}/deploy/example/csi-driver/testdata/${component}.yaml"
   done
+  if [ -n "${SNAPSHOT_METADATA_REQUIRE_BASE_SNAPSHOT}" ]; then
+    $KUBECTL patch snapshotmetadataservices.cbt.storage.k8s.io hostpath.csi.k8s.io --type merge \
+      -p "{\"spec\":{\"requireBaseSnapshotForDelta\":${SNAPSHOT_METADATA_REQUIRE_BASE_SNAPSHOT}}}"
+  else
+    $KUBECTL patch snapshotmetadataservices.cbt.storage.k8s.io hostpath.csi.k8s.io --type merge \
+      -p '{"spec":{"requireBaseSnapshotForDelta":null}}'
+  fi
   work_dir="$(mktemp -d)"
   trap 'rm -rf "${work_dir}"' EXIT
   curl -fsSL "${hostpath_raw}/deploy/${HOSTPATH_DEPLOY_DIR}/hostpath/csi-snapshot-metadata-sidecar.patch" -o "${work_dir}/sidecar.patch"
+  # Run the sidecar of the same release as the CRD and the
+  # SnapshotMetadataService, not the one the hostpath patch pins.
+  sed -i -e "s#csi-snapshot-metadata:v[0-9][0-9.]*#csi-snapshot-metadata:${SNAPSHOT_METADATA_VERSION}#" "${work_dir}/sidecar.patch"
   printf '%s\n' "${plugin_yaml}" > "${work_dir}/plugin.yaml"
   sed -i -e "/# end csi containers/r ${work_dir}/sidecar.patch" "${work_dir}/plugin.yaml"
   sed -i -e 's/# end csi volumes/- name: csi-snapshot-metadata-server-certs\n          secret:\n            secretName: csi-snapshot-metadata-certs\n        # end csi volumes/' "${work_dir}/plugin.yaml"
